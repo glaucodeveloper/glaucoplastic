@@ -1,0 +1,78 @@
+{
+  "scopeName": "source.nim.glaucoplastic.inline-blocks",
+  "name": "GlaucoPlastic Nim Inline Blocks",
+  "injectionSelector": "L:source.nim",
+  "patterns": [
+    {
+      "include": "#js-block"
+    },
+    {
+      "include": "#html-block"
+    },
+    {
+      "include": "#css-block"
+    }
+  ],
+  "repository": {
+    "js-block": {
+      "begin": "(\"\"\"[ \\t]*//js[ \\t]*\\r?\\n)",
+      "beginCaptures": {
+        "1": {
+          "name": "punctuation.definition.string.begin.nim"
+        }
+      },
+      "end": "^[ \\t]*\"\"\"",
+      "endCaptures": {
+        "0": {
+          "name": "punctuation.definition.string.end.nim"
+        }
+      },
+      "contentName": "source.js",
+      "patterns": [
+        {
+          "include": "source.js"
+        }
+      ]
+    },
+    "html-block": {
+      "begin": "(\"\"\"[ \\t]*//html[ \\t]*\\r?\\n)",
+      "beginCaptures": {
+        "1": {
+          "name": "punctuation.definition.string.begin.nim"
+        }
+      },
+      "end": "^[ \\t]*\"\"\"",
+      "endCaptures": {
+        "0": {
+          "name": "punctuation.definition.string.end.nim"
+        }
+      },
+      "contentName": "text.html.basic",
+      "patterns": [
+        {
+          "include": "text.html.basic"
+        }
+      ]
+    },
+    "css-block": {
+      "begin": "(\"\"\"[ \\t]*//css[ \\t]*\\r?\\n)",
+      "beginCaptures": {
+        "1": {
+          "name": "punctuation.definition.string.begin.nim"
+        }
+      },
+      "end": "^[ \\t]*\"\"\"",
+      "endCaptures": {
+        "0": {
+          "name": "punctuation.definition.string.end.nim"
+        }
+      },
+      "contentName": "source.css",
+      "patterns": [
+        {
+          "include": "source.css"
+        }
+      ]
+    }
+  }
+}

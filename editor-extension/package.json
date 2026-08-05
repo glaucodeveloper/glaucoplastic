@@ -1,0 +1,25 @@
+{
+  "name": "glaucoplastic-nim-inline-blocks",
+  "displayName": "GlaucoPlastic Nim Inline Blocks",
+  "description": "TextMate injections for //js, //html, and //css blocks inside Nim triple-quoted strings.",
+  "version": "0.0.1",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "grammars": [
+      {
+        "language": "nim",
+        "scopeName": "source.nim.glaucoplastic.inline-blocks",
+        "path": "./syntaxes/nim-inline-blocks.tmLanguage.json",
+        "injectTo": [
+          "source.nim"
+        ]
+      }
+    ]
+  }
+}

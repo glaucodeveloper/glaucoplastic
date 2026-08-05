@@ -1,0 +1,8 @@
+import std/os
+
+# O exemplo vive dentro do repositório do framework.
+switch("path", thisDir() / "../../src")
+# begin Nimble config (version 2)
+when withDir(thisDir(), system.fileExists("nimble.paths")):
+  include "nimble.paths"
+# end Nimble config
