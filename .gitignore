@@ -73,13 +73,16 @@ models/
 *.h5
 *.tflite
 *.mlmodel
-*.bin
 *.weights
 *.tar.zst
 *.tar.gz
 *.zip
 *.7z
 *.rar
+
+# Exceções úteis de binários-fonte/configuração
+!**/package.json
+!**/nimble.lock
 
 # Hugging Face, Torch e caches de IA
 .cache/
@@ -185,7 +188,7 @@ examples/*/src/main
 examples/*/consumer
 examples/*/main
 
-# Arquivos grandes de mídia gerados
+# Mídia grande
 *.mp4
 *.mkv
 *.mov
