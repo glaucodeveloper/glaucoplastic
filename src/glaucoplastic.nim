@@ -13,8 +13,26 @@
 
 import std/strtabs
 import std/dynlib
+import std/os
+import std/strutils
 import nimpy
 import nimpy/py_lib
+
+
+# `--os:windows` muda a semântica de std/os durante cross-compilação.
+# `staticRead`, porém, é executado pelo compilador no host.
+const PlasticCompileSourcePath =
+  currentSourcePath().replace('\\', '/')
+const PlasticCompileSourceDir =
+  PlasticCompileSourcePath[
+    0 .. PlasticCompileSourcePath.rfind('/')
+  ]
+
+const PlasticAssistantForeignOverlayScript* =
+  staticRead(
+    PlasticCompileSourceDir &
+    "glaucoplastic_assistant_foreign_overlay.js"
+  )
 
 type
   PlasticPyGILState = cint
@@ -75,6 +93,11 @@ proc plasticReleasePythonGIL(state: PlasticPyGILState) {.inline.} =
 
 import std/[
   base64,
+  streams,
+  nativesockets,
+  httpcore,
+  asyncdispatch,
+  asynchttpserver,
   algorithm,
   httpclient,
   json,
@@ -91,6 +114,223 @@ import std/[
   times,
   uri
 ]
+
+
+# Necessário para procedimentos {.async.} emitidos pela macro no consumidor.
+export asyncdispatch
+
+
+type
+  PlasticNetworkWebRenderProc* = proc(): string {.closure.}
+  PlasticNetworkWebEventProc* = proc(event: JsonNode) {.closure.}
+  PlasticNetworkWebPollProc* = proc(): JsonNode {.closure.}
+
+  PlasticNetworkWebOptions* = object
+    enabled*: bool
+    host*: string
+    port*: int
+
+proc plasticNetworkWebOptions*(
+  parameters = commandLineParams()
+): PlasticNetworkWebOptions =
+  result.host = getEnv("GLAUCOPLASTIC_NW_HOST", "0.0.0.0")
+  result.port = 8765
+
+  let environmentPort = getEnv("GLAUCOPLASTIC_NW_PORT", "").strip
+  if environmentPort.len > 0:
+    try:
+      result.port = parseInt(environmentPort)
+    except ValueError:
+      discard
+
+  for parameter in parameters:
+    if parameter == "--nw":
+      result.enabled = true
+    elif parameter.startsWith("--nw="):
+      result.enabled = true
+      let value = parameter["--nw=".len .. ^1].strip
+      if value.len > 0:
+        try:
+          result.port = parseInt(value)
+        except ValueError:
+          result.host = value
+    elif parameter.startsWith("--nw-port="):
+      result.enabled = true
+      let value = parameter["--nw-port=".len .. ^1].strip
+      try:
+        result.port = parseInt(value)
+      except ValueError:
+        raise newException(ValueError, "Porta inválida em --nw-port: " & value)
+    elif parameter.startsWith("--nw-host="):
+      result.enabled = true
+      result.host = parameter["--nw-host=".len .. ^1].strip
+
+  if result.host.len == 0:
+    result.host = "0.0.0.0"
+  if result.port < 1 or result.port > 65535:
+    raise newException(ValueError, "A porta do modo --nw deve estar entre 1 e 65535.")
+
+proc plasticNetworkWebBridgeScript(): string =
+  r"""
+  <script>
+  (() => {
+    if (window.__glaucoplasticNetworkBridgeInstalled) return;
+    window.__glaucoplasticNetworkBridgeInstalled = true;
+    window.__glaucoplasticNetworkWeb = true;
+
+    let sending = false;
+    let polling = false;
+
+    function eventQueue() {
+      return window.__glaucoplasticEvents ||
+        (window.__glaucoplasticEvents = []);
+    }
+
+    function findIdentity(path) {
+      return Array.from(
+        document.querySelectorAll('[data-glauco-identity]')
+      ).find(element => element.dataset.glaucoIdentity === path) || null;
+    }
+
+    function applyProperty(update) {
+      if (!update || !update.path || !update.property) return;
+      const element = findIdentity(update.path);
+      if (!element) return;
+
+      if (update.property === 'textContent' || update.property === 'innerHTML') {
+        element[update.property] = typeof update.value === 'string'
+          ? update.value
+          : JSON.stringify(update.value);
+      } else {
+        element[update.property] = update.value;
+      }
+    }
+
+    function applyPayload(payload) {
+      if (!payload || typeof payload !== 'object') return;
+      if (Array.isArray(payload.properties)) {
+        payload.properties.forEach(applyProperty);
+      }
+      if (payload.assistant && window.__glaucoplasticAssistantApply) {
+        window.__glaucoplasticAssistantApply(payload.assistant);
+      }
+    }
+
+    async function postEvents() {
+      if (sending) return;
+      const queue = eventQueue();
+      if (!queue.length) return;
+
+      const events = queue.splice(0, queue.length);
+      sending = true;
+      try {
+        const response = await fetch('/__glaucoplastic/events', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(events),
+          cache: 'no-store'
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        applyPayload(await response.json());
+      } catch (error) {
+        queue.unshift(...events);
+        console.error('GlaucoPlastic event transport:', error);
+      } finally {
+        sending = false;
+      }
+    }
+
+    async function poll() {
+      if (polling) return;
+      polling = true;
+      try {
+        const response = await fetch('/__glaucoplastic/poll', {cache: 'no-store'});
+        if (response.ok) applyPayload(await response.json());
+      } catch (error) {
+        console.debug('GlaucoPlastic poll:', error);
+      } finally {
+        polling = false;
+      }
+    }
+
+    window.setInterval(postEvents, 50);
+    window.setInterval(poll, 200);
+    postEvents();
+    poll();
+  })();
+  </script>
+  """
+
+proc plasticNetworkWebDocument(html: string): string =
+  result = html
+  let bridge = plasticNetworkWebBridgeScript()
+  if result.contains("</body>"):
+    result = result.replace("</body>", bridge & "\n</body>")
+  else:
+    result.add bridge
+
+proc runPlasticNetworkWebServer*(
+  host: string;
+  port: int;
+  renderHtml: PlasticNetworkWebRenderProc;
+  dispatchEvent: PlasticNetworkWebEventProc;
+  pollState: PlasticNetworkWebPollProc
+) =
+  if renderHtml.isNil or dispatchEvent.isNil or pollState.isNil:
+    raise newException(ValueError, "O servidor --nw recebeu callbacks incompletos.")
+
+  let server = newAsyncHttpServer()
+
+  proc callback(request: Request) {.async, gcsafe.} =
+    var status = Http200
+    var contentType = "application/json; charset=utf-8"
+    var body = ""
+
+    try:
+      case request.url.path
+      of "/", "/index.html":
+        contentType = "text/html; charset=utf-8"
+        {.cast(gcsafe).}:
+          body = plasticNetworkWebDocument(renderHtml())
+      of "/__glaucoplastic/health":
+        body = "{\"ok\":true}"
+      of "/__glaucoplastic/poll":
+        {.cast(gcsafe).}:
+          body = $pollState()
+      of "/__glaucoplastic/events":
+        if request.reqMethod != HttpPost:
+          status = Http405
+          body = "{\"ok\":false,\"error\":\"POST required\"}"
+        else:
+          let parsed = parseJson(request.body)
+          let events = if parsed.kind == JArray: parsed else: %*[parsed]
+          {.cast(gcsafe).}:
+            for event in events.items:
+              if event.kind == JObject:
+                dispatchEvent(event)
+            body = $pollState()
+      else:
+        status = Http404
+        body = "{\"ok\":false,\"error\":\"not found\"}"
+    except CatchableError as error:
+      status = Http400
+      body = $(%*{"ok": false, "error": error.msg})
+
+    await request.respond(
+      status,
+      body,
+      newHttpHeaders({
+        "Content-Type": contentType,
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff"
+      })
+    )
+
+  let displayHost = if host == "0.0.0.0": "127.0.0.1" else: host
+  echo "GlaucoPlastic --nw: http://" & displayHost & ":" & $port
+  echo "GlaucoPlastic --nw escutando em " & host & ":" & $port
+  waitFor server.serve(Port(port), callback, address = host)
+
 
 proc applyTemplate*(sourceText: string; replacements: openArray[tuple[key, value: string]]): string =
   result = sourceText
@@ -335,6 +575,14 @@ type
   PlasticMetisMemoryConfig* = object
     enabled*: bool
     startup*: bool
+    startupRequired*: bool
+    logSafetensors*: bool
+    diagnoseMemory*: bool
+    safeLoad*: bool
+    metaTensorFallback*: bool
+    minSystemAvailableMiB*: int
+    minGpuFreeMiB*: int
+    gpuReserveMiB*: int
     prepareRuntime*: bool
     autoInstallDependencies*: bool
     autoDownloadModel*: bool
@@ -396,6 +644,9 @@ type
     inputDeviceObject*: PyObject
     workerState*: PlasticMetisWorkerState
     workerThread*: Thread[PlasticMetisWorkerState]
+    lastDiagnostic*: JsonNode
+    startupAttempted*: bool
+    startupFailed*: bool
     runtimePrepared*: bool
     modelPrepared*: bool
     initialized*: bool
@@ -430,6 +681,7 @@ type
     lastGeometryKey*: string
     lastLayoutSnapshot*: string
     nativeHandle*: pointer
+    nativeContainer*: pointer
     desktopOwner*: pointer
     eventHandler*: PlasticForeignEventProc
   PlasticForeignCreateProc* = proc(element: PlasticForeignElementRuntime) 
@@ -467,6 +719,7 @@ type
 
   PlasticLlamaRuntime* = ref object
     config*: PlasticLlamaConfig
+    metisMemory*: PlasticMetisMemory
     executablePath*: string
     modelPath*: string
     modelRepo*: string
@@ -519,7 +772,7 @@ type
     intoKind*: string
     intoName*: string
 
-  PlasticAgentFunctionPlan* = object
+  PlasticAgentToolPlan* = object
     name*: string
     parameters*: JsonNode
     returnType*: string
@@ -582,6 +835,109 @@ type
     stopping*: bool
     active*: bool
 
+  PlasticAssistantConfig* = object
+    enabled*: bool
+    builtInShell*: bool
+    assistantName*: string
+    systemPrompt*: string
+    language*: string
+    voiceName*: string
+    voiceRecognition*: string
+    whisperBinary*: string
+    whisperModel*: string
+    ffmpegBinary*: string
+    rlmAgent*: string
+    autoSpeak*: bool
+    autoSendVoice*: bool
+    backgroundLearning*: bool
+    maxRecentMessages*: int
+    maxMemoryItems*: int
+    responseMaxTokens*: int
+    learningMaxTokens*: int
+
+  PlasticAssistantChatJob* = object
+    sessionId*: string
+    messageId*: string
+    userText*: string
+    messages*: JsonNode
+
+  PlasticAssistantLearningJob* = object
+    sessionId*: string
+    userText*: string
+    assistantText*: string
+
+  PlasticAssistantVoiceJob* = object
+    audioBase64*: string
+    mimeType*: string
+
+  PlasticAssistantVoiceWorkerState* = ref object
+    runtime*: PlasticAssistantRuntime
+    queueLock*: Lock
+    jobs*: seq[PlasticAssistantVoiceJob]
+    running*: bool
+    stopping*: bool
+    active*: bool
+    processed*: int
+    failed*: int
+    lastError*: string
+
+  PlasticAssistantChatWorkerState* = ref object
+    runtime*: PlasticAssistantRuntime
+    queueLock*: Lock
+    jobs*: seq[PlasticAssistantChatJob]
+    running*: bool
+    stopping*: bool
+    active*: bool
+    processed*: int
+    failed*: int
+    lastError*: string
+
+  PlasticAssistantLearningWorkerState* = ref object
+    runtime*: PlasticAssistantRuntime
+    queueLock*: Lock
+    jobs*: seq[PlasticAssistantLearningJob]
+    running*: bool
+    stopping*: bool
+    active*: bool
+    processed*: int
+    skipped*: int
+    failed*: int
+    lastError*: string
+
+  PlasticAssistantRuntime* = ref object
+    config*: PlasticAssistantConfig
+    metisMemory*: PlasticMetisMemory
+    rootPath*: string
+    sessionsPath*: string
+    sessionsIndexPath*: string
+    thingsPath*: string
+    endpoint*: string
+    modelAlias*: string
+    activeSession*: string
+    sessions*: JsonNode
+    things*: JsonNode
+    dataLock*: Lock
+    sequence*: int64
+    revision*: int64
+    publishedRevision*: int64
+    status*: string
+    voiceState*: string
+    lastResponse*: string
+    lastResponseId*: string
+    lastTranscript*: string
+    lastTranscriptId*: string
+    lastError*: string
+    voiceCaptureProcess*: Process
+    voiceCapturePath*: string
+    agentRunner*: proc(input: JsonNode): JsonNode {.closure.}
+    started*: bool
+    voiceWorkerState*: PlasticAssistantVoiceWorkerState
+    voiceThread*: Thread[PlasticAssistantVoiceWorkerState]
+    chatState*: PlasticAssistantChatWorkerState
+    chatThread*: Thread[PlasticAssistantChatWorkerState]
+    learningState*: PlasticAssistantLearningWorkerState
+    learningThread*: Thread[PlasticAssistantLearningWorkerState]
+
   PlasticApplication* = ref object
     nameValue*: string
     productValue*: PlasticProductConfig
@@ -593,6 +949,7 @@ type
     ormValue*: PlasticOrmRuntime
     okfValue*: PlasticOkfRuntime
     metisMemoryValue*: PlasticMetisMemory
+    assistantValue*: PlasticAssistantRuntime
     safeStorageValue*: PlasticSafeStorageRuntime
     foreignValue*: PlasticForeignRuntime
     llamaValue*: PlasticLlamaRuntime
@@ -623,7 +980,7 @@ type
     metisSession*: string
     domainPlan*: JsonNode
     rlmConditions*: string
-    functionPlans*: JsonNode
+    toolPlans*: JsonNode
     application*: PlasticApplication
     sessionVariables*: Table[string, JsonNode]
     hookDispatching*: bool
@@ -643,6 +1000,3030 @@ type
 
   PlasticRlmRuntime* = ref object
     capabilities*: Table[string, PlasticCapability]
+
+
+const PlasticAssistantHandlerId* = "glaucoplastic-assistant"
+
+proc plasticAssistantUtcNow(): string =
+  getTime().utc.format("yyyy-MM-dd'T'HH:mm:ss'Z'")
+
+proc plasticAssistantEnvEnabled(name: string; fallback: bool): bool =
+  let fallbackText = if fallback: "1" else: "0"
+  getEnv(name, fallbackText).strip.toLowerAscii in
+    ["1", "true", "yes", "on", "enabled"]
+
+proc plasticDefaultAssistantConfig*(applicationName: string): PlasticAssistantConfig =
+  PlasticAssistantConfig(
+    enabled: plasticAssistantEnvEnabled("GLAUCOPLASTIC_ASSISTANT_ENABLED", false),
+    builtInShell: plasticAssistantEnvEnabled(
+      "GLAUCOPLASTIC_ASSISTANT_BUILTIN_SHELL",
+      true
+    ),
+    assistantName: getEnv("GLAUCOPLASTIC_ASSISTANT_NAME", applicationName),
+    systemPrompt: getEnv(
+      "GLAUCOPLASTIC_ASSISTANT_SYSTEM_PROMPT",
+      "Você é um assistente pessoal local. Responda com clareza, preserve " &
+      "continuidade entre sessões e não invente fatos sobre o usuário."
+    ),
+    language: getEnv("GLAUCOPLASTIC_ASSISTANT_LANGUAGE", "pt-BR"),
+    voiceName: getEnv("GLAUCOPLASTIC_ASSISTANT_VOICE", ""),
+    voiceRecognition: getEnv("GLAUCOPLASTIC_VOICE_RECOGNITION", "system-microphone"),
+    whisperBinary: getEnv("GLAUCOPLASTIC_WHISPER_BINARY", "whisper-cli"),
+    whisperModel: getEnv("GLAUCOPLASTIC_WHISPER_MODEL", ""),
+    ffmpegBinary: getEnv("GLAUCOPLASTIC_FFMPEG_BINARY", "ffmpeg"),
+    rlmAgent: getEnv("GLAUCOPLASTIC_ASSISTANT_RLM_AGENT", ""),
+    autoSpeak: plasticAssistantEnvEnabled(
+      "GLAUCOPLASTIC_ASSISTANT_AUTO_SPEAK",
+      true
+    ),
+    autoSendVoice: plasticAssistantEnvEnabled(
+      "GLAUCOPLASTIC_ASSISTANT_AUTO_SEND_VOICE",
+      true
+    ),
+    backgroundLearning: plasticAssistantEnvEnabled(
+      "GLAUCOPLASTIC_ASSISTANT_BACKGROUND_LEARNING",
+      true
+    ),
+    maxRecentMessages: plasticParseIntFallback(
+      getEnv("GLAUCOPLASTIC_ASSISTANT_RECENT_MESSAGES", "18"),
+      18
+    ),
+    maxMemoryItems: plasticParseIntFallback(
+      getEnv("GLAUCOPLASTIC_ASSISTANT_MEMORY_ITEMS", "16"),
+      16
+    ),
+    responseMaxTokens: plasticParseIntFallback(
+      getEnv("GLAUCOPLASTIC_ASSISTANT_RESPONSE_TOKENS", "1024"),
+      1024
+    ),
+    learningMaxTokens: plasticParseIntFallback(
+      getEnv("GLAUCOPLASTIC_ASSISTANT_LEARNING_TOKENS", "512"),
+      512
+    )
+  )
+
+proc plasticAssistantReadJson(path: string; fallback: JsonNode): JsonNode =
+  if path.len == 0 or not fileExists(path):
+    return fallback.copy
+  try:
+    result = parseJson(readFile(path))
+  except CatchableError:
+    result = fallback.copy
+
+proc plasticAssistantWriteJson(path: string; value: JsonNode) =
+  if path.len == 0:
+    return
+  createDir(path.parentDir)
+  let temporaryPath = path & ".tmp"
+  writeFile(temporaryPath, value.pretty())
+  if fileExists(path):
+    removeFile(path)
+  moveFile(temporaryPath, path)
+
+proc plasticAssistantNormalizeWords(value: string): seq[string] =
+  var normalized = newStringOfCap(value.len)
+  for character in value.toLowerAscii:
+    if character.isAlphaNumeric:
+      normalized.add character
+    else:
+      normalized.add ' '
+  for part in normalized.splitWhitespace:
+    if part.len >= 3 and part notin result:
+      result.add part
+
+proc plasticAssistantNextIdUnlocked(
+  runtime: PlasticAssistantRuntime;
+  prefix: string
+): string =
+  inc runtime.sequence
+  prefix & "-" & $epochTime().int64 & "-" & $runtime.sequence
+
+proc plasticAssistantSessionIndexUnlocked(
+  runtime: PlasticAssistantRuntime;
+  sessionId: string
+): int =
+  if runtime.sessions.kind != JArray:
+    return -1
+  for index in 0 ..< runtime.sessions.len:
+    let session = runtime.sessions[index]
+    if session.kind == JObject and session.hasKey("id") and
+        session["id"].kind == JString and session["id"].getStr == sessionId:
+      return index
+  -1
+
+proc plasticAssistantSessionPath(
+  runtime: PlasticAssistantRuntime;
+  sessionId: string
+): string =
+  var safe = ""
+  for character in sessionId:
+    if character.isAlphaNumeric or character in {'-', '_'}:
+      safe.add character
+  if safe.len == 0:
+    safe = "session"
+  runtime.sessionsPath / (safe & ".json")
+
+proc plasticAssistantSaveUnlocked(runtime: PlasticAssistantRuntime) =
+  createDir(runtime.rootPath)
+  createDir(runtime.sessionsPath)
+
+  var index = newJArray()
+  if runtime.sessions.kind == JArray:
+    for session in runtime.sessions.items:
+      if session.kind != JObject or not session.hasKey("id") or
+          session["id"].kind != JString:
+        continue
+      let sessionId = session["id"].getStr
+      plasticAssistantWriteJson(
+        runtime.plasticAssistantSessionPath(sessionId),
+        session
+      )
+      index.add %*{
+        "id": sessionId,
+        "title": if session.hasKey("title"): session["title"] else: %"Nova sessão",
+        "createdAt": if session.hasKey("createdAt"): session["createdAt"] else: %plasticAssistantUtcNow(),
+        "updatedAt": if session.hasKey("updatedAt"): session["updatedAt"] else: %plasticAssistantUtcNow(),
+        "summary": if session.hasKey("summary"): session["summary"] else: %""
+      }
+
+  plasticAssistantWriteJson(runtime.sessionsIndexPath, index)
+  plasticAssistantWriteJson(runtime.thingsPath, runtime.things)
+
+proc plasticAssistantNewSessionUnlocked(
+  runtime: PlasticAssistantRuntime;
+  title = "Nova sessão"
+): string =
+  let sessionId = runtime.plasticAssistantNextIdUnlocked("session")
+  let timestamp = plasticAssistantUtcNow()
+  let session = %*{
+    "id": sessionId,
+    "title": title,
+    "createdAt": timestamp,
+    "updatedAt": timestamp,
+    "summary": "",
+    "messages": newJArray()
+  }
+  if runtime.sessions.kind != JArray:
+    runtime.sessions = newJArray()
+  var sessions = newJArray()
+  sessions.add session
+  for existing in runtime.sessions.items:
+    sessions.add existing.copy
+  runtime.sessions = sessions
+  runtime.activeSession = sessionId
+  inc runtime.revision
+  result = sessionId
+
+proc newPlasticAssistantRuntime*(
+  applicationName, dataRoot, endpoint, modelAlias: string
+): PlasticAssistantRuntime =
+  let rootPath = dataRoot / ".glauco" / "assistant"
+  result = PlasticAssistantRuntime(
+    config: plasticDefaultAssistantConfig(applicationName),
+    rootPath: rootPath,
+    sessionsPath: rootPath / "sessions",
+    sessionsIndexPath: rootPath / "sessions.json",
+    thingsPath: rootPath / "things.json",
+    endpoint: endpoint,
+    modelAlias: modelAlias,
+    sessions: newJArray(),
+    things: newJArray(),
+    status: "idle",
+    voiceState: "idle",
+    publishedRevision: -1
+  )
+  initLock(result.dataLock)
+
+proc prepare*(runtime: PlasticAssistantRuntime) =
+  if runtime.isNil:
+    return
+  acquire(runtime.dataLock)
+  try:
+    createDir(runtime.rootPath)
+    createDir(runtime.sessionsPath)
+    runtime.things = plasticAssistantReadJson(
+      runtime.thingsPath,
+      newJArray()
+    )
+    if runtime.things.kind != JArray:
+      runtime.things = newJArray()
+
+    let index = plasticAssistantReadJson(
+      runtime.sessionsIndexPath,
+      newJArray()
+    )
+    runtime.sessions = newJArray()
+    if index.kind == JArray:
+      for metadata in index.items:
+        if metadata.kind != JObject or not metadata.hasKey("id") or
+            metadata["id"].kind != JString:
+          continue
+        let sessionId = metadata["id"].getStr
+        let session = plasticAssistantReadJson(
+          runtime.plasticAssistantSessionPath(sessionId),
+          newJNull()
+        )
+        if session.kind == JObject:
+          runtime.sessions.add session
+
+    if runtime.sessions.len == 0:
+      discard runtime.plasticAssistantNewSessionUnlocked()
+    else:
+      runtime.activeSession = runtime.sessions[0]["id"].getStr
+
+    runtime.status = "ready"
+    runtime.lastError = ""
+    inc runtime.revision
+    runtime.plasticAssistantSaveUnlocked()
+  finally:
+    release(runtime.dataLock)
+
+proc plasticAssistantMessagesForPromptUnlocked(
+  runtime: PlasticAssistantRuntime;
+  sessionId, userText: string;
+  upToMessageId = ""
+): JsonNode =
+  result = newJArray()
+  result.add %*{
+    "role": "system",
+    "content": runtime.config.systemPrompt & "\n\n" &
+      "Idioma preferencial: " & runtime.config.language & "."
+  }
+
+  var memoryItems = newJArray()
+  let queryWords = plasticAssistantNormalizeWords(userText)
+  var candidates: seq[tuple[score: int, item: JsonNode]] = @[]
+  if runtime.things.kind == JArray:
+    for item in runtime.things.items:
+      if item.kind != JObject:
+        continue
+      if item.hasKey("status") and item["status"].kind == JString and
+          item["status"].getStr == "forgotten":
+        continue
+      let scope =
+        if item.hasKey("scope") and item["scope"].kind == JString:
+          item["scope"].getStr
+        else:
+          "global"
+      if scope != "global" and scope != "session:" & sessionId:
+        continue
+      let content =
+        (if item.hasKey("title") and item["title"].kind == JString:
+          item["title"].getStr else: "") & " " &
+        (if item.hasKey("content") and item["content"].kind == JString:
+          item["content"].getStr else: "")
+      let words = plasticAssistantNormalizeWords(content)
+      var score =
+        if item.hasKey("pinned") and item["pinned"].kind == JBool and
+            item["pinned"].getBool: 100 else: 0
+      for word in queryWords:
+        if word in words:
+          inc score, 4
+        elif content.toLowerAscii.contains(word):
+          inc score
+      if scope == "global":
+        inc score
+      candidates.add (score: score, item: item.copy)
+
+  candidates.sort(proc(a, b: tuple[score: int, item: JsonNode]): int =
+    cmp(b.score, a.score)
+  )
+  for index, candidate in candidates:
+    if index >= max(0, runtime.config.maxMemoryItems):
+      break
+    memoryItems.add candidate.item
+
+  if memoryItems.len > 0:
+    result.add %*{
+      "role": "system",
+      "content": "Coisas persistentes conhecidas sobre o usuário e seus contextos:\n" &
+        memoryItems.pretty()
+    }
+
+  let sessionIndex = runtime.plasticAssistantSessionIndexUnlocked(sessionId)
+  if sessionIndex >= 0:
+    let session = runtime.sessions[sessionIndex]
+    if session.hasKey("summary") and session["summary"].kind == JString and
+        session["summary"].getStr.strip.len > 0:
+      result.add %*{
+        "role": "system",
+        "content": "Resumo da sessão: " & session["summary"].getStr
+      }
+    if session.hasKey("messages") and
+        session["messages"].kind == JArray:
+      let messages = session["messages"]
+      var lastIndex = messages.len - 1
+
+      if upToMessageId.len > 0:
+        lastIndex = -1
+        for index in 0 ..< messages.len:
+          let message = messages[index]
+          if message.kind == JObject and
+              message.hasKey("id") and
+              message["id"].kind == JString and
+              message["id"].getStr == upToMessageId:
+            lastIndex = index
+            break
+
+      if lastIndex >= 0:
+        let firstIndex = max(
+          0,
+          lastIndex + 1 - runtime.config.maxRecentMessages
+        )
+
+        for index in firstIndex .. lastIndex:
+          let message = messages[index]
+          if message.kind == JObject and
+              message.hasKey("role") and
+              message.hasKey("content"):
+            result.add %*{
+              "role": message["role"],
+              "content": message["content"]
+            }
+
+proc plasticAssistantLlamaChat(
+  runtime: PlasticAssistantRuntime;
+  messages: JsonNode;
+  maxTokens: int;
+  jsonResponse = false
+): string =
+  discard messages
+  discard maxTokens
+  discard jsonResponse
+
+  if runtime.isNil:
+    raise newException(
+      PlasticRuntimeError,
+      "Runtime do assistente indisponível."
+    )
+
+  if runtime.metisMemory.isNil:
+    raise newException(
+      PlasticRuntimeError,
+      "O assistente está configurado para inferência exclusiva pelo " &
+      "IAAR-Shanghai/Metis-4B, mas o runtime Metis não foi associado."
+    )
+
+  raise newException(
+    PlasticRuntimeError,
+    "Inferência exclusiva pelo Metis requer um rlmAgent associado ao " &
+    "assistente. Nenhum llama-server ou modelo GGUF será iniciado."
+  )
+
+proc plasticAssistantAppendMessageUnlocked(
+  runtime: PlasticAssistantRuntime;
+  sessionId, role, content: string
+): string =
+  let sessionIndex = runtime.plasticAssistantSessionIndexUnlocked(sessionId)
+  if sessionIndex < 0:
+    return ""
+  var session = runtime.sessions[sessionIndex]
+  if not session.hasKey("messages") or session["messages"].kind != JArray:
+    session["messages"] = newJArray()
+  let messageId = runtime.plasticAssistantNextIdUnlocked("message")
+  let timestamp = plasticAssistantUtcNow()
+  session["messages"].add %*{
+    "id": messageId,
+    "role": role,
+    "content": content,
+    "createdAt": timestamp
+  }
+  session["updatedAt"] = %timestamp
+  if role == "user" and
+      (not session.hasKey("title") or
+       session["title"].kind != JString or
+       session["title"].getStr in ["", "Nova sessão"]):
+    let cleaned = content.strip.replace("\n", " ")
+    session["title"] = %(
+      if cleaned.len > 48: cleaned[0 .. 47] & "…" else: cleaned
+    )
+  # `session` referencia diretamente o JsonNode armazenado no array.
+  # As mutações acima já foram aplicadas em `runtime.sessions`.
+  inc runtime.revision
+  result = messageId
+
+
+# GLAUCOPLASTIC_ASSISTANT_STRICT_DEDUPE_V1
+proc plasticAssistantLearningKey(value: string): string =
+  result = value.toLowerAscii.splitWhitespace.join(" ")
+
+proc plasticAssistantIsNameLearningCandidate(
+  candidate: JsonNode
+): bool =
+  if candidate.kind != JObject:
+    return false
+
+  let title =
+    if candidate.hasKey("title") and
+        candidate["title"].kind == JString:
+      plasticAssistantLearningKey(candidate["title"].getStr)
+    else:
+      ""
+
+  let content =
+    if candidate.hasKey("content") and
+        candidate["content"].kind == JString:
+      plasticAssistantLearningKey(candidate["content"].getStr)
+    else:
+      ""
+
+  result =
+    title in [
+      "nome do usuário",
+      "nome do usuario",
+      "nome completo do usuário",
+      "nome completo do usuario"
+    ] or
+    content.startsWith("nome do usuário:") or
+    content.startsWith("nome do usuario:")
+
+proc plasticAssistantIsLearningNoise(
+  candidate: JsonNode
+): bool =
+  if candidate.kind != JObject:
+    return true
+
+  let title =
+    if candidate.hasKey("title") and
+        candidate["title"].kind == JString:
+      plasticAssistantLearningKey(candidate["title"].getStr)
+    else:
+      ""
+
+  let content =
+    if candidate.hasKey("content") and
+        candidate["content"].kind == JString:
+      plasticAssistantLearningKey(candidate["content"].getStr)
+    else:
+      ""
+
+  let combined = title & " " & content
+  for phrase in [
+    "o usuário perguntou",
+    "o usuario perguntou",
+    "usuário identificado na sessão",
+    "usuario identificado na sessao",
+    "usuário se apresentou",
+    "usuario se apresentou",
+    "o assistente não possui acesso",
+    "o assistente nao possui acesso",
+    "o assistente não armazena",
+    "o assistente nao armazena",
+    "nenhuma informação durável",
+    "nenhuma informacao duravel",
+    "início de sessão",
+    "inicio de sessao"
+  ]:
+    if combined.contains(phrase):
+      return true
+
+  result = false
+
+proc plasticAssistantNormalizeLearningCandidate*(
+  existingThings, candidate: JsonNode
+): JsonNode =
+  if candidate.kind != JObject:
+    return newJNull()
+
+  let title =
+    if candidate.hasKey("title") and
+        candidate["title"].kind == JString:
+      candidate["title"].getStr.strip
+    else:
+      ""
+
+  let content =
+    if candidate.hasKey("content") and
+        candidate["content"].kind == JString:
+      candidate["content"].getStr.strip
+    else:
+      ""
+
+  if title.len == 0 or content.len == 0:
+    return newJNull()
+
+  # Nome é propriedade determinística. O worker inferencial nunca grava nome.
+  if plasticAssistantIsNameLearningCandidate(candidate):
+    return newJNull()
+
+  if plasticAssistantIsLearningNoise(candidate):
+    return newJNull()
+
+  let titleKey = plasticAssistantLearningKey(title)
+  let contentKey = plasticAssistantLearningKey(content)
+  let scope =
+    if candidate.hasKey("scope") and
+        candidate["scope"].kind == JString:
+      candidate["scope"].getStr
+    else:
+      "global"
+
+  if existingThings.kind == JArray:
+    for existing in existingThings.items:
+      if existing.kind != JObject:
+        continue
+
+      if existing.hasKey("status") and
+          existing["status"].kind == JString and
+          existing["status"].getStr == "forgotten":
+        continue
+
+      let existingTitle =
+        if existing.hasKey("title") and
+            existing["title"].kind == JString:
+          plasticAssistantLearningKey(existing["title"].getStr)
+        else:
+          ""
+
+      let existingContent =
+        if existing.hasKey("content") and
+            existing["content"].kind == JString:
+          plasticAssistantLearningKey(existing["content"].getStr)
+        else:
+          ""
+
+      let existingScope =
+        if existing.hasKey("scope") and
+            existing["scope"].kind == JString:
+          existing["scope"].getStr
+        else:
+          "global"
+
+      if existingContent.len > 0 and
+          existingContent == contentKey:
+        return newJNull()
+
+      if existingTitle.len > 0 and
+          existingTitle == titleKey and
+          existingScope == scope:
+        if existingContent == contentKey:
+          return newJNull()
+        return candidate.copy
+
+      if scope.startsWith("session:") and
+          existingScope == "global" and
+          existingTitle.len > 0 and
+          existingTitle == titleKey:
+        return newJNull()
+
+  result = candidate.copy
+
+proc plasticAssistantUpsertThingUnlocked(
+  runtime: PlasticAssistantRuntime;
+  sourceSession: string;
+  candidate: JsonNode
+) =
+  if candidate.kind != JObject:
+    return
+  let title =
+    if candidate.hasKey("title") and candidate["title"].kind == JString:
+      candidate["title"].getStr.strip
+    else:
+      ""
+  let content =
+    if candidate.hasKey("content") and candidate["content"].kind == JString:
+      candidate["content"].getStr.strip
+    else:
+      ""
+  if title.len == 0 or content.len == 0:
+    return
+
+  let operation =
+    if candidate.hasKey("operation") and candidate["operation"].kind == JString:
+      candidate["operation"].getStr.toLowerAscii
+    else:
+      "upsert"
+  let scope =
+    if candidate.hasKey("scope") and candidate["scope"].kind == JString:
+      candidate["scope"].getStr
+    else:
+      "global"
+  let normalizedTitle = title.toLowerAscii
+
+  var found = -1
+  if runtime.things.kind != JArray:
+    runtime.things = newJArray()
+  for index in 0 ..< runtime.things.len:
+    let item = runtime.things[index]
+    if item.kind == JObject and item.hasKey("title") and
+        item["title"].kind == JString and
+        item["title"].getStr.toLowerAscii == normalizedTitle and
+        item.hasKey("scope") and item["scope"].kind == JString and
+        item["scope"].getStr == scope:
+      found = index
+      break
+
+  if operation in ["delete", "forget", "remove"]:
+    if found >= 0:
+      runtime.things[found]["status"] = %"forgotten"
+      runtime.things[found]["updatedAt"] = %plasticAssistantUtcNow()
+    return
+
+  let timestamp = plasticAssistantUtcNow()
+  let thingId =
+    if found >= 0 and runtime.things[found].hasKey("id"):
+      runtime.things[found]["id"].copy
+    else:
+      %runtime.plasticAssistantNextIdUnlocked("thing")
+  let thingKind =
+    if candidate.hasKey("kind"):
+      candidate["kind"].copy
+    else:
+      %"fact"
+  let confidence =
+    if candidate.hasKey("confidence"):
+      candidate["confidence"].copy
+    else:
+      %0.75
+  let pinned =
+    if found >= 0 and runtime.things[found].hasKey("pinned"):
+      runtime.things[found]["pinned"].copy
+    else:
+      %false
+  let createdAt =
+    if found >= 0 and runtime.things[found].hasKey("createdAt"):
+      runtime.things[found]["createdAt"].copy
+    else:
+      %timestamp
+  var thing = %*{
+    "id": thingId,
+    "kind": thingKind,
+    "title": title,
+    "content": content,
+    "scope": scope,
+    "confidence": confidence,
+    "status": "active",
+    "pinned": pinned,
+    "sourceSessionId": sourceSession,
+    "createdAt": createdAt,
+    "updatedAt": timestamp
+  }
+  if found >= 0:
+    # A expressão `runtime.things[found]` não é um lvalue atribuível no Nim.
+    # Reconstruímos o array substituindo somente o item encontrado.
+    var things = newJArray()
+    var existingIndex = 0
+    for existing in runtime.things.items:
+      if existingIndex == found:
+        things.add thing
+      else:
+        things.add existing.copy
+      inc existingIndex
+    runtime.things = things
+  else:
+    var things = newJArray()
+    things.add thing
+    for existing in runtime.things.items:
+      things.add existing.copy
+    runtime.things = things
+
+
+# GLAUCOPLASTIC_ASSISTANT_DETERMINISTIC_LEARNING_V1
+proc plasticAssistantCleanDeclaredValue(value: string): string =
+  result = value.strip
+
+  while result.len > 0 and
+      result[0] in {' ', '\t', '\r', '\n', '"', '\''}:
+    result.delete(0, 0)
+
+  while result.len > 0 and
+      result[^1] in {
+        ' ', '\t', '\r', '\n', '"', '\'',
+        '.', ',', ';', ':', '!', '?'
+      }:
+    result.setLen(result.len - 1)
+
+  result = result.strip
+
+proc plasticAssistantDeclaredUserName(
+  userText: string
+): string =
+  let statement = userText.strip
+  if statement.len == 0 or '?' in statement:
+    return ""
+
+  let lowered = statement.toLowerAscii
+  let prefixes = @[
+    "meu nome completo é ",
+    "meu nome completo e ",
+    "meu nome é ",
+    "meu nome e ",
+    "eu me chamo ",
+    "pode me chamar de "
+  ]
+
+  for prefix in prefixes:
+    if lowered.startsWith(prefix):
+      if statement.len <= prefix.len:
+        return ""
+      result = plasticAssistantCleanDeclaredValue(
+        statement[prefix.len .. ^1]
+      )
+      break
+
+  if result.len < 2 or result.len > 160:
+    result = ""
+    return
+
+  if '\n' in result or '\r' in result:
+    result = ""
+
+proc plasticAssistantApplyDeterministicLearningUnlocked(
+  runtime: PlasticAssistantRuntime;
+  sourceSession, userText: string
+): bool =
+  if runtime.isNil:
+    return false
+
+  if getEnv(
+      "GLAUCOPLASTIC_ASSISTANT_DETERMINISTIC_LEARNING",
+      "1"
+    ).strip.toLowerAscii in ["0", "false", "no", "off", "disabled"]:
+    return false
+
+  let declaredName = plasticAssistantDeclaredUserName(userText)
+  if declaredName.len == 0:
+    return false
+
+  runtime.plasticAssistantUpsertThingUnlocked(
+    sourceSession,
+    %*{
+      "kind": "person",
+      "title": "Nome do Usuário",
+      "content": declaredName,
+      "scope": "global",
+      "confidence": 1.0,
+      "operation": "upsert"
+    }
+  )
+
+  plasticDebugTrace(
+    "assistant.learning.deterministic " &
+    "title=Nome do Usuário content=" & declaredName
+  )
+
+  result = true
+
+proc plasticAssistantResultText(value: JsonNode): string {.gcsafe.}
+proc runPlasticAssistantChatWorker(
+  state: PlasticAssistantChatWorkerState
+) {.thread.} =
+  if state.isNil:
+    return
+  state.running = true
+  while not state.stopping:
+    var hasJob = false
+    var job: PlasticAssistantChatJob
+    acquire(state.queueLock)
+    if state.jobs.len > 0:
+      job = state.jobs[0]
+      state.jobs.delete(0)
+      state.active = true
+      hasJob = true
+    release(state.queueLock)
+
+    if not hasJob:
+      sleep(25)
+      continue
+
+    let runtime = state.runtime
+    acquire(runtime.dataLock)
+    runtime.status = "thinking"
+    runtime.lastError = ""
+    inc runtime.revision
+    release(runtime.dataLock)
+
+    try:
+      var promptMessages = newJArray()
+
+      acquire(runtime.dataLock)
+      try:
+        promptMessages =
+          runtime.plasticAssistantMessagesForPromptUnlocked(
+            job.sessionId,
+            job.userText,
+            job.messageId
+          )
+      finally:
+        release(runtime.dataLock)
+
+      var answer: string
+      if not runtime.agentRunner.isNil:
+        var agentResult = newJNull()
+        {.cast(gcsafe).}:
+          agentResult = runtime.agentRunner(%*{
+            "message": job.userText,
+            "prompt": job.userText,
+            "session": job.sessionId,
+            "assistantContext": promptMessages.copy
+          })
+        answer = plasticAssistantResultText(agentResult)
+      else:
+        answer = plasticAssistantLlamaChat(
+          runtime,
+          promptMessages,
+          max(64, runtime.config.responseMaxTokens)
+        )
+      acquire(runtime.dataLock)
+      try:
+        let responseId = runtime.plasticAssistantAppendMessageUnlocked(
+          job.sessionId,
+          "assistant",
+          answer
+        )
+        runtime.lastResponse = answer
+        runtime.lastResponseId = responseId
+        runtime.status = "ready"
+        discard runtime.plasticAssistantApplyDeterministicLearningUnlocked(
+          job.sessionId,
+          job.userText
+        )
+        runtime.plasticAssistantSaveUnlocked()
+      finally:
+        release(runtime.dataLock)
+
+      # O agente RLM já registra a troca no estado tensorial do Metis.
+      # O worker legado de extração textual só permanece para assistentes sem
+      # agente, evitando uma segunda inferência ou qualquer fallback GGUF.
+      if runtime.config.backgroundLearning and runtime.agentRunner.isNil:
+        acquire(runtime.learningState.queueLock)
+        runtime.learningState.jobs.add PlasticAssistantLearningJob(
+          sessionId: job.sessionId,
+          userText: job.userText,
+          assistantText: answer
+        )
+        release(runtime.learningState.queueLock)
+      inc state.processed
+    except CatchableError as error:
+      plasticDebugTrace(
+        "assistant.chat.error session=" &
+        job.sessionId &
+        " messageId=" &
+        job.messageId &
+        " error=" &
+        error.msg
+      )
+      acquire(runtime.dataLock)
+      runtime.status = "error"
+      runtime.lastError = error.msg
+      inc runtime.revision
+      release(runtime.dataLock)
+      state.lastError = error.msg
+      inc state.failed
+
+    acquire(state.queueLock)
+    state.active = false
+    release(state.queueLock)
+  state.running = false
+
+proc runPlasticAssistantLearningWorker(
+  state: PlasticAssistantLearningWorkerState
+) {.thread.} =
+  if state.isNil:
+    return
+  state.running = true
+  while not state.stopping:
+    var hasJob = false
+    var job: PlasticAssistantLearningJob
+    acquire(state.queueLock)
+    if state.jobs.len > 0:
+      job = state.jobs[0]
+      state.jobs.delete(0)
+      state.active = true
+      hasJob = true
+    release(state.queueLock)
+
+    if not hasJob:
+      sleep(50)
+      continue
+
+    let runtime = state.runtime
+    var existingThings = newJArray()
+    acquire(runtime.dataLock)
+    try:
+      if runtime.things.kind == JArray:
+        for item in runtime.things.items:
+          if item.kind == JObject and
+              (not item.hasKey("status") or
+               item["status"].kind != JString or
+               item["status"].getStr != "forgotten"):
+            existingThings.add item.copy
+    finally:
+      release(runtime.dataLock)
+    let prompt = """
+Você é um filtro conservador e rigoroso de memória persistente.
+
+Extraia somente fatos declarados explicitamente pelo USUÁRIO e úteis em
+sessões futuras. O texto do ASSISTENTE é apenas contexto e nunca cria memória.
+
+REGRAS OBRIGATÓRIAS:
+1. Perguntas não são fatos.
+2. Respostas do assistente que repetem algo conhecido não são fatos novos.
+3. Não registre cumprimentos, atividade da sessão, ausência de dados,
+   limitações do assistente ou resumos do diálogo como things.
+4. Não produza "o usuário perguntou", "usuário identificado",
+   "usuário se apresentou" ou equivalentes.
+5. Compare semanticamente com MEMÓRIAS EXISTENTES.
+6. Não crie sinônimo, título alternativo, reformulação ou cópia em outro scope.
+7. Correção ou detalhamento usa exatamente o mesmo title e scope com upsert.
+8. Nunca use o próprio valor como title.
+9. Nome e nome completo são tratados deterministicamente pelo runtime.
+   Para declaração, pergunta ou repetição de nome, retorne things=[].
+10. Prefira things=[] a qualquer memória incerta ou redundante.
+11. Retorne somente JSON válido:
+{
+  "sessionSummary": "resumo curto",
+  "things": [
+    {
+      "kind": "preference|project|person|decision|task|vocabulary|instruction|fact",
+      "title": "rótulo curto e canônico",
+      "content": "informação declarativa",
+      "scope": "global ou session:ID",
+      "confidence": 0.0,
+      "operation": "upsert|forget"
+    }
+  ]
+}
+"""
+    let messages = %*[
+      %*{"role": "system", "content": prompt},
+      %*{
+        "role": "user",
+        "content": "Sessão: " & job.sessionId &
+          "\nMEMÓRIAS EXISTENTES:\n" & $existingThings &
+          "\nUSUÁRIO:\n" & job.userText &
+          "\nASSISTENTE:\n" & job.assistantText
+      }
+    ]
+
+    try:
+      let content = plasticAssistantLlamaChat(
+        runtime,
+        messages,
+        max(128, runtime.config.learningMaxTokens),
+        true
+      )
+      let objectStart = content.find('{')
+      let objectEnd = content.rfind('}')
+      let payload = parseJson(
+        if objectStart >= 0 and objectEnd >= objectStart:
+          content[objectStart .. objectEnd]
+        else:
+          content
+      )
+      plasticDebugTrace(
+        "assistant.learning.response session=" &
+        job.sessionId & " payload=" & $payload
+      )
+      acquire(runtime.dataLock)
+      try:
+        let sessionIndex = runtime.plasticAssistantSessionIndexUnlocked(
+          job.sessionId
+        )
+        if sessionIndex >= 0 and payload.hasKey("sessionSummary") and
+            payload["sessionSummary"].kind == JString:
+          runtime.sessions[sessionIndex]["summary"] =
+            payload["sessionSummary"].copy
+        if payload.hasKey("things") and payload["things"].kind == JArray:
+          for candidate in payload["things"].items:
+            let normalized =
+              plasticAssistantNormalizeLearningCandidate(
+                runtime.things,
+                candidate
+              )
+            if normalized.kind == JObject:
+              runtime.plasticAssistantUpsertThingUnlocked(
+                job.sessionId,
+                normalized
+              )
+            else:
+              plasticDebugTrace(
+                "assistant.learning.rejected " &
+                "session=" & job.sessionId &
+                " candidate=" & $candidate
+              )
+        runtime.plasticAssistantSaveUnlocked()
+        inc runtime.revision
+      finally:
+        release(runtime.dataLock)
+      inc state.processed
+      plasticDebugTrace(
+        "assistant.learning.processed session=" & job.sessionId
+      )
+    except CatchableError as error:
+      state.lastError = error.msg
+      inc state.failed
+      plasticDebugTrace(
+        "assistant.learning.error session=" &
+        job.sessionId & " error=" & error.msg
+      )
+
+    acquire(state.queueLock)
+    state.active = false
+    release(state.queueLock)
+  state.running = false
+
+proc runPlasticAssistantVoiceWorker(
+  state: PlasticAssistantVoiceWorkerState
+) {.thread.}
+
+proc start*(runtime: PlasticAssistantRuntime) =
+  if runtime.isNil or runtime.started:
+    return
+  runtime.prepare()
+  runtime.voiceWorkerState = PlasticAssistantVoiceWorkerState(runtime: runtime)
+  runtime.chatState = PlasticAssistantChatWorkerState(runtime: runtime)
+  runtime.learningState = PlasticAssistantLearningWorkerState(runtime: runtime)
+  initLock(runtime.voiceWorkerState.queueLock)
+  initLock(runtime.chatState.queueLock)
+  initLock(runtime.learningState.queueLock)
+  runtime.started = true
+  createThread(
+    runtime.voiceThread,
+    runPlasticAssistantVoiceWorker,
+    runtime.voiceWorkerState
+  )
+  createThread(
+    runtime.chatThread,
+    runPlasticAssistantChatWorker,
+    runtime.chatState
+  )
+  createThread(
+    runtime.learningThread,
+    runPlasticAssistantLearningWorker,
+    runtime.learningState
+  )
+
+proc stop*(runtime: PlasticAssistantRuntime) =
+  if runtime.isNil or not runtime.started:
+    return
+  runtime.voiceWorkerState.stopping = true
+  runtime.chatState.stopping = true
+  runtime.learningState.stopping = true
+  joinThread(runtime.voiceThread)
+  joinThread(runtime.chatThread)
+  joinThread(runtime.learningThread)
+  runtime.started = false
+
+proc enqueueMessage*(runtime: PlasticAssistantRuntime; text: string) =
+  if runtime.isNil:
+    return
+  let cleaned = text.strip
+  if cleaned.len == 0:
+    return
+  if not runtime.started:
+    runtime.start()
+
+  var job: PlasticAssistantChatJob
+  acquire(runtime.dataLock)
+  try:
+    if runtime.activeSession.len == 0 or
+        runtime.plasticAssistantSessionIndexUnlocked(runtime.activeSession) < 0:
+      discard runtime.plasticAssistantNewSessionUnlocked()
+    let sessionId = runtime.activeSession
+    let userMessageId =
+      runtime.plasticAssistantAppendMessageUnlocked(
+        sessionId,
+        "user",
+        cleaned
+      )
+
+    job = PlasticAssistantChatJob(
+      sessionId: sessionId,
+      messageId: userMessageId,
+      userText: cleaned,
+      messages: newJArray()
+    )
+    runtime.status = "queued"
+    runtime.lastError = ""
+    runtime.plasticAssistantSaveUnlocked()
+  finally:
+    release(runtime.dataLock)
+
+  acquire(runtime.chatState.queueLock)
+  runtime.chatState.jobs.add job
+  release(runtime.chatState.queueLock)
+
+proc newSession*(runtime: PlasticAssistantRuntime): string =
+  if runtime.isNil:
+    return ""
+  acquire(runtime.dataLock)
+  try:
+    result = runtime.plasticAssistantNewSessionUnlocked()
+    runtime.plasticAssistantSaveUnlocked()
+  finally:
+    release(runtime.dataLock)
+
+proc selectSession*(runtime: PlasticAssistantRuntime; sessionId: string) =
+  if runtime.isNil:
+    return
+  acquire(runtime.dataLock)
+  try:
+    if runtime.plasticAssistantSessionIndexUnlocked(sessionId) >= 0:
+      runtime.activeSession = sessionId
+      inc runtime.revision
+  finally:
+    release(runtime.dataLock)
+
+proc plasticAssistantToggleThing(
+  runtime: PlasticAssistantRuntime;
+  thingId: string;
+  forget = false
+) =
+  if runtime.isNil:
+    return
+  acquire(runtime.dataLock)
+  try:
+    if runtime.things.kind == JArray:
+      for index in 0 ..< runtime.things.len:
+        let thing = runtime.things[index]
+        if thing.kind == JObject and thing.hasKey("id") and
+            thing["id"].kind == JString and thing["id"].getStr == thingId:
+          if forget:
+            runtime.things[index]["status"] = %"forgotten"
+          else:
+            let pinned = runtime.things[index].hasKey("pinned") and
+              runtime.things[index]["pinned"].kind == JBool and
+              runtime.things[index]["pinned"].getBool
+            runtime.things[index]["pinned"] = %(not pinned)
+          runtime.things[index]["updatedAt"] = %plasticAssistantUtcNow()
+          inc runtime.revision
+          runtime.plasticAssistantSaveUnlocked()
+          break
+  finally:
+    release(runtime.dataLock)
+
+proc plasticAssistantVoiceInputDevice*(): string =
+  let configured = getEnv("GLAUCOPLASTIC_VOICE_INPUT_DEVICE", "").strip
+  if configured.len > 0:
+    return configured
+  when defined(windows):
+    "CABLE Output"
+  elif defined(macosx):
+    ":0"
+  else:
+    "glauco_phone_mic"
+
+proc plasticAssistantVoiceCaptureArgs(
+  runtime: PlasticAssistantRuntime;
+  outputPath: string
+): seq[string] =
+  let device = plasticAssistantVoiceInputDevice()
+  result = @["-hide_banner", "-loglevel", "error", "-y"]
+  when defined(windows):
+    result.add @["-f", "dshow", "-i", "audio=" & device]
+  elif defined(macosx):
+    result.add @["-f", "avfoundation", "-i", device]
+  else:
+    result.add @["-f", "pulse", "-i", device]
+  result.add @[
+    "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", outputPath
+  ]
+
+proc plasticAssistantStartNativeCapture*(runtime: PlasticAssistantRuntime) =
+  if runtime.isNil:
+    return
+  acquire(runtime.dataLock)
+  let alreadyRecording = not runtime.voiceCaptureProcess.isNil
+  release(runtime.dataLock)
+  if alreadyRecording:
+    return
+
+  let voiceRoot = runtime.rootPath / "voice"
+  createDir(voiceRoot)
+  let outputPath = voiceRoot / (
+    "native-input-" & $epochTime().int64 & "-" & $getCurrentProcessId() & ".wav"
+  )
+  try:
+    let capture = startProcess(
+      runtime.config.ffmpegBinary,
+      args = runtime.plasticAssistantVoiceCaptureArgs(outputPath),
+      options = {poUsePath, poStdErrToStdOut}
+    )
+    acquire(runtime.dataLock)
+    runtime.voiceCaptureProcess = capture
+    runtime.voiceCapturePath = outputPath
+    runtime.voiceState = "recording"
+    runtime.lastError = ""
+    inc runtime.revision
+    release(runtime.dataLock)
+  except CatchableError as error:
+    acquire(runtime.dataLock)
+    runtime.voiceState = "error"
+    runtime.lastError = "Falha ao abrir o microfone nativo: " & error.msg
+    inc runtime.revision
+    release(runtime.dataLock)
+
+proc plasticAssistantStopNativeCapture*(runtime: PlasticAssistantRuntime) =
+  if runtime.isNil:
+    return
+  var capture: Process
+  var outputPath = ""
+  acquire(runtime.dataLock)
+  capture = runtime.voiceCaptureProcess
+  outputPath = runtime.voiceCapturePath
+  runtime.voiceCaptureProcess = nil
+  runtime.voiceCapturePath = ""
+  runtime.voiceState = "stopping"
+  inc runtime.revision
+  release(runtime.dataLock)
+
+  if capture.isNil:
+    acquire(runtime.dataLock)
+    runtime.voiceState = "idle"
+    inc runtime.revision
+    release(runtime.dataLock)
+    return
+
+  try:
+    let input = capture.inputStream
+    if not input.isNil:
+      input.write("q\n")
+      input.flush()
+    let exitCode = waitForExit(capture, 5000)
+    if exitCode == -1:
+      terminate(capture)
+      discard waitForExit(capture, 2000)
+  except CatchableError:
+    try:
+      terminate(capture)
+      discard waitForExit(capture, 2000)
+    except CatchableError:
+      discard
+  finally:
+    try: close(capture)
+    except CatchableError: discard
+
+  if not fileExists(outputPath) or getFileSize(outputPath) <= 44:
+    acquire(runtime.dataLock)
+    runtime.voiceState = "error"
+    runtime.lastError = "A captura nativa não produziu áudio. Entrada: " &
+      plasticAssistantVoiceInputDevice()
+    inc runtime.revision
+    release(runtime.dataLock)
+    return
+
+  if not runtime.started:
+    runtime.start()
+  let encodedAudio = encode(readFile(outputPath))
+  try: removeFile(outputPath)
+  except CatchableError: discard
+  acquire(runtime.voiceWorkerState.queueLock)
+  runtime.voiceWorkerState.jobs.add PlasticAssistantVoiceJob(
+    audioBase64: encodedAudio,
+    mimeType: "audio/wav"
+  )
+  release(runtime.voiceWorkerState.queueLock)
+  acquire(runtime.dataLock)
+  runtime.voiceState = "queued"
+  runtime.lastError = ""
+  inc runtime.revision
+  release(runtime.dataLock)
+
+proc handleUiEvent*(
+  runtime: PlasticAssistantRuntime;
+  action: string;
+  value: JsonNode;
+  checked: bool
+) =
+  if runtime.isNil:
+    return
+  case action
+  of "assistant:send":
+    if value.kind == JString:
+      runtime.enqueueMessage(value.getStr)
+  of "assistant:new-session":
+    discard runtime.newSession()
+  of "assistant:select-session":
+    if value.kind == JString:
+      runtime.selectSession(value.getStr)
+  of "assistant:auto-speak":
+    acquire(runtime.dataLock)
+    try:
+      runtime.config.autoSpeak =
+        if value.kind == JBool: value.getBool else: checked
+      inc runtime.revision
+    finally:
+      release(runtime.dataLock)
+  of "assistant:pin-thing":
+    if value.kind == JString:
+      runtime.plasticAssistantToggleThing(value.getStr)
+  of "assistant:forget-thing":
+    if value.kind == JString:
+      runtime.plasticAssistantToggleThing(value.getStr, true)
+  of "assistant:voice-start":
+    runtime.plasticAssistantStartNativeCapture()
+  of "assistant:voice-stop":
+    runtime.plasticAssistantStopNativeCapture()
+  of "assistant:voice-audio":
+    if value.kind == JObject and value.hasKey("data") and
+        value["data"].kind == JString:
+      if not runtime.started:
+        runtime.start()
+      acquire(runtime.voiceWorkerState.queueLock)
+      runtime.voiceWorkerState.jobs.add PlasticAssistantVoiceJob(
+        audioBase64: value["data"].getStr,
+        mimeType:
+          if value.hasKey("mimeType") and value["mimeType"].kind == JString:
+            value["mimeType"].getStr
+          else:
+            "audio/webm"
+      )
+      release(runtime.voiceWorkerState.queueLock)
+      acquire(runtime.dataLock)
+      runtime.voiceState = "queued"
+      inc runtime.revision
+      release(runtime.dataLock)
+  else:
+    discard
+
+proc plasticAssistantSnapshot*(runtime: PlasticAssistantRuntime): JsonNode =
+  if runtime.isNil:
+    return newJNull()
+  acquire(runtime.dataLock)
+  try:
+    var sessions = newJArray()
+    var active = newJNull()
+    if runtime.sessions.kind == JArray:
+      for session in runtime.sessions.items:
+        if session.kind != JObject:
+          continue
+        sessions.add %*{
+          "id": if session.hasKey("id"): session["id"] else: %"",
+          "title": if session.hasKey("title"): session["title"] else: %"Nova sessão",
+          "updatedAt": if session.hasKey("updatedAt"): session["updatedAt"] else: %"",
+          "summary": if session.hasKey("summary"): session["summary"] else: %""
+        }
+        if session.hasKey("id") and session["id"].kind == JString and
+            session["id"].getStr == runtime.activeSession:
+          active = session.copy
+
+    var visibleThings = newJArray()
+    if runtime.things.kind == JArray:
+      for thing in runtime.things.items:
+        if thing.kind == JObject and
+            (not thing.hasKey("status") or thing["status"].kind != JString or
+             thing["status"].getStr != "forgotten"):
+          visibleThings.add thing.copy
+
+    var queuedMessages = 0
+    var chatActive = false
+
+    if not runtime.chatState.isNil:
+      acquire(runtime.chatState.queueLock)
+      queuedMessages = runtime.chatState.jobs.len
+      chatActive = runtime.chatState.active
+      release(runtime.chatState.queueLock)
+
+    result = %*{
+      "revision": runtime.revision,
+      "status": runtime.status,
+      "voiceState": runtime.voiceState,
+      "lastError": runtime.lastError,
+      "lastResponse": runtime.lastResponse,
+      "lastResponseId": runtime.lastResponseId,
+      "lastTranscript": runtime.lastTranscript,
+      "lastTranscriptId": runtime.lastTranscriptId,
+      "activeSessionId": runtime.activeSession,
+      "sessions": sessions,
+      "activeSession": active,
+      "things": visibleThings,
+      "chatQueue": {
+        "active": chatActive,
+        "queued": queuedMessages,
+        "totalPending":
+          queuedMessages + (if chatActive: 1 else: 0)
+      },
+      "config": {
+        "assistantName": runtime.config.assistantName,
+        "language": runtime.config.language,
+        "voiceName": runtime.config.voiceName,
+        "voiceRecognition": runtime.config.voiceRecognition,
+        "autoSpeak": runtime.config.autoSpeak,
+        "autoSendVoice": runtime.config.autoSendVoice,
+        "backgroundLearning": runtime.config.backgroundLearning
+      }
+    }
+  finally:
+    release(runtime.dataLock)
+
+proc plasticAssistantCss*(): string =
+  result = r"""
+    .plastic-assistant { position: fixed; inset: 0; width: 100%; height: 100dvh; min-height: 0; overflow: hidden; display: grid; grid-template-columns: 300px minmax(0, 1fr); background: #f4f5f7; color: #1e2329; }
+    .plastic-assistant button, .plastic-assistant textarea { font: inherit; }
+    .assistant-sidebar { height: 100%; min-height: 0; border-right: 1px solid #dfe3e8; background: #ffffff; padding: 18px 14px; display: flex; flex-direction: column; gap: 18px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; }
+    .assistant-brand { display: flex; align-items: center; gap: 10px; padding: 4px 6px; }
+    .assistant-brand-mark { width: 36px; height: 36px; display: grid; place-items: center; border-radius: 11px; background: #1e2329; color: white; font-weight: 700; }
+    .assistant-brand-copy strong { display: block; }
+    .assistant-brand-copy small { color: #737b85; }
+    .assistant-new-session { width: 100%; border: 0; border-radius: 10px; padding: 11px 13px; background: #1e2329; color: white; cursor: pointer; text-align: left; }
+    .assistant-sidebar-title { margin: 0 6px 8px; color: #737b85; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; }
+    .assistant-session-list, .assistant-thing-list { display: flex; flex-direction: column; gap: 5px; }
+    .assistant-session { width: 100%; border: 0; border-radius: 9px; padding: 10px; background: transparent; color: inherit; cursor: pointer; text-align: left; }
+    .assistant-session:hover, .assistant-session.active { background: #eef0f3; }
+    .assistant-session strong { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .assistant-session small { color: #8a919b; }
+    .assistant-things { margin-top: auto; }
+    .assistant-thing { border: 1px solid #e1e4e8; border-radius: 10px; background: #fafbfc; padding: 9px; }
+    .assistant-thing-head { display: flex; gap: 6px; align-items: center; }
+    .assistant-thing-kind { font-size: 10px; text-transform: uppercase; color: #737b85; }
+    .assistant-thing strong { flex: 1; font-size: 13px; }
+    .assistant-thing p { margin: 6px 0 0; color: #5e6670; font-size: 12px; line-height: 1.35; }
+    .assistant-thing-actions { display: flex; gap: 4px; margin-top: 7px; }
+    .assistant-mini-button { border: 1px solid #dfe3e8; border-radius: 7px; background: white; padding: 4px 7px; cursor: pointer; font-size: 11px; }
+    .assistant-main { min-width: 0; min-height: 0; height: 100%; overflow: hidden; display: grid; grid-template-rows: auto minmax(0, 1fr) auto auto; }
+    .assistant-header { position: relative; z-index: 3; height: 66px; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 0 24px; border-bottom: 1px solid #dfe3e8; background: rgba(255,255,255,.96); backdrop-filter: blur(12px); }
+    .assistant-header h1 { margin: 0; font-size: 17px; }
+    .assistant-status { display: flex; align-items: center; gap: 8px; color: #737b85; font-size: 12px; }
+    .assistant-status-dot { width: 8px; height: 8px; border-radius: 50%; background: #2fa36b; }
+    .assistant-status[data-status="thinking"] .assistant-status-dot, .assistant-status[data-status="queued"] .assistant-status-dot { background: #d58b20; animation: assistant-pulse 1s infinite alternate; }
+    .assistant-status[data-status="error"] .assistant-status-dot { background: #c44747; }
+    @keyframes assistant-pulse { to { opacity: .35; } }
+    .assistant-voice-controls { display: flex; gap: 7px; align-items: center; }
+    .assistant-control { border: 1px solid #dfe3e8; border-radius: 9px; background: white; padding: 7px 10px; cursor: pointer; }
+    .assistant-messages { min-height: 0; height: 100%; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; scroll-behavior: smooth; padding: 26px max(22px, calc((100% - 860px) / 2)) 30px; display: flex; flex-direction: column; gap: 16px; }
+    .assistant-empty { margin: auto; max-width: 520px; text-align: center; color: #737b85; }
+    .assistant-message { max-width: 82%; border-radius: 16px; padding: 12px 15px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .assistant-message.user { align-self: flex-end; background: #1e2329; color: white; border-bottom-right-radius: 5px; }
+    .assistant-message.assistant { align-self: flex-start; background: white; border: 1px solid #e0e4e8; border-bottom-left-radius: 5px; }
+    .assistant-message.assistant > div { white-space: normal; }
+    .assistant-message.assistant p { margin: 0 0 .75em; }
+    .assistant-message.assistant p:last-child { margin-bottom: 0; }
+    .assistant-message.assistant h1, .assistant-message.assistant h2, .assistant-message.assistant h3 { margin: .25em 0 .6em; line-height: 1.25; }
+    .assistant-message.assistant h1 { font-size: 1.35em; }
+    .assistant-message.assistant h2 { font-size: 1.18em; }
+    .assistant-message.assistant h3 { font-size: 1.05em; }
+    .assistant-message.assistant ul, .assistant-message.assistant ol { margin: .45em 0 .8em; padding-left: 1.4em; }
+    .assistant-message.assistant blockquote { margin: .6em 0; padding: .2em 0 .2em .9em; border-left: 3px solid #cfd5dc; color: #5e6670; }
+    .assistant-message.assistant code { border-radius: 5px; background: #eef0f3; padding: .12em .34em; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .92em; }
+    .assistant-message.assistant pre { margin: .75em 0; overflow: auto; border: 1px solid #dfe3e8; border-radius: 10px; background: #f4f5f7; padding: 12px; }
+    .assistant-message.assistant pre code { background: transparent; padding: 0; }
+    .assistant-message.assistant a { color: #245c9e; text-decoration-thickness: 1px; text-underline-offset: 2px; }
+    .assistant-message.assistant .markdown-table-wrap { width: 100%; margin: .8em 0; overflow-x: auto; border: 1px solid #dfe3e8; border-radius: 10px; background: #fff; }
+    .assistant-message.assistant table { width: 100%; min-width: 520px; border-collapse: collapse; border-spacing: 0; font-size: .94em; }
+    .assistant-message.assistant th, .assistant-message.assistant td { padding: 9px 11px; border-right: 1px solid #e3e7eb; border-bottom: 1px solid #e3e7eb; text-align: left; vertical-align: top; }
+    .assistant-message.assistant th:last-child, .assistant-message.assistant td:last-child { border-right: 0; }
+    .assistant-message.assistant tbody tr:last-child td { border-bottom: 0; }
+    .assistant-message.assistant thead th { background: #f3f5f7; font-weight: 650; color: #252a30; }
+    .assistant-message.assistant tbody tr:nth-child(even) { background: #fafbfc; }
+    .assistant-message-time { display: block; margin-top: 6px; opacity: .55; font-size: 10px; }
+    .assistant-error { position: relative; z-index: 3; margin: 0 max(22px, calc((100% - 860px) / 2)); border: 1px solid #efc6c6; border-radius: 10px; background: #fff3f3; color: #9e3434; padding: 10px 12px; }
+    .assistant-composer-shell { position: relative; z-index: 4; padding: 16px max(22px, calc((100% - 860px) / 2)) max(22px, env(safe-area-inset-bottom)); border-top: 1px solid #dfe3e8; background: rgba(255,255,255,.97); backdrop-filter: blur(14px); box-shadow: 0 -10px 30px rgba(31,35,41,.055); }
+    .assistant-composer { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 9px; align-items: end; border: 1px solid #cfd5dc; border-radius: 16px; padding: 8px; box-shadow: 0 8px 26px rgba(31,35,41,.06); }
+    .assistant-composer textarea { width: 100%; min-height: 42px; max-height: 150px; overflow-y: auto; resize: none; border: 0; outline: 0; background: transparent; color: inherit; padding: 10px 4px; }
+    .assistant-round-button { width: 42px; height: 42px; border: 0; border-radius: 12px; display: grid; place-items: center; cursor: pointer; background: #eef0f3; color: #1e2329; }
+    .assistant-round-button.primary { background: #1e2329; color: white; }
+    .assistant-round-button.listening { background: #c44747; color: white; animation: assistant-pulse .7s infinite alternate; }
+    .assistant-composer-note { margin: 7px 3px 0; color: #8a919b; font-size: 11px; }
+    @media (max-width: 780px) { .plastic-assistant { grid-template-columns: 1fr; } .assistant-sidebar { display: none; } .assistant-message { max-width: 92%; } }
+  """
+
+proc plasticAssistantBodyHtml*(runtime: PlasticAssistantRuntime): string =
+  let name =
+    if runtime.isNil or runtime.config.assistantName.strip.len == 0:
+      "Assistente"
+    else:
+      runtime.config.assistantName
+  result = """
+    <div class="plastic-assistant" id="plastic-assistant-root">
+      <aside class="assistant-sidebar">
+        <div class="assistant-brand">
+          <div class="assistant-brand-mark">G</div>
+          <div class="assistant-brand-copy"><strong>""" & name & """</strong><small>GlaucoPlastic</small></div>
+        </div>
+        <button class="assistant-new-session" id="assistant-new-session">+ Nova sessão</button>
+        <section><h2 class="assistant-sidebar-title">Sessões</h2><div class="assistant-session-list" id="assistant-session-list"></div></section>
+        <section class="assistant-things"><h2 class="assistant-sidebar-title">Coisas aprendidas</h2><div class="assistant-thing-list" id="assistant-thing-list"></div></section>
+      </aside>
+      <main class="assistant-main">
+        <header class="assistant-header">
+          <div><h1 id="assistant-current-title">Nova sessão</h1><div class="assistant-status" id="assistant-status" data-status="idle"><span class="assistant-status-dot"></span><span id="assistant-status-text">Pronto</span></div></div>
+          <div class="assistant-voice-controls">
+            <label class="assistant-control"><input type="checkbox" id="assistant-auto-speak"> falar respostas</label>
+            <button class="assistant-control" id="assistant-repeat-voice" title="Repetir resposta">Repetir</button>
+            <button class="assistant-control" id="assistant-stop-voice" title="Interromper voz">Parar voz</button>
+          </div>
+        </header>
+        <div class="assistant-messages" id="assistant-messages"><div class="assistant-empty">Crie uma conversa por texto ou voz. Preferências, projetos, decisões e pendências podem continuar disponíveis em outras sessões.</div></div>
+        <div id="assistant-error" class="assistant-error" hidden></div>
+        <footer class="assistant-composer-shell">
+          <div class="assistant-composer">
+            <button class="assistant-round-button" id="assistant-microphone" title="Falar">◉</button>
+            <textarea id="assistant-composer" rows="1" placeholder="Escreva ou fale..."></textarea>
+            <button class="assistant-round-button primary" id="assistant-send" title="Enviar">➜</button>
+          </div>
+          <div class="assistant-composer-note" id="assistant-voice-note">Enter envia; Shift+Enter cria uma linha.</div>
+        </footer>
+      </main>
+    </div>
+  """
+
+proc plasticAssistantScript*(runtime: PlasticAssistantRuntime = nil): string =
+  let initialVoiceBackend =
+    if runtime.isNil: ""
+    else: runtime.config.voiceRecognition
+  result = "<script>window.__glaucoplasticAssistantVoiceBackend = " &
+    $(%initialVoiceBackend) & ";</script>" & r"""
+    <script>
+      (() => {
+        const state = {
+          snapshot: null,
+          spokenMessageId: '',
+          lastAssistantText: '',
+          hasAppliedSnapshot: false,
+          recognition: null,
+          mediaRecorder: null,
+          mediaStream: null,
+          audioChunks: [],
+          transcriptId: '',
+          listening: false,
+          awaitingDispatch: false
+        };
+
+        const byId = id => document.getElementById(id);
+        const eventQueue = () => window.__glaucoplasticEvents ||
+          (window.__glaucoplasticEvents = []);
+        const emit = (identity, value = null, checked = false) => {
+          const payload = {
+            handlerId: 'glaucoplastic-assistant',
+            event: 'assistant',
+            identity,
+            bindState: '',
+            value,
+            checked,
+            key: ''
+          };
+
+          const bridge =
+            window.webkit &&
+            window.webkit.messageHandlers &&
+            window.webkit.messageHandlers.glaucoplasticEvent;
+
+          if (bridge && typeof bridge.postMessage === 'function') {
+            try {
+              bridge.postMessage(JSON.stringify(payload));
+              return true;
+            } catch (error) {
+              console.error(
+                '[GlaucoPlastic] assistant bridge failed',
+                error
+              );
+            }
+          }
+
+          eventQueue().push(payload);
+          return false;
+        };
+        const uiDebug = (kind, details = {}) => {
+          const bridge =
+            window.webkit &&
+            window.webkit.messageHandlers &&
+            window.webkit.messageHandlers.glaucoplasticEvent;
+
+          const payload = {
+            kind,
+            at: Date.now(),
+            href: String(window.location && window.location.href || ''),
+            shellGeneration:
+              Number(window.__glaucoplasticShellGeneration || 0),
+            ...details
+          };
+
+          if (bridge && typeof bridge.postMessage === 'function') {
+            try {
+              bridge.postMessage(JSON.stringify({
+                handlerId: 'glaucoplastic-ui-debug',
+                event: 'debug',
+                identity: 'ui:debug',
+                bindState: '',
+                value: JSON.stringify(payload),
+                checked: false,
+                key: ''
+              }));
+            } catch (_) {}
+          }
+
+          try {
+            console.debug('[GlaucoPlastic][ui]', payload);
+          } catch (_) {}
+        };
+
+        const text = value => value == null ? '' : String(value);
+        const escapeHtml = value => text(value)
+          .replaceAll('&', '&amp;')
+          .replaceAll('<', '&lt;')
+          .replaceAll('>', '&gt;')
+          .replaceAll('"', '&quot;')
+          .replaceAll("'", '&#39;');
+        function markdownInline(value) {
+          let html = escapeHtml(value);
+          html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+          html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+          html = html.replace(/__([^_]+)__/g, '<strong>$1</strong>');
+          html = html.replace(/(^|[^*])\*([^*]+)\*/g, '$1<em>$2</em>');
+          html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+            '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+          return html;
+        }
+        function markdownTableCells(line) {
+          let value = text(line).trim();
+          if (value.startsWith('|')) value = value.slice(1);
+          if (value.endsWith('|')) value = value.slice(0, -1);
+
+          const cells = [];
+          let cell = '';
+          let escaped = false;
+          let inlineCode = false;
+
+          for (const character of value) {
+            if (escaped) {
+              cell += character;
+              escaped = false;
+              continue;
+            }
+            if (character === '\\') {
+              cell += character;
+              escaped = true;
+              continue;
+            }
+            if (character === '`') {
+              inlineCode = !inlineCode;
+              cell += character;
+              continue;
+            }
+            if (character === '|' && !inlineCode) {
+              cells.push(cell.trim());
+              cell = '';
+              continue;
+            }
+            cell += character;
+          }
+          cells.push(cell.trim());
+          return cells;
+        }
+        function markdownTableDivider(line) {
+          const cells = markdownTableCells(line);
+          return cells.length > 0 && cells.every(cell =>
+            /^:?-{3,}:?$/.test(cell.replace(/\s+/g, ''))
+          );
+        }
+        function markdownTableAlignment(cell) {
+          const compact = cell.replace(/\s+/g, '');
+          if (compact.startsWith(':') && compact.endsWith(':')) return 'center';
+          if (compact.endsWith(':')) return 'right';
+          return 'left';
+        }
+        function renderMarkdownTable(headerLine, dividerLine, bodyLines) {
+          const headers = markdownTableCells(headerLine);
+          const dividers = markdownTableCells(dividerLine);
+          const width = Math.max(headers.length, dividers.length);
+          const alignments = Array.from({length: width}, (_, index) =>
+            markdownTableAlignment(dividers[index] || '---')
+          );
+          const normalize = cells => Array.from(
+            {length: width},
+            (_, index) => cells[index] || ''
+          );
+          const head = normalize(headers).map((cell, index) =>
+            `<th style="text-align:${alignments[index]}">${markdownInline(cell)}</th>`
+          ).join('');
+          const body = bodyLines.map(line => {
+            const cells = normalize(markdownTableCells(line));
+            return `<tr>${cells.map((cell, index) =>
+              `<td style="text-align:${alignments[index]}">${markdownInline(cell)}</td>`
+            ).join('')}</tr>`;
+          }).join('');
+          return `<div class="markdown-table-wrap"><table><thead><tr>${head}</tr></thead>${body ? `<tbody>${body}</tbody>` : ''}</table></div>`;
+        }
+        function renderMarkdown(value) {
+          const source = text(value).replace(/\r\n/g, '\n');
+          const fences = [];
+          const tokenized = source.replace(/```([^\n]*)\n([\s\S]*?)```/g,
+            (_, language, code) => {
+              const token = `@@GLAUCO_CODE_${fences.length}@@`;
+              fences.push(`<pre><code data-language="${escapeHtml(language.trim())}">${escapeHtml(code.replace(/\n$/, ''))}</code></pre>`);
+              return token;
+            });
+          const lines = tokenized.split('\n');
+          const blocks = [];
+          let listType = '';
+          const closeList = () => {
+            if (listType) blocks.push(`</${listType}>`);
+            listType = '';
+          };
+          for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+            const rawLine = lines[lineIndex];
+            const line = rawLine.trimEnd();
+            const nextLine = lineIndex + 1 < lines.length
+              ? lines[lineIndex + 1].trimEnd()
+              : '';
+            if (
+              line.includes('|') &&
+              markdownTableDivider(nextLine) &&
+              markdownTableCells(line).length === markdownTableCells(nextLine).length
+            ) {
+              closeList();
+              const tableRows = [];
+              let cursor = lineIndex + 2;
+              while (cursor < lines.length) {
+                const candidate = lines[cursor].trimEnd();
+                if (!candidate.trim() || !candidate.includes('|')) break;
+                tableRows.push(candidate);
+                cursor++;
+              }
+              blocks.push(renderMarkdownTable(line, nextLine, tableRows));
+              lineIndex = cursor - 1;
+              continue;
+            }
+            const codeMatch = line.match(/^@@GLAUCO_CODE_(\d+)@@$/);
+            if (codeMatch) {
+              closeList();
+              blocks.push(fences[Number(codeMatch[1])]);
+              continue;
+            }
+            const heading = line.match(/^(#{1,6})\s+(.+)$/);
+            if (heading) {
+              closeList();
+              const level = heading[1].length;
+              blocks.push(`<h${level}>${markdownInline(heading[2])}</h${level}>`);
+              continue;
+            }
+            const unordered = line.match(/^\s*[-*+]\s+(.+)$/);
+            const ordered = line.match(/^\s*\d+[.)]\s+(.+)$/);
+            if (unordered || ordered) {
+              const nextType = unordered ? 'ul' : 'ol';
+              if (listType !== nextType) {
+                closeList();
+                listType = nextType;
+                blocks.push(`<${listType}>`);
+              }
+              blocks.push(`<li>${markdownInline((unordered || ordered)[1])}</li>`);
+              continue;
+            }
+            const quote = line.match(/^>\s?(.*)$/);
+            if (quote) {
+              closeList();
+              blocks.push(`<blockquote>${markdownInline(quote[1])}</blockquote>`);
+              continue;
+            }
+            if (!line.trim()) {
+              closeList();
+              continue;
+            }
+            closeList();
+            blocks.push(`<p>${markdownInline(line)}</p>`);
+          }
+          closeList();
+          return blocks.join('');
+        }
+        const clear = element => {
+          while (element && element.firstChild) element.removeChild(element.firstChild);
+        };
+        const button = (label, className, onClick) => {
+          const element = document.createElement('button');
+          element.type = 'button';
+          element.className = className;
+          element.textContent = label;
+          element.addEventListener('click', onClick);
+          return element;
+        };
+        const formatTime = value => {
+          if (!value) return '';
+          const date = new Date(value);
+          if (Number.isNaN(date.getTime())) return '';
+          return date.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+        };
+
+        function selectedVoice(config) {
+          if (!window.speechSynthesis) return null;
+          const voices = speechSynthesis.getVoices();
+          const configured = text(config && config.voiceName).toLowerCase();
+          if (configured) {
+            const exact = voices.find(voice => voice.name.toLowerCase() === configured);
+            if (exact) return exact;
+            const partial = voices.find(voice => voice.name.toLowerCase().includes(configured));
+            if (partial) return partial;
+          }
+          const language = text(config && config.language).toLowerCase();
+          return voices.find(voice => voice.lang.toLowerCase() === language) ||
+            voices.find(voice => voice.lang.toLowerCase().startsWith(language.split('-')[0])) ||
+            null;
+        }
+
+        function speak(value, force = false) {
+          const snapshot = state.snapshot;
+          if (!window.speechSynthesis || !value) return;
+          if (!force && !(snapshot && snapshot.config && snapshot.config.autoSpeak)) return;
+          speechSynthesis.cancel();
+          const utterance = new SpeechSynthesisUtterance(value);
+          utterance.lang = text(snapshot && snapshot.config && snapshot.config.language) || 'pt-BR';
+          const voice = selectedVoice(snapshot && snapshot.config);
+          if (voice) utterance.voice = voice;
+          utterance.rate = 1;
+          utterance.pitch = 1;
+          utterance.onstart = () => {
+            const note = byId('assistant-status-text');
+            if (note) note.textContent = 'Falando';
+          };
+          utterance.onend = utterance.onerror = () => {
+            const note = byId('assistant-status-text');
+            if (note && state.snapshot) note.textContent = statusLabel(state.snapshot.status);
+          };
+          state.lastAssistantText = value;
+          speechSynthesis.speak(utterance);
+        }
+
+        function stopSpeaking() {
+          if (window.speechSynthesis) speechSynthesis.cancel();
+        }
+
+        function statusLabel(status) {
+          switch (status) {
+            case 'queued': return 'Na fila';
+            case 'thinking': return 'Pensando';
+            case 'error': return 'Falha';
+            case 'ready': return 'Pronto';
+            default: return status || 'Pronto';
+          }
+        }
+
+        function renderSessions(snapshot) {
+          const list = byId('assistant-session-list');
+          clear(list);
+          for (const session of snapshot.sessions || []) {
+            const item = button('', 'assistant-session' +
+              (session.id === snapshot.activeSessionId ? ' active' : ''), () => {
+                emit('assistant:select-session', session.id);
+              });
+            const title = document.createElement('strong');
+            title.textContent = text(session.title) || 'Nova sessão';
+            const summary = document.createElement('small');
+            summary.textContent = text(session.summary) || 'Conversa';
+            item.append(title, summary);
+            list.appendChild(item);
+          }
+        }
+
+        function renderThings(snapshot) {
+          const list = byId('assistant-thing-list');
+          clear(list);
+          const things = (snapshot.things || []).slice(0, 20);
+          if (!things.length) {
+            const empty = document.createElement('p');
+            empty.className = 'assistant-composer-note';
+            empty.textContent = 'Nenhuma coisa consolidada ainda.';
+            list.appendChild(empty);
+            return;
+          }
+          for (const thing of things) {
+            const card = document.createElement('article');
+            card.className = 'assistant-thing';
+            const head = document.createElement('div');
+            head.className = 'assistant-thing-head';
+            const kind = document.createElement('span');
+            kind.className = 'assistant-thing-kind';
+            kind.textContent = text(thing.kind || 'coisa');
+            const title = document.createElement('strong');
+            title.textContent = text(thing.title);
+            head.append(kind, title);
+            const body = document.createElement('p');
+            body.textContent = text(thing.content);
+            const actions = document.createElement('div');
+            actions.className = 'assistant-thing-actions';
+            actions.append(
+              button(thing.pinned ? 'Desafixar' : 'Fixar', 'assistant-mini-button', () => emit('assistant:pin-thing', thing.id)),
+              button('Esquecer', 'assistant-mini-button', () => emit('assistant:forget-thing', thing.id))
+            );
+            card.append(head, body, actions);
+            list.appendChild(card);
+          }
+        }
+
+        function renderMessages(snapshot) {
+          const container = byId('assistant-messages');
+          const previousScrollTop = container.scrollTop;
+          const previousDistanceFromBottom = Math.max(
+            0,
+            container.scrollHeight - container.scrollTop - container.clientHeight
+          );
+          const wasNearBottom = previousDistanceFromBottom < 96;
+          const session = snapshot.activeSession || {};
+          const sessionId = text(session.id || snapshot.activeSessionId);
+          const changedSession = sessionId !== (container.dataset.sessionId || '');
+
+          clear(container);
+          const messages = session.messages || [];
+          container.dataset.sessionId = sessionId;
+          container.dataset.messageCount = String(messages.length);
+
+          if (!messages.length) {
+            const empty = document.createElement('div');
+            empty.className = 'assistant-empty';
+            empty.textContent = 'Converse por texto ou voz. O aprendizado útil aparecerá na lateral.';
+            container.appendChild(empty);
+            return;
+          }
+
+          for (const message of messages) {
+            const bubble = document.createElement('article');
+            bubble.className = 'assistant-message ' + (message.role === 'user' ? 'user' : 'assistant');
+            const body = document.createElement('div');
+            if (message.role === 'user') {
+              body.textContent = text(message.content);
+            } else {
+              body.innerHTML = renderMarkdown(message.content);
+            }
+            const time = document.createElement('span');
+            time.className = 'assistant-message-time';
+            time.textContent = formatTime(message.createdAt);
+            bubble.append(body, time);
+            container.appendChild(bubble);
+          }
+
+          requestAnimationFrame(() => {
+            if (changedSession || wasNearBottom) {
+              container.scrollTop = container.scrollHeight;
+            } else {
+              container.scrollTop = previousScrollTop;
+            }
+          });
+        }
+
+        function showAssistantResponseNotification(value, responseId) {
+          if (document.querySelector('[data-glauco-foreign]')) return;
+          const message = text(value).trim();
+          if (!message) return;
+
+          let stack = byId('assistant-notifications');
+          if (!stack) {
+            stack = document.createElement('div');
+            stack.id = 'assistant-notifications';
+            stack.className = 'rpa-notification-stack';
+            document.body.appendChild(stack);
+          }
+
+          const toast = document.createElement('button');
+          toast.type = 'button';
+          toast.className = 'rpa-agent-notification';
+          toast.dataset.responseId = text(responseId);
+
+          const heading = document.createElement('strong');
+          heading.textContent = 'Glauco respondeu';
+          const preview = document.createElement('span');
+          preview.textContent = message.length > 240
+            ? message.slice(0, 237) + '…'
+            : message;
+          toast.append(heading, preview);
+
+          toast.addEventListener('click', () => {
+            const toggle = byId('rpa-chat-toggle');
+            if (toggle) {
+              toggle.checked = true;
+              toggle.dispatchEvent(new Event('change', {bubbles: true}));
+            }
+            toast.remove();
+          });
+
+          stack.appendChild(toast);
+          requestAnimationFrame(() => toast.classList.add('visible'));
+          window.setTimeout(() => {
+            toast.classList.remove('visible');
+            window.setTimeout(() => toast.remove(), 220);
+          }, 9000);
+
+          if ('Notification' in window &&
+              Notification.permission === 'granted' &&
+              !document.hasFocus()) {
+            try {
+              new Notification('Glauco', {
+                body: preview.textContent,
+                tag: 'glauco-response-' + text(responseId)
+              });
+            } catch (_) {
+              /* notificação do sistema é opcional */
+            }
+          }
+
+          try {
+            window.dispatchEvent(new CustomEvent(
+              'glaucoplastic:assistant-response',
+              {detail: {id: text(responseId), text: message}}
+            ));
+          } catch (_) {
+            /* CustomEvent indisponível */
+          }
+        }
+
+        function queueInfo(snapshot) {
+        const queue = snapshot && snapshot.chatQueue || {};
+        const queued = Number(queue.queued || 0);
+        const active = !!queue.active;
+        const totalPending = Number(
+          queue.totalPending ||
+          queued + (active ? 1 : 0)
+        );
+        return {queued, active, totalPending};
+      }
+      function runtimeIsProcessing(snapshot) {
+        const status = valueText(
+          snapshot && snapshot.status
+        ).toLowerCase();
+        const queue = queueInfo(snapshot);
+        return (
+          status === "thinking" ||
+          status === "processing" ||
+          status === "running" ||
+          queue.totalPending > 0
+        );
+      }
+      function updateInteraction(snapshot) {
+        const composer = byId("composer");
+        const sendButton = byId("send");
+        const microphone = byId("microphone");
+        const queueState = byId("queue-state");
+        const queue = queueInfo(snapshot);
+        const processing =
+          runtimeIsProcessing(snapshot);
+
+        if (processing || (snapshot && snapshot.lastError)) {
+          state.awaitingDispatch = false;
+        }
+
+        document.body.classList.toggle(
+          "processing",
+          processing
+        );
+
+        composer.disabled = state.awaitingDispatch;
+        sendButton.disabled = state.awaitingDispatch;
+        microphone.disabled = state.awaitingDispatch;
+
+        sendButton.textContent =
+          processing ? "Enfileirar" : "Executar";
+
+        composer.placeholder =
+          state.awaitingDispatch
+            ? "Enviando mensagem..."
+            : processing
+              ? "Digite outra mensagem para acrescentar à fila..."
+              : "Descreva o que deseja realizar...";
+
+        if (state.awaitingDispatch) {
+          queueState.textContent =
+            "Enviando para o processamento...";
+        } else if (queue.totalPending === 1) {
+          queueState.textContent =
+            "1 mensagem em processamento";
+        } else if (queue.totalPending > 1) {
+          queueState.textContent =
+            queue.totalPending +
+            " mensagens em processamento ou na fila";
+        } else {
+          queueState.textContent = "";
+        }
+      }
+        function mainAssistantQueueInfo(snapshot) {
+          const queue = snapshot && snapshot.chatQueue || {};
+          const queued = Number(queue.queued || 0);
+          const active = !!queue.active;
+          const totalPending = Number(
+            queue.totalPending || queued + (active ? 1 : 0)
+          );
+          return {queued, active, totalPending};
+        }
+
+        function mainAssistantProcessing(snapshot) {
+          const status = text(snapshot && snapshot.status).toLowerCase();
+          const queue = mainAssistantQueueInfo(snapshot);
+          return (
+            status === 'thinking' ||
+            status === 'processing' ||
+            status === 'running' ||
+            status === 'queued' ||
+            queue.totalPending > 0
+          );
+        }
+
+      function applySnapshot(snapshot) {
+          if (!snapshot || typeof snapshot !== 'object') return;
+          state.snapshot = snapshot;
+
+          const processing = mainAssistantProcessing(snapshot);
+          const queueInfo = mainAssistantQueueInfo(snapshot);
+
+          if (processing || snapshot.lastError) {
+            state.awaitingDispatch = false;
+          }
+
+          const composerControl = byId('assistant-composer');
+          const sendControl = byId('assistant-send');
+          const microphoneControl = byId('assistant-microphone');
+
+          if (sendControl && !sendControl.dataset.idleLabel) {
+            sendControl.dataset.idleLabel =
+              sendControl.textContent || 'Executar';
+          }
+
+          if (composerControl) {
+            if (!composerControl.dataset.idlePlaceholder) {
+              composerControl.dataset.idlePlaceholder =
+                composerControl.getAttribute('placeholder') ||
+                'Descreva o que deseja realizar...';
+            }
+            composerControl.disabled = state.awaitingDispatch;
+            composerControl.placeholder =
+              state.awaitingDispatch
+                ? 'Enviando mensagem...'
+                : processing
+                  ? 'Digite outra mensagem para acrescentar à fila...'
+                  : composerControl.dataset.idlePlaceholder;
+          }
+
+          if (sendControl) {
+            sendControl.disabled = state.awaitingDispatch;
+            sendControl.textContent = processing
+              ? 'Enfileirar'
+              : sendControl.dataset.idleLabel;
+          }
+
+          if (microphoneControl) {
+            microphoneControl.disabled = state.awaitingDispatch;
+          }
+
+          document.documentElement.classList.toggle(
+            'glaucoplastic-assistant-processing',
+            processing
+          );
+
+          renderSessions(snapshot);
+          renderThings(snapshot);
+          renderMessages(snapshot);
+
+          const currentTitle = byId('assistant-current-title');
+          if (currentTitle) currentTitle.textContent =
+            text(snapshot.activeSession && snapshot.activeSession.title) || 'Nova sessão';
+          const status = byId('assistant-status');
+          if (status) {
+            status.dataset.status =
+              processing ? 'thinking' : (snapshot.status || 'idle');
+          }
+          const statusText = byId('assistant-status-text');
+          if (statusText) {
+            statusText.textContent =
+              state.awaitingDispatch
+                ? 'Enviando'
+                : processing
+                  ? (
+                      queueInfo.totalPending > 1
+                        ? 'Processando · ' + queueInfo.totalPending + ' na fila'
+                        : 'Processando'
+                    )
+                  : statusLabel(snapshot.status);
+
+            statusText.title =
+              snapshot.lastError
+                ? text(snapshot.lastError)
+                : '';
+          }
+
+          if (status) {
+            status.dataset.hasError =
+              snapshot.lastError ? 'true' : 'false';
+
+            if (snapshot.lastError) {
+              status.setAttribute(
+                'title',
+                text(snapshot.lastError)
+              );
+            } else {
+              status.removeAttribute('title');
+            }
+          }
+          const nativeVoiceState = text(snapshot.voiceState).toLowerCase();
+          const microphone = byId('assistant-microphone');
+          const voiceNote = byId('assistant-voice-note');
+          const recording = nativeVoiceState === 'recording' ||
+            nativeVoiceState === 'starting';
+          state.listening = recording;
+          if (microphone) microphone.classList.toggle('listening', recording);
+          if (voiceNote) {
+            if (nativeVoiceState === 'recording') {
+              voiceNote.textContent = 'Ouvindo pelo microfone nativo; clique novamente para transcrever.';
+            } else if (nativeVoiceState === 'stopping') {
+              voiceNote.textContent = 'Finalizando a gravação…';
+            } else if (nativeVoiceState === 'queued' || nativeVoiceState === 'transcribing') {
+              voiceNote.textContent = 'Transcrevendo localmente com whisper.cpp…';
+            } else if (nativeVoiceState === 'error' && snapshot.lastError) {
+              voiceNote.textContent = text(snapshot.lastError);
+            }
+          }
+
+          const autoSpeak = byId('assistant-auto-speak');
+          if (autoSpeak) autoSpeak.checked = !!(snapshot.config && snapshot.config.autoSpeak);
+          const error = byId('assistant-error');
+          if (error) {
+            error.hidden = !snapshot.lastError;
+            error.textContent = text(snapshot.lastError);
+          }
+
+          if (snapshot.lastTranscriptId &&
+              snapshot.lastTranscriptId !== state.transcriptId) {
+            state.transcriptId = snapshot.lastTranscriptId;
+            if (!(snapshot.config && snapshot.config.autoSendVoice)) {
+              const composer = byId('assistant-composer');
+              if (composer) composer.value = text(snapshot.lastTranscript);
+            }
+          }
+
+          if (snapshot.lastResponseId &&
+              snapshot.lastResponseId !== state.spokenMessageId) {
+            const shouldNotify = state.hasAppliedSnapshot;
+            state.spokenMessageId = snapshot.lastResponseId;
+            state.lastAssistantText = text(snapshot.lastResponse);
+            if (shouldNotify) {
+              showAssistantResponseNotification(
+                state.lastAssistantText,
+                snapshot.lastResponseId
+              );
+            }
+            speak(state.lastAssistantText);
+          }
+          state.hasAppliedSnapshot = true;
+
+          if (
+            typeof window.__glaucoplasticSyncChatPanelUi ===
+            'function'
+          ) {
+            window.__glaucoplasticSyncChatPanelUi(
+              'snapshot'
+            );
+          }
+
+          uiDebug('snapshot.applied', {
+            revision: Number(snapshot.revision || 0),
+            status: text(snapshot.status),
+            queue: queueInfo.totalPending,
+            messages: Number(
+              snapshot.activeSession &&
+              snapshot.activeSession.messages &&
+              snapshot.activeSession.messages.length ||
+              0
+            ),
+            awaitingDispatch: state.awaitingDispatch
+          });
+        }
+
+        function sendComposer() {
+          const composer = byId('assistant-composer');
+          const sendControl = byId('assistant-send');
+          const microphone = byId('assistant-microphone');
+          const statusText = byId('assistant-status-text');
+          const value = composer ? composer.value.trim() : '';
+
+          if (!value || state.awaitingDispatch) return;
+
+          state.awaitingDispatch = true;
+          if (composer) composer.disabled = true;
+          if (sendControl) sendControl.disabled = true;
+          if (microphone) microphone.disabled = true;
+          if (statusText) statusText.textContent = 'Enviando';
+
+          uiDebug('assistant.send', {
+            chars: value.length,
+            chatOpen:
+              !!window.__glaucoplasticChatOpen
+          });
+
+          emit('assistant:send', value);
+          composer.value = '';
+          composer.style.height = 'auto';
+        }
+
+        window.__glaucoplasticAssistantDispatchAccepted =
+          () => {
+            state.awaitingDispatch = false;
+            applySnapshot(state.snapshot || {});
+            return true;
+          };
+
+        function installSystemRecorder() {
+          const microphone = byId('assistant-microphone');
+          const note = byId('assistant-voice-note');
+          if (!microphone) return;
+          microphone.addEventListener('click', () => {
+            if (state.listening) {
+              emit('assistant:voice-stop');
+              note.textContent = 'Finalizando áudio e enviando ao Whisper…';
+            } else {
+              emit('assistant:voice-start');
+              note.textContent = 'Abrindo o microfone nativo do computador…';
+            }
+          });
+        }
+
+        function installNativeRecorder() {
+          const microphone = byId('assistant-microphone');
+          const note = byId('assistant-voice-note');
+
+          if (
+            !navigator.mediaDevices ||
+            !navigator.mediaDevices.getUserMedia ||
+            !window.MediaRecorder
+          ) {
+            microphone.disabled = true;
+            note.textContent =
+              'Captura de microfone indisponível neste WebView.';
+            return;
+          }
+
+          microphone.addEventListener('click', async () => {
+            if (
+              state.mediaRecorder &&
+              state.mediaRecorder.state === 'recording'
+            ) {
+              state.mediaRecorder.stop();
+              return;
+            }
+
+            try {
+              state.mediaStream =
+                await navigator.mediaDevices.getUserMedia({
+                  audio: true
+                });
+
+              state.audioChunks = [];
+
+              const preferred = [
+                'audio/webm;codecs=opus',
+                'audio/ogg;codecs=opus',
+                'audio/mp4'
+              ].find(type =>
+                MediaRecorder.isTypeSupported(type)
+              );
+
+              state.mediaRecorder = preferred
+                ? new MediaRecorder(
+                    state.mediaStream,
+                    { mimeType: preferred }
+                  )
+                : new MediaRecorder(state.mediaStream);
+
+              state.mediaRecorder.ondataavailable = event => {
+                if (event.data && event.data.size) {
+                  state.audioChunks.push(event.data);
+                }
+              };
+
+              state.mediaRecorder.onstart = () => {
+                state.listening = true;
+                microphone.classList.add('listening');
+                note.textContent =
+                  'Gravando; clique novamente para transcrever com Whisper…';
+              };
+
+              state.mediaRecorder.onstop = () => {
+                state.listening = false;
+                microphone.classList.remove('listening');
+
+                const mimeType =
+                  state.mediaRecorder.mimeType ||
+                  (
+                    state.audioChunks[0] &&
+                    state.audioChunks[0].type
+                  ) ||
+                  'audio/webm';
+
+                const blob = new Blob(
+                  state.audioChunks,
+                  { type: mimeType }
+                );
+
+                const reader = new FileReader();
+
+                reader.onloadend = () => {
+                  const encoded =
+                    String(reader.result || '')
+                      .split(',')
+                      .pop() || '';
+
+                  emit('assistant:voice-audio', {
+                    data: encoded,
+                    mimeType
+                  });
+
+                  note.textContent =
+                    'Transcrevendo localmente com whisper.cpp…';
+                };
+
+                reader.readAsDataURL(blob);
+
+                if (state.mediaStream) {
+                  for (
+                    const track of
+                    state.mediaStream.getTracks()
+                  ) {
+                    track.stop();
+                  }
+                }
+              };
+
+              state.mediaRecorder.start();
+            } catch (error) {
+              note.textContent =
+                'Falha ao abrir o microfone: ' +
+                text(
+                  error &&
+                  error.message ||
+                  error
+                );
+            }
+          });
+        }
+
+
+        function installPhoneAdbRecorder() {
+          const microphone = byId('assistant-microphone');
+          const note = byId('assistant-voice-note');
+          const endpoint = 'http://127.0.0.1:5003';
+          let recording = false;
+
+          async function phoneRequest(path, method = 'GET') {
+            const response = await fetch(endpoint + path, {
+              method,
+              cache: 'no-store',
+              headers: { 'Accept': 'application/json' }
+            });
+            const payload = await response.json().catch(() => ({}));
+            if (!response.ok || payload.ok === false) {
+              throw new Error(payload.error || ('HTTP ' + response.status));
+            }
+            return payload;
+          }
+
+          microphone.addEventListener('click', async () => {
+            if (microphone.disabled) return;
+            microphone.disabled = true;
+            try {
+              if (!recording) {
+                await phoneRequest('/record/start', 'POST');
+                recording = true;
+                state.listening = true;
+                microphone.classList.add('listening');
+                note.textContent = 'Ouvindo pelo microfone do celular; clique novamente para transcrever…';
+              } else {
+                note.textContent = 'Recebendo áudio do celular…';
+                const payload = await phoneRequest('/record/stop', 'POST');
+                recording = false;
+                state.listening = false;
+                microphone.classList.remove('listening');
+                emit('assistant:voice-audio', {
+                  data: payload.data || '',
+                  mimeType: payload.mimeType || 'audio/wav'
+                });
+                note.textContent = 'Transcrevendo localmente com whisper.cpp…';
+              }
+            } catch (error) {
+              recording = false;
+              state.listening = false;
+              microphone.classList.remove('listening');
+              note.textContent = 'Falha no microfone do celular: ' + text(error && error.message || error);
+            } finally {
+              microphone.disabled = false;
+            }
+          });
+
+          phoneRequest('/status').then(status => {
+            note.textContent = status.phoneConnected
+              ? 'Microfone do celular conectado por ADB.'
+              : 'Abra o Audio Phone Speaker e confirme a permissão de microfone.';
+          }).catch(() => {
+            note.textContent = 'Inicie audio_sender.py para usar o microfone do celular.';
+          });
+          return true;
+        }
+
+        function installWebRecognition() {
+          const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+          const microphone = byId('assistant-microphone');
+          const note = byId('assistant-voice-note');
+          if (!Recognition) return false;
+          const recognition = new Recognition();
+          recognition.lang = 'pt-BR';
+          recognition.interimResults = true;
+          recognition.continuous = false;
+          state.recognition = recognition;
+          recognition.onstart = () => {
+            state.listening = true;
+            microphone.classList.add('listening');
+            note.textContent = 'Ouvindo…';
+          };
+          recognition.onresult = event => {
+            let transcript = '';
+            let finalResult = false;
+            for (let index = event.resultIndex; index < event.results.length; index++) {
+              transcript += event.results[index][0].transcript;
+              finalResult = finalResult || event.results[index].isFinal;
+            }
+            const composer = byId('assistant-composer');
+            if (composer) composer.value = transcript.trim();
+            if (finalResult && state.snapshot && state.snapshot.config &&
+                state.snapshot.config.autoSendVoice) setTimeout(sendComposer, 120);
+          };
+          recognition.onerror = event => {
+            note.textContent = 'Falha no reconhecimento: ' + text(event.error);
+          };
+          recognition.onend = () => {
+            state.listening = false;
+            microphone.classList.remove('listening');
+          };
+          microphone.addEventListener('click', () => {
+            if (state.listening) recognition.stop();
+            else recognition.start();
+          });
+          return true;
+        }
+
+function installVoiceInput() {
+          const backend = text(
+            state.snapshot &&
+              state.snapshot.config &&
+              state.snapshot.config.voiceRecognition ||
+            window.__glaucoplasticAssistantVoiceBackend
+          ).toLowerCase();
+
+          const nativeSystemBackend =
+            backend.includes('system') ||
+            backend.includes('native') ||
+            backend.includes('pipewire') ||
+            backend.includes('pulse');
+
+          if (
+            backend.includes('phone') ||
+            backend.includes('adb')
+          ) {
+            installPhoneAdbRecorder();
+          } else if (
+            nativeSystemBackend ||
+            window.__glaucoplasticWebMode
+          ) {
+            installSystemRecorder();
+          } else if (
+            backend &&
+            !backend.includes('web') &&
+            !backend.includes('speechrecognition')
+          ) {
+            installNativeRecorder();
+          } else if (!installWebRecognition()) {
+            installNativeRecorder();
+          }
+        }
+
+        function syncChatPanelUi(source = 'sync') {
+          const shell =
+            document.querySelector('.rpa-shell');
+          const toggle =
+            byId('rpa-chat-toggle');
+          const panel =
+            document.querySelector('.rpa-chat-panel');
+          const composerShell =
+            document.querySelector('.rpa-composer-shell');
+
+          if (!shell || !toggle) {
+            uiDebug('chat.missing', {
+              source,
+              shell: !!shell,
+              toggle: !!toggle,
+              panel: !!panel,
+              composer: !!composerShell
+            });
+            return false;
+          }
+
+          const open = !!toggle.checked;
+          window.__glaucoplasticChatOpen = open;
+          shell.dataset.chatOpen =
+            open ? 'true' : 'false';
+
+          const stateBridge =
+            window.webkit &&
+            window.webkit.messageHandlers &&
+            window.webkit.messageHandlers.glaucoplasticEvent;
+
+          if (
+            stateBridge &&
+            typeof stateBridge.postMessage === 'function'
+          ) {
+            try {
+              stateBridge.postMessage(
+                JSON.stringify({
+                  handlerId: 'glaucoplastic-ui-state',
+                  event: 'state',
+                  identity: 'ui:chat-state',
+                  bindState: '',
+                  value: open ? 'open' : 'closed',
+                  checked: open,
+                  key: ''
+                })
+              );
+            } catch (_) {}
+          }
+
+          requestAnimationFrame(() => {
+            const panelStyle =
+              panel ? window.getComputedStyle(panel) : null;
+            const composerStyle =
+              composerShell
+                ? window.getComputedStyle(composerShell)
+                : null;
+
+            uiDebug('chat.state', {
+              source,
+              checked: !!toggle.checked,
+              dataChatOpen:
+                shell.dataset.chatOpen || '',
+              panelTransform:
+                panelStyle && panelStyle.transform || '',
+              panelOpacity:
+                panelStyle && panelStyle.opacity || '',
+              panelPointerEvents:
+                panelStyle &&
+                panelStyle.pointerEvents || '',
+              composerLeft:
+                composerStyle &&
+                composerStyle.left || '',
+              composerRight:
+                composerStyle &&
+                composerStyle.right || '',
+              composerWidth:
+                composerStyle &&
+                composerStyle.width || ''
+            });
+          });
+
+          return open;
+        }
+
+        const chatToggle =
+          byId('rpa-chat-toggle');
+        const chatToggleLabel =
+          document.querySelector(
+            '.rpa-chat-toggle-button'
+          );
+
+        if (chatToggle) {
+          if (window.__glaucoplasticChatOpen) {
+            chatToggle.checked = true;
+          }
+
+          chatToggle.addEventListener(
+            'change',
+            () => syncChatPanelUi('change')
+          );
+        }
+
+        if (
+          chatToggle &&
+          chatToggleLabel &&
+          typeof window.__glaucoplasticCoreChatSync !==
+            'function'
+        ) {
+          chatToggleLabel.addEventListener(
+            'click',
+            event => {
+              event.preventDefault();
+              event.stopPropagation();
+
+              chatToggle.checked =
+                !chatToggle.checked;
+
+              chatToggle.dispatchEvent(
+                new Event(
+                  'change',
+                  {bubbles: true}
+                )
+              );
+
+              uiDebug('chat.click', {
+                checked: !!chatToggle.checked,
+                shellGeneration:
+                  Number(
+                    window.__glaucoplasticShellGeneration || 0
+                  )
+              });
+            }
+          );
+        }
+
+        window.__glaucoplasticSyncChatPanelUi =
+          syncChatPanelUi;
+
+        requestAnimationFrame(
+          () => syncChatPanelUi('install')
+        );
+
+window.__glaucoplasticAssistantApply = applySnapshot;
+        byId('assistant-new-session')?.addEventListener('click', () => emit('assistant:new-session'));
+        byId('assistant-send')?.addEventListener('click', sendComposer);
+        byId('assistant-composer')?.addEventListener('keydown', event => {
+          if (event.key === 'Enter' && !event.shiftKey) {
+            event.preventDefault();
+            sendComposer();
+          }
+        });
+        byId('assistant-composer')?.addEventListener('input', event => {
+          const composer = event.currentTarget;
+          composer.style.height = 'auto';
+          composer.style.height = Math.min(composer.scrollHeight, 150) + 'px';
+        });
+        byId('assistant-auto-speak')?.addEventListener('change', event => {
+          emit('assistant:auto-speak', !!event.currentTarget.checked, !!event.currentTarget.checked);
+          if (!event.currentTarget.checked) stopSpeaking();
+        });
+        byId('assistant-repeat-voice')?.addEventListener('click', () => speak(state.lastAssistantText, true));
+        byId('assistant-stop-voice')?.addEventListener('click', stopSpeaking);
+        installVoiceInput();
+        if (window.speechSynthesis) speechSynthesis.getVoices();
+      })();
+    </script>
+  """
+
+# WHITE_PLASTIC_FOR_GLAUCO_V1
+proc plasticOfficeRuntimePython*(): string =
+  let configured = getEnv("GLAUCOPLASTIC_OFFICE_PYTHON", "").strip
+  if configured.len > 0:
+    return expandTilde(configured)
+  when defined(windows):
+    "python"
+  else:
+    "python3"
+
+proc plasticOfficeRuntimeBridge*(): string =
+  let configured = getEnv("GLAUCOPLASTIC_OFFICE_BRIDGE", "").strip
+  if configured.len > 0:
+    return expandTilde(configured)
+  getCurrentDir() / "tools" / "glaucoplastic_office.py"
+
+proc plasticOfficeInvoke*(capability: string; arguments: JsonNode): JsonNode =
+  let python = plasticOfficeRuntimePython()
+  let bridge = plasticOfficeRuntimeBridge()
+  if not fileExists(bridge):
+    raise newException(
+      PlasticAgentError,
+      "Office bridge not found: " & bridge
+    )
+  let tempRoot = getTempDir() / "glaucoplastic-office"
+  createDir(tempRoot)
+  let inputPath = tempRoot / (
+    "arguments-" & $epochTime().int64 & "-" & $getCurrentProcessId() & ".json"
+  )
+  writeFile(inputPath, $arguments)
+  defer:
+    if fileExists(inputPath):
+      removeFile(inputPath)
+  let command = @[python, bridge, capability, inputPath]
+    .mapIt(quoteShell(it))
+    .join(" ")
+  let execution = execCmdEx(
+    command,
+    options = {poUsePath, poStdErrToStdOut}
+  )
+  let payload = execution.output.strip
+  if payload.len == 0:
+    raise newException(
+      PlasticAgentError,
+      "Office tool returned empty output: " & capability
+    )
+  try:
+    result = parseJson(payload)
+  except CatchableError as error:
+    raise newException(
+      PlasticAgentError,
+      "Invalid Office tool JSON for " & capability & ": " &
+        error.msg & "\\n" & payload
+    )
+  if execution.exitCode != 0 or
+      (result.kind == JObject and result.hasKey("ok") and
+       result["ok"].kind == JBool and not result["ok"].getBool):
+    raise newException(
+      PlasticAgentError,
+      "Office tool failed: " & capability & "\\n" & payload
+    )
+
+
+proc plasticRpaRuntimePython*(): string =
+  let configured = getEnv("GLAUCOPLASTIC_RPA_PYTHON", "").strip
+  if configured.len > 0:
+    return expandTilde(configured)
+  when defined(windows):
+    "python"
+  else:
+    "python3"
+
+proc plasticRpaRuntimeBridge*(): string =
+  let configured = getEnv("GLAUCOPLASTIC_RPA_BRIDGE", "").strip
+  if configured.len > 0:
+    return expandTilde(configured)
+  getCurrentDir() / "tools" / "glaucoplastic_rpa.py"
+
+proc plasticRpaInvoke*(capability: string; arguments: JsonNode): JsonNode =
+  let python = plasticRpaRuntimePython()
+  let bridge = plasticRpaRuntimeBridge()
+  if not fileExists(bridge):
+    raise newException(
+      PlasticAgentError,
+      "RPA bridge not found: " & bridge
+    )
+
+  let tempRoot = getTempDir() / "glaucoplastic-rpa"
+  createDir(tempRoot)
+  let inputPath = tempRoot / (
+    "arguments-" & $epochTime().int64 & "-" & $getCurrentProcessId() & ".json"
+  )
+  writeFile(inputPath, $arguments)
+  defer:
+    if fileExists(inputPath):
+      removeFile(inputPath)
+
+  let command = @[python, bridge, capability, inputPath]
+    .mapIt(quoteShell(it))
+    .join(" ")
+  let execution = execCmdEx(
+    command,
+    options = {poUsePath, poStdErrToStdOut}
+  )
+  let payload = execution.output.strip
+  if payload.len == 0:
+    raise newException(
+      PlasticAgentError,
+      "RPA tool returned empty output: " & capability
+    )
+  try:
+    result = parseJson(payload)
+  except CatchableError as error:
+    raise newException(
+      PlasticAgentError,
+      "Invalid RPA tool JSON for " & capability & ": " &
+        error.msg & "\\n" & payload
+    )
+  if execution.exitCode != 0 or
+      (result.kind == JObject and result.hasKey("ok") and
+       result["ok"].kind == JBool and not result["ok"].getBool):
+    raise newException(
+      PlasticAgentError,
+      "RPA tool failed: " & capability & "\\n" & payload
+    )
+
+proc plasticAssistantVoiceExtension(mimeType: string): string =
+  let normalized = mimeType.toLowerAscii
+  if normalized.contains("webm"): return ".webm"
+  if normalized.contains("ogg"): return ".ogg"
+  if normalized.contains("mp4") or normalized.contains("m4a"): return ".m4a"
+  if normalized.contains("wav"): return ".wav"
+  ".audio"
+
+proc plasticAssistantWhisperLanguage(language: string): string =
+  let normalized = language.strip.replace('_', '-')
+  if normalized.len == 0: return "auto"
+  normalized.split('-')[0].toLowerAscii
+
+proc plasticAssistantTranscribeNative(
+  runtime: PlasticAssistantRuntime;
+  job: PlasticAssistantVoiceJob
+): string =
+  if runtime.config.whisperModel.strip.len == 0:
+    raise newException(
+      PlasticRuntimeError,
+      "Whisper model not configured. Set GLAUCOPLASTIC_WHISPER_MODEL."
+    )
+  let voiceRoot = runtime.rootPath / "voice"
+  createDir(voiceRoot)
+  let token = $epochTime().int64 & "-" & $getCurrentProcessId()
+  let sourcePath = voiceRoot / (
+    "source-" &
+    token &
+    plasticAssistantVoiceExtension(job.mimeType)
+  )
+  let wavPath = voiceRoot / (
+    "prepared-" &
+    token &
+    ".wav"
+  )
+  let outputPrefix = voiceRoot / ("transcript-" & token)
+  writeFile(sourcePath, decode(job.audioBase64))
+
+  let ffmpegCommand = @[
+    runtime.config.ffmpegBinary,
+    "-hide_banner", "-loglevel", "error", "-y",
+    "-i", sourcePath,
+    "-ar", "16000",
+    "-ac", "1",
+    "-c:a", "pcm_s16le",
+    wavPath
+  ].mapIt(quoteShell(it)).join(" ")
+  let ffmpegResult = execCmdEx(
+    ffmpegCommand,
+    options = {poUsePath, poStdErrToStdOut}
+  )
+  if ffmpegResult.exitCode != 0:
+    raise newException(
+      PlasticRuntimeError,
+      "FFmpeg failed while preparing microphone audio:\\n" & ffmpegResult.output
+    )
+
+  let whisperCommand = @[
+    runtime.config.whisperBinary,
+    "-m", expandTilde(runtime.config.whisperModel),
+    "-f", wavPath,
+    "-l", plasticAssistantWhisperLanguage(runtime.config.language),
+    "-nt", "-np", "-otxt", "-of", outputPrefix
+  ].mapIt(quoteShell(it)).join(" ")
+  let whisperResult = execCmdEx(
+    whisperCommand,
+    options = {poUsePath, poStdErrToStdOut}
+  )
+  let transcriptPath = outputPrefix & ".txt"
+  if whisperResult.exitCode != 0 or not fileExists(transcriptPath):
+    raise newException(
+      PlasticRuntimeError,
+      "whisper.cpp failed:\\n" & whisperResult.output
+    )
+  result = readFile(transcriptPath).strip
+  if not plasticAssistantEnvEnabled("GLAUCOPLASTIC_KEEP_VOICE_AUDIO", false):
+    for path in [sourcePath, wavPath, transcriptPath]:
+      if fileExists(path): removeFile(path)
+
+proc plasticAssistantResultText(
+  value: JsonNode
+): string {.gcsafe.} =
+  case value.kind
+  of JString:
+    result = value.getStr.strip
+  of JObject:
+    if value.hasKey("answer") and value["answer"].kind == JString:
+      result = value["answer"].getStr.strip
+    elif value.hasKey("content") and value["content"].kind == JString:
+      result = value["content"].getStr.strip
+    else:
+      result = value.pretty()
+  else:
+    result = value.pretty()
+
+  if result.strip.len == 0 or result.strip == "null":
+    result =
+      "A solicitação foi processada, mas o agente não retornou uma " &
+      "mensagem de confirmação."
+
+proc runPlasticAssistantVoiceWorker(
+  state: PlasticAssistantVoiceWorkerState
+) {.thread.} =
+  if state.isNil: return
+  state.running = true
+  while not state.stopping:
+    var hasJob = false
+    var job: PlasticAssistantVoiceJob
+    acquire(state.queueLock)
+    if state.jobs.len > 0:
+      job = state.jobs[0]
+      state.jobs.delete(0)
+      state.active = true
+      hasJob = true
+    release(state.queueLock)
+    if not hasJob:
+      sleep(25)
+      continue
+    let runtime = state.runtime
+    acquire(runtime.dataLock)
+    runtime.voiceState = "transcribing"
+    runtime.lastError = ""
+    inc runtime.revision
+    release(runtime.dataLock)
+    try:
+      let transcript = runtime.plasticAssistantTranscribeNative(job)
+      var autoSend = false
+      acquire(runtime.dataLock)
+      runtime.lastTranscript = transcript
+      runtime.lastTranscriptId =
+        "transcript-" & $epochTime().int64 & "-" & $state.processed
+      runtime.voiceState = "idle"
+      autoSend = runtime.config.autoSendVoice
+      inc runtime.revision
+      release(runtime.dataLock)
+      if transcript.len > 0 and autoSend:
+        runtime.enqueueMessage(transcript)
+      inc state.processed
+    except CatchableError as error:
+      acquire(runtime.dataLock)
+      runtime.voiceState = "error"
+      runtime.lastError = error.msg
+      inc runtime.revision
+      release(runtime.dataLock)
+      state.lastError = error.msg
+      inc state.failed
+    acquire(state.queueLock)
+    state.active = false
+    release(state.queueLock)
+  state.running = false
+
 
 proc activeOkfRuntime*(agent: PlasticAgent): PlasticOkfRuntime =
   if not agent.isNil and not agent.okfValue.isNil:
@@ -674,10 +4055,158 @@ Quando o pedido exigir produzir ou estruturar conhecimento:
 type
   PlasticRenderEnvironment* = Table[string, JsonNode]
 
+
+type
+  PlasticWebViewCompositionLayer* = enum
+    pwclForeign
+    pwclApplication
+
+  PlasticWebViewCompositionPolicy* = object
+    applicationTransparent*: bool
+    foreignBelowApplication*: bool
+    routeInputThroughForeignRegions*: bool
+
+const
+  PlasticDefaultWebViewComposition* =
+    PlasticWebViewCompositionPolicy(
+      applicationTransparent: true,
+      foreignBelowApplication: true,
+      routeInputThroughForeignRegions: true
+    )
+
+# Estado do boot do runtime/modelo. É compartilhado por Metis/llama e não
+# pertence ao backend gráfico Linux.
+type
+  PlasticLlamaBootState* = ref object
+    lock*: Lock
+    done*: bool
+    failed*: bool
+    message*: string
+    phase*: string
+    connection*: string
+    model*: string
+    detail*: string
+    progress*: int
+    llama*: PlasticLlamaRuntime
+    metis*: PlasticMetisMemory
+
+
+when defined(windows) and not defined(glaucoplasticHeadless):
+  {.passL:
+    "-lglaucoplastic_webview2 " &
+    "-ldcomp -ld3d11 -ldxgi -lole32 -loleaut32 " &
+    "-luuid -luser32 -lgdi32 -lshlwapi -ldwmapi -lstdc++".}
+
+  type
+    PlasticWebView2Rect* {.bycopy.} = object
+      x*, y*, width*, height*: cint
+
+    PlasticWebView2MessageCallback* = proc(
+      surface: cint;
+      messageUtf8: cstring;
+      userData: pointer
+    ) {.cdecl.}
+
+    PlasticWebView2SourceCallback* = proc(
+      urlUtf8: cstring;
+      userData: pointer
+    ) {.cdecl.}
+
+    PlasticWebView2LogCallback* = proc(
+      messageUtf8: cstring;
+      userData: pointer
+    ) {.cdecl.}
+
+    PlasticWindowsDesktopRuntime* =
+      ref object of PlasticDesktopRuntime
+        application*: PlasticApplication
+        host*: pointer
+        foreignPath*: string
+        width*: int
+        height*: int
+
+  proc gpwv2_create(
+    titleUtf8, userDataFolderUtf8: cstring;
+    width, height: cint;
+    messageCallback: PlasticWebView2MessageCallback;
+    sourceCallback: PlasticWebView2SourceCallback;
+    logCallback: PlasticWebView2LogCallback;
+    userData: pointer
+  ): pointer {.cdecl, importc.}
+
+  proc gpwv2_wait_ready(
+    host: pointer;
+    timeoutMs: cint
+  ): cint {.cdecl, importc.}
+
+  proc gpwv2_run(
+    host: pointer
+  ): cint {.cdecl, importc.}
+
+  proc gpwv2_close(
+    host: pointer
+  ) {.cdecl, importc.}
+
+  proc gpwv2_destroy(
+    host: pointer
+  ) {.cdecl, importc.}
+
+  proc gpwv2_shell_set_html(
+    host: pointer;
+    htmlUtf8: cstring
+  ): cint {.cdecl, importc.}
+
+  proc gpwv2_foreign_navigate(
+    host: pointer;
+    urlUtf8: cstring
+  ): cint {.cdecl, importc.}
+
+  proc gpwv2_foreign_add_document_script(
+    host: pointer;
+    scriptUtf8: cstring
+  ): cint {.cdecl, importc.}
+
+  proc gpwv2_foreign_execute_sync(
+    host: pointer;
+    scriptUtf8: cstring;
+    timeoutMs: cint
+  ): cstring {.cdecl, importc.}
+
+  proc gpwv2_free_string(
+    value: cstring
+  ) {.cdecl, importc.}
+
+  proc gpwv2_set_foreign_bounds(
+    host: pointer;
+    x, y, width, height: cint
+  ) {.cdecl, importc.}
+
+  proc gpwv2_set_foreign_visible(
+    host: pointer;
+    visible: cint
+  ) {.cdecl, importc.}
+
+  proc gpwv2_set_foreign_input_regions(
+    host: pointer;
+    rects: ptr PlasticWebView2Rect;
+    count: cint
+  ) {.cdecl, importc.}
+
+  proc gpwv2_present(
+    host: pointer
+  ) {.cdecl, importc.}
+
 when defined(linux):
   type
     PlasticGtkAllocation* {.bycopy.} = object
       x*, y*, width*, height*: cint
+
+
+    PlasticCairoRectangleInt* {.bycopy.} = object
+      x*, y*, width*, height*: cint
+
+    PlasticGdkRgba* {.bycopy.} = object
+      red*, green*, blue*, alpha*: cdouble
 
     PlasticGSourceFunc* = proc(data: pointer): cint {.cdecl.}
     PlasticGAsyncReadyCallback* = proc(
@@ -687,22 +4216,22 @@ when defined(linux):
     ) {.cdecl.}
 
     PlasticJsEvalRequest* = ref object
+      lock*: Lock
+      webView*: pointer
+      script*: string
       completed*: bool
+      abandoned*: bool
       failed*: bool
       text*: string
+      error*: string
 
-    PlasticLlamaBootState* = ref object
+    PlasticForeignNavigateRequest* = ref object
       lock*: Lock
-      done*: bool
+      element*: PlasticForeignElementRuntime
+      url*: string
+      completed*: bool
       failed*: bool
-      message*: string
-      phase*: string
-      connection*: string
-      model*: string
-      detail*: string
-      progress*: int
-      llama*: PlasticLlamaRuntime
-      metis*: PlasticMetisMemory
+      error*: string
 
     PlasticLinuxDesktopRuntime* = ref object of PlasticDesktopRuntime
       application*: PlasticApplication
@@ -719,7 +4248,22 @@ when defined(linux):
       bootTracePhase*: string
       websiteDataManager*: pointer
       webContext*: pointer
+      # WebView foreign: pode navegar livremente entre páginas externas.
       mainWebView*: pointer
+      # WebView do shell GlaucoPlastic: documento próprio e persistente.
+      shellWebView*: pointer
+      compositedForeignPath*: string
+      compositedShellInstalled*: bool
+      compositedChatOpen*: bool
+      eventBridgeInstalled*: bool
+      popupPolicyInstalled*: bool
+      uiEventDrainBusy*: bool
+      uiEventDrainSuspendedUntil*: float
+      uiControlDebugNextAt*: float
+      uiControlDebugLast*: string
+      assistantOverlayWebView*: pointer
+      assistantOverlayWindow*: pointer
+      assistantOverlayGeometryKey*: string
       width*: int
       height*: int
       geometryTimer*: cuint
@@ -3015,7 +6559,7 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
       let llamaConfig = PlasticLlamaConfig(
         host: plasticDefaultLlamaHostCandidates()[0],
         port: plasticDefaultLlamaPortCandidates()[0],
-        modelAlias: getEnv("GLAUCOPLASTIC_MODEL_ALIAS", "qwen3-4b"),
+        modelAlias: getEnv("GLAUCOPLASTIC_MODEL_ALIAS", "IAAR-Shanghai/Metis-4B"),
         contextSize: parseInt(getEnv("GLAUCOPLASTIC_CONTEXT_SIZE", "32768")),
         gpuLayers: parseInt(getEnv("GLAUCOPLASTIC_GPU_LAYERS", "0")),
         temperature: parseFloat(getEnv("GLAUCOPLASTIC_TEMPERATURE", "0.1")),
@@ -3045,6 +6589,7 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
             dataRelativePath: applicationName,
             dataDirectories: @[
               "data", "okf", ".glauco/metis", ".glauco/sessions",
+              ".glauco/assistant", ".glauco/assistant/sessions",
               ".glauco/runtime/metis", ".glauco/models/metis",
               ".glauco/cache/huggingface",
               "webview/Default", "webview/Default/data", "webview/Default/cache"
@@ -3085,10 +6630,63 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
         metisMemoryValue: PlasticMetisMemory(
           config: PlasticMetisMemoryConfig(
             enabled: getEnv("GLAUCOPLASTIC_METIS_ENABLED", "1") != "0",
-            startup: getEnv("GLAUCOPLASTIC_METIS_STARTUP", "1") != "0",
+            startup:
+              getEnv(
+                "GLAUCOPLASTIC_METIS_STARTUP",
+                getEnv(
+                  "GLAUCOPLASTIC_METIS_LOAD_SAFETENSORS_ON_STARTUP",
+                  "0"
+                )
+              ) != "0",
+            startupRequired:
+              getEnv(
+                "GLAUCOPLASTIC_METIS_STARTUP_REQUIRED",
+                "0"
+              ) != "0",
+            logSafetensors:
+              getEnv(
+                "GLAUCOPLASTIC_METIS_LOG_SAFETENSORS",
+                "1"
+              ) != "0",
+            diagnoseMemory:
+              getEnv(
+                "GLAUCOPLASTIC_METIS_DIAGNOSE_MEMORY",
+                "1"
+              ) != "0",
+            safeLoad:
+              getEnv(
+                "GLAUCOPLASTIC_METIS_SAFE_LOAD",
+                "1"
+              ) != "0",
+            metaTensorFallback:
+              getEnv(
+                "GLAUCOPLASTIC_METIS_META_TENSOR_FALLBACK",
+                "1"
+              ) != "0",
+            minSystemAvailableMiB:
+              parseInt(
+                getEnv(
+                  "GLAUCOPLASTIC_METIS_MIN_SYSTEM_AVAILABLE_MIB",
+                  "8192"
+                )
+              ),
+            minGpuFreeMiB:
+              parseInt(
+                getEnv(
+                  "GLAUCOPLASTIC_METIS_MIN_FREE_GPU_MIB",
+                  "2048"
+                )
+              ),
+            gpuReserveMiB:
+              parseInt(
+                getEnv(
+                  "GLAUCOPLASTIC_METIS_GPU_RESERVE_MIB",
+                  "768"
+                )
+              ),
             prepareRuntime: getEnv("GLAUCOPLASTIC_METIS_PREPARE_RUNTIME", "1") != "0",
             autoInstallDependencies: getEnv("GLAUCOPLASTIC_METIS_AUTO_INSTALL", "1") != "0",
-            autoDownloadModel: getEnv("GLAUCOPLASTIC_METIS_AUTO_DOWNLOAD", "0") != "0",
+            autoDownloadModel: getEnv("GLAUCOPLASTIC_METIS_AUTO_DOWNLOAD", "1") != "0",
             pythonVersion: getEnv("GLAUCOPLASTIC_METIS_PYTHON_VERSION", "3.10"),
             pythonVenv: getEnv("GLAUCOPLASTIC_METIS_VENV", ""),
             modelId: getEnv("GLAUCOPLASTIC_METIS_MODEL", "IAAR-Shanghai/Metis-4B"),
@@ -3106,10 +6704,17 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
           rootPath: dataRoot / ".glauco" / "metis",
           runtimeRoot: dataRoot / ".glauco" / "runtime" / "metis",
           modelCachePath: dataRoot / ".glauco" / "cache" / "huggingface",
+          lastDiagnostic: newJObject(),
           runtimePrepared: false,
           modelPrepared: false,
           initialized: false,
           lastError: ""
+        ),
+        assistantValue: newPlasticAssistantRuntime(
+          applicationName,
+          dataRoot,
+          "http://" & llamaConfig.host & ":" & $llamaConfig.port & "/v1",
+          llamaConfig.modelAlias
         ),
         safeStorageValue: PlasticSafeStorageRuntime(
           config: PlasticSafeStorageConfig(
@@ -3182,6 +6787,12 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
         runningValue: false,
         agentPollStartedValue: false
       )
+
+      # Um único runtime IAAR-Shanghai/Metis-4B atende geração, RLM e memória.
+      # PlasticLlamaRuntime permanece apenas como fachada compatível de config;
+      # ele não inicia servidor, não baixa GGUF e não executa inferência.
+      result.llamaValue.metisMemory = result.metisMemoryValue
+      result.assistantValue.metisMemory = result.metisMemoryValue
 
     proc safeStorageAvailable*(application: PlasticApplication): bool =
       findExe("secret-tool").len > 0
@@ -3542,7 +7153,18 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
           llamaMaxTokens: int,
           llamaLogResponseBody: bool,
           metisEnabled: bool,
+          metisStartup: bool,
+          metisStartupRequired: bool,
+          metisLogSafetensors: bool,
+          metisDiagnoseMemory: bool,
+          metisSafeLoad: bool,
+          metisMetaTensorFallback: bool,
+          metisMinSystemAvailableMiB: int,
+          metisMinGpuFreeMiB: int,
+          metisGpuReserveMiB: int,
+          metisAutoDownload: bool,
           metisModelId: string,
+          metisModelPath: string,
           metisProfile: string,
           metisDevice: string,
           metisDtype: string,
@@ -3572,7 +7194,71 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
           result.llamaMaxTokens = parseInt(getEnv("GLAUCOPLASTIC_MAX_TOKENS", "2048"))
           result.llamaLogResponseBody = getEnv("GLAUCOPLASTIC_LLM_LOG_RESPONSE", "0").strip.toLowerAscii in ["1", "true", "yes", "on", "enabled"]
           result.metisEnabled = getEnv("GLAUCOPLASTIC_METIS_ENABLED", "1") != "0"
+          result.metisStartup =
+            getEnv(
+              "GLAUCOPLASTIC_METIS_STARTUP",
+              getEnv(
+                "GLAUCOPLASTIC_METIS_LOAD_SAFETENSORS_ON_STARTUP",
+                "0"
+              )
+            ) != "0"
+          result.metisStartupRequired =
+            getEnv(
+              "GLAUCOPLASTIC_METIS_STARTUP_REQUIRED",
+              "0"
+            ) != "0"
+          result.metisLogSafetensors =
+            getEnv(
+              "GLAUCOPLASTIC_METIS_LOG_SAFETENSORS",
+              "1"
+            ) != "0"
+          result.metisDiagnoseMemory =
+            getEnv(
+              "GLAUCOPLASTIC_METIS_DIAGNOSE_MEMORY",
+              "1"
+            ) != "0"
+          result.metisSafeLoad =
+            getEnv(
+              "GLAUCOPLASTIC_METIS_SAFE_LOAD",
+              "1"
+            ) != "0"
+          result.metisMetaTensorFallback =
+            getEnv(
+              "GLAUCOPLASTIC_METIS_META_TENSOR_FALLBACK",
+              "1"
+            ) != "0"
+          result.metisMinSystemAvailableMiB =
+            parseInt(
+              getEnv(
+                "GLAUCOPLASTIC_METIS_MIN_SYSTEM_AVAILABLE_MIB",
+                "8192"
+              )
+            )
+          result.metisMinGpuFreeMiB =
+            parseInt(
+              getEnv(
+                "GLAUCOPLASTIC_METIS_MIN_FREE_GPU_MIB",
+                "2048"
+              )
+            )
+          result.metisGpuReserveMiB =
+            parseInt(
+              getEnv(
+                "GLAUCOPLASTIC_METIS_GPU_RESERVE_MIB",
+                "768"
+              )
+            )
+          result.metisAutoDownload =
+            getEnv(
+              "GLAUCOPLASTIC_METIS_AUTO_DOWNLOAD",
+              "1"
+            ) != "0"
           result.metisModelId = getEnv("GLAUCOPLASTIC_METIS_MODEL", "IAAR-Shanghai/Metis-4B")
+          result.metisModelPath =
+            getEnv(
+              "GLAUCOPLASTIC_METIS_MODEL_PATH",
+              ""
+            )
           result.metisProfile = getEnv("GLAUCOPLASTIC_METIS_PROFILE", applicationName.toLowerAscii)
           result.metisDevice = getEnv("GLAUCOPLASTIC_METIS_DEVICE", "cuda:0")
           result.metisDtype = getEnv("GLAUCOPLASTIC_METIS_DTYPE", "bfloat16")
@@ -3599,7 +7285,18 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
           llamaMaxTokens: int,
           llamaLogResponseBody: bool,
           metisEnabled: bool,
+          metisStartup: bool,
+          metisStartupRequired: bool,
+          metisLogSafetensors: bool,
+          metisDiagnoseMemory: bool,
+          metisSafeLoad: bool,
+          metisMetaTensorFallback: bool,
+          metisMinSystemAvailableMiB: int,
+          metisMinGpuFreeMiB: int,
+          metisGpuReserveMiB: int,
+          metisAutoDownload: bool,
           metisModelId: string,
+          metisModelPath: string,
           metisProfile: string,
           metisDevice: string,
           metisDtype: string,
@@ -3646,8 +7343,75 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
             of "metis":
               for item in planChildren(child):
                 case planName(item)
-                of "enabled": result.metisEnabled = firstLiteralBool(item, result.metisEnabled)
-                of "model", "modelId": result.metisModelId = firstLiteralString(item, result.metisModelId)
+                of "enabled":
+                  result.metisEnabled =
+                    firstLiteralBool(item, result.metisEnabled)
+                of "startup", "preload", "prewarm":
+                  result.metisStartup =
+                    firstLiteralBool(item, result.metisStartup)
+                of "startupRequired", "preloadRequired":
+                  result.metisStartupRequired =
+                    firstLiteralBool(
+                      item,
+                      result.metisStartupRequired
+                    )
+                of "logSafetensors", "logLoading":
+                  result.metisLogSafetensors =
+                    firstLiteralBool(item, result.metisLogSafetensors)
+                of "diagnoseMemory", "memoryDiagnostics":
+                  result.metisDiagnoseMemory =
+                    firstLiteralBool(
+                      item,
+                      result.metisDiagnoseMemory
+                    )
+                of "safeLoad", "safeMemoryLoad":
+                  result.metisSafeLoad =
+                    firstLiteralBool(
+                      item,
+                      result.metisSafeLoad
+                    )
+                of "metaTensorFallback", "retryWithoutMeta":
+                  result.metisMetaTensorFallback =
+                    firstLiteralBool(
+                      item,
+                      result.metisMetaTensorFallback
+                    )
+                of "minSystemAvailableMiB":
+                  result.metisMinSystemAvailableMiB =
+                    firstLiteralInt(
+                      item,
+                      result.metisMinSystemAvailableMiB
+                    )
+                of "minGpuFreeMiB":
+                  result.metisMinGpuFreeMiB =
+                    firstLiteralInt(
+                      item,
+                      result.metisMinGpuFreeMiB
+                    )
+                of "gpuReserveMiB":
+                  result.metisGpuReserveMiB =
+                    firstLiteralInt(
+                      item,
+                      result.metisGpuReserveMiB
+                    )
+                of "autoDownload", "autoDownloadModel", "downloadModel":
+                  result.metisAutoDownload =
+                    firstLiteralBool(
+                      item,
+                      result.metisAutoDownload
+                    )
+                of "model", "modelId":
+                  result.metisModelId =
+                    firstLiteralString(
+                      item,
+                      result.metisModelId
+                    )
+                of "modelPath", "checkpointPath":
+                  result.metisModelPath =
+                    firstLiteralString(
+                      item,
+                      result.metisModelPath
+                    )
                 of "profile": result.metisProfile = firstLiteralString(item, result.metisProfile)
                 of "device": result.metisDevice = firstLiteralString(item, result.metisDevice)
                 of "dtype": result.metisDtype = firstLiteralString(item, result.metisDtype)
@@ -3723,10 +7487,23 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
         `applicationVariable`.llamaValue.config.logResponseBody = runtimeConfig.llamaLogResponseBody
         `applicationVariable`.metisMemoryValue.config = PlasticMetisMemoryConfig(
           enabled: runtimeConfig.metisEnabled,
-          startup: getEnv("GLAUCOPLASTIC_METIS_STARTUP", "1") != "0",
+          startup: runtimeConfig.metisStartup,
+          startupRequired:
+            runtimeConfig.metisStartupRequired,
+          logSafetensors: runtimeConfig.metisLogSafetensors,
+          diagnoseMemory: runtimeConfig.metisDiagnoseMemory,
+          safeLoad: runtimeConfig.metisSafeLoad,
+          metaTensorFallback:
+            runtimeConfig.metisMetaTensorFallback,
+          minSystemAvailableMiB:
+            runtimeConfig.metisMinSystemAvailableMiB,
+          minGpuFreeMiB:
+            runtimeConfig.metisMinGpuFreeMiB,
+          gpuReserveMiB:
+            runtimeConfig.metisGpuReserveMiB,
           prepareRuntime: getEnv("GLAUCOPLASTIC_METIS_PREPARE_RUNTIME", "1") != "0",
           autoInstallDependencies: getEnv("GLAUCOPLASTIC_METIS_AUTO_INSTALL", "1") != "0",
-          autoDownloadModel: getEnv("GLAUCOPLASTIC_METIS_AUTO_DOWNLOAD", "0") != "0",
+          autoDownloadModel: runtimeConfig.metisAutoDownload,
           pythonVersion: getEnv("GLAUCOPLASTIC_METIS_PYTHON_VERSION", "3.10"),
           pythonVenv: getEnv("GLAUCOPLASTIC_METIS_VENV", ""),
           modelId: runtimeConfig.metisModelId,
@@ -3743,6 +7520,25 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
         )
         `applicationVariable`.metisMemoryValue.rootPath =
           `applicationVariable`.installationValue.metisMemoryPath
+
+        if runtimeConfig.metisModelPath.strip.len > 0:
+          let configuredMetisPath =
+            expandTilde(
+              runtimeConfig.metisModelPath
+            )
+
+          `applicationVariable`.metisMemoryValue.modelPath =
+            if configuredMetisPath.isAbsolute:
+              configuredMetisPath
+            else:
+              getCurrentDir() /
+                configuredMetisPath
+
+        if not `applicationVariable`.assistantValue.isNil:
+          `applicationVariable`.assistantValue.endpoint =
+            `applicationVariable`.llamaValue.endpoint
+          `applicationVariable`.assistantValue.modelAlias =
+            `applicationVariable`.llamaValue.config.modelAlias
       continue
 
     if section.kind in {nnkCall, nnkCommand} and section[0].eqIdent("installation"):
@@ -3765,6 +7561,8 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
               "okf",
               ".glauco/memory",
               ".glauco/sessions",
+              ".glauco/assistant",
+              ".glauco/assistant/sessions",
               "webview/Default",
               "webview/Default/data",
               "webview/Default/cache"
@@ -3907,6 +7705,15 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
           `applicationVariable`.installationValue.okfPath / "index.json"
         `applicationVariable`.metisMemoryValue.rootPath =
           `applicationVariable`.installationValue.metisMemoryPath
+        if not `applicationVariable`.assistantValue.isNil:
+          `applicationVariable`.assistantValue.rootPath =
+            `applicationVariable`.installationValue.dataRoot / ".glauco" / "assistant"
+          `applicationVariable`.assistantValue.sessionsPath =
+            `applicationVariable`.assistantValue.rootPath / "sessions"
+          `applicationVariable`.assistantValue.sessionsIndexPath =
+            `applicationVariable`.assistantValue.rootPath / "sessions.json"
+          `applicationVariable`.assistantValue.thingsPath =
+            `applicationVariable`.assistantValue.rootPath / "things.json"
         `applicationVariable`.webViewValue.userFolder =
           plasticWebViewProfileRoot(
             `applicationVariable`.installationValue.dataRoot
@@ -4646,6 +8453,1009 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
         proc reload*(runtime: PlasticForeignRuntime; path: string) =
           discard runtime.evalJs(path, "location.reload(); true")
 
+        proc plasticRpaJsonString(
+          arguments: JsonNode;
+          key: string;
+          fallback = ""
+        ): string =
+          if arguments.kind != JObject or not arguments.hasKey(key):
+            return fallback
+          let value = arguments[key]
+          case value.kind
+          of JString:
+            value.getStr
+          of JInt:
+            $value.getInt
+          of JFloat:
+            $value.getFloat
+          of JBool:
+            $value.getBool
+          else:
+            fallback
+
+        proc plasticRpaJsonInt(
+          arguments: JsonNode;
+          key: string;
+          fallback = 0
+        ): int =
+          if arguments.kind != JObject or not arguments.hasKey(key):
+            return fallback
+          let value = arguments[key]
+          case value.kind
+          of JInt:
+            value.getInt
+          of JFloat:
+            value.getFloat.int
+          of JString:
+            try:
+              parseInt(value.getStr)
+            except ValueError:
+              fallback
+          else:
+            fallback
+
+        proc plasticRpaJsonBool(
+          arguments: JsonNode;
+          key: string;
+          fallback = false
+        ): bool =
+          if arguments.kind != JObject or not arguments.hasKey(key):
+            return fallback
+          let value = arguments[key]
+          case value.kind
+          of JBool:
+            value.getBool
+          of JInt:
+            value.getInt != 0
+          of JString:
+            value.getStr.strip.toLowerAscii in ["1", "true", "yes", "on", "enabled"]
+          else:
+            fallback
+
+        proc plasticRpaJsLiteral(value: string): string =
+          $(%value)
+
+        proc plasticRpaResolveForeignPath(
+          runtime: PlasticForeignRuntime;
+          requested = ""
+        ): string =
+          if runtime.isNil:
+            raise newException(
+              PlasticForeignBackendError,
+              "O runtime de página controlada não foi inicializado."
+            )
+
+          let candidate = requested.strip
+          if candidate.len > 0:
+            if runtime.elements.hasKey(candidate):
+              return candidate
+            for path, element in runtime.elements:
+              if element.variableName == candidate or
+                  element.identityName == candidate or
+                  element.componentName == candidate:
+                return path
+            raise newException(
+              PlasticForeignBackendError,
+              "Página controlada inexistente: " & candidate
+            )
+
+          if runtime.elements.len == 1:
+            for path in runtime.elements.keys:
+              return path
+
+          for path, element in runtime.elements:
+            let names = @[
+              element.variableName.toLowerAscii,
+              element.identityName.toLowerAscii,
+              element.componentName.toLowerAscii
+            ]
+            if "workspace" in names or "browser" in names or "page" in names:
+              return path
+
+          for path in runtime.elements.keys:
+            return path
+
+          raise newException(
+            PlasticForeignBackendError,
+            "Nenhuma página controlada está disponível."
+          )
+
+        proc plasticRpaDomEval(
+          runtime: PlasticForeignRuntime;
+          arguments: JsonNode;
+          script: string;
+          timeoutMs = 15_000
+        ): JsonNode =
+          let path = runtime.plasticRpaResolveForeignPath(
+            plasticRpaJsonString(arguments, "path")
+          )
+          result = runtime.evalJs(path, script, timeoutMs)
+          if result.kind == JObject and not result.hasKey("path"):
+            result["path"] = %path
+
+        proc plasticRpaDomSnapshot*(
+          runtime: PlasticForeignRuntime;
+          arguments: JsonNode
+        ): JsonNode =
+          let selector = plasticRpaJsonString(arguments, "selector", "body")
+          let maxElements = max(1, min(300, plasticRpaJsonInt(arguments, "maxElements", 120)))
+          let maxText = max(0, min(30_000, plasticRpaJsonInt(arguments, "maxText", 6000)))
+          let visibleOnly = plasticRpaJsonBool(arguments, "visibleOnly", true)
+          var script = """
+        (() => {
+          const rootSelector = __SELECTOR__;
+          const maxElements = __MAX_ELEMENTS__;
+          const maxText = __MAX_TEXT__;
+          const visibleOnly = __VISIBLE_ONLY__;
+          const normalize = value => String(value ?? '').replace(/\s+/g, ' ').trim();
+          const escapeCss = value => globalThis.CSS?.escape ? CSS.escape(value) : String(value).replace(/[^a-zA-Z0-9_-]/g, '\\$&');
+          const visible = element => {
+            if (!element || !(element instanceof Element)) return false;
+            const style = getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.display !== 'none' && style.visibility !== 'hidden' &&
+              style.opacity !== '0' && rect.width > 0 && rect.height > 0;
+          };
+          const cssPath = element => {
+            if (element.id) return '#' + escapeCss(element.id);
+            const parts = [];
+            let current = element;
+            while (current && current.nodeType === 1 && parts.length < 7) {
+              let part = current.tagName.toLowerCase();
+              const name = current.getAttribute('name');
+              if (name) {
+                part += '[name=' + JSON.stringify(name) + ']';
+                parts.unshift(part);
+                break;
+              }
+              let position = 1;
+              let sibling = current;
+              while ((sibling = sibling.previousElementSibling)) {
+                if (sibling.tagName === current.tagName) position += 1;
+              }
+              part += ':nth-of-type(' + position + ')';
+              parts.unshift(part);
+              current = current.parentElement;
+            }
+            return parts.join(' > ');
+          };
+          const describe = element => {
+            const rect = element.getBoundingClientRect();
+            const value = typeof element.value === 'string' ? element.value : undefined;
+            return {
+              selector: cssPath(element),
+              tag: element.tagName.toLowerCase(),
+              id: element.id || undefined,
+              name: element.getAttribute('name') || undefined,
+              type: element.getAttribute('type') || undefined,
+              role: element.getAttribute('role') || undefined,
+              ariaLabel: element.getAttribute('aria-label') || undefined,
+              placeholder: element.getAttribute('placeholder') || undefined,
+              text: normalize(element.innerText || element.textContent).slice(0, 320),
+              value: value === undefined ? undefined : value.slice(0, 1000),
+              checked: typeof element.checked === 'boolean' ? element.checked : undefined,
+              disabled: !!element.disabled,
+              visible: visible(element),
+              rect: {
+                x: Math.round(rect.x), y: Math.round(rect.y),
+                width: Math.round(rect.width), height: Math.round(rect.height)
+              }
+            };
+          };
+          try {
+            const root = document.querySelector(rootSelector);
+            if (!root) return JSON.stringify({ok: false, error: 'selector-not-found', selector: rootSelector});
+            const interactive = 'a,button,input,textarea,select,option,[role],[contenteditable="true"],[tabindex]';
+            let elements = Array.from(root.querySelectorAll(interactive));
+            if (visibleOnly) elements = elements.filter(visible);
+            elements = elements.slice(0, maxElements).map(describe);
+            return JSON.stringify({
+              ok: true,
+              url: location.href,
+              title: document.title,
+              selector: rootSelector,
+              text: maxText > 0 ? normalize(root.innerText || root.textContent).slice(0, maxText) : '',
+              activeElement: document.activeElement ? describe(document.activeElement) : null,
+              elements
+            });
+          } catch (error) {
+            return JSON.stringify({ok: false, error: String(error), selector: rootSelector});
+          }
+        })()
+        """
+          script = script.replace("__SELECTOR__", plasticRpaJsLiteral(selector))
+          script = script.replace("__MAX_ELEMENTS__", $maxElements)
+          script = script.replace("__MAX_TEXT__", $maxText)
+          script = script.replace("__VISIBLE_ONLY__", $(%visibleOnly))
+          runtime.plasticRpaDomEval(arguments, script)
+
+        proc plasticRpaDomQuery*(
+          runtime: PlasticForeignRuntime;
+          arguments: JsonNode
+        ): JsonNode =
+          let selector = plasticRpaJsonString(arguments, "selector")
+          let text = plasticRpaJsonString(arguments, "text")
+          let role = plasticRpaJsonString(arguments, "role")
+          let limit = max(1, min(200, plasticRpaJsonInt(arguments, "limit", 30)))
+          let visibleOnly = plasticRpaJsonBool(arguments, "visibleOnly", true)
+          var script = """
+        (() => {
+          const requestedSelector = __SELECTOR__;
+          const requestedText = __TEXT__;
+          const requestedRole = __ROLE__;
+          const limit = __LIMIT__;
+          const visibleOnly = __VISIBLE_ONLY__;
+          const normalize = value => String(value ?? '').replace(/\s+/g, ' ').trim();
+          const escapeCss = value => globalThis.CSS?.escape ? CSS.escape(value) : String(value).replace(/[^a-zA-Z0-9_-]/g, '\\$&');
+          const visible = element => {
+            if (!element || !(element instanceof Element)) return false;
+            const style = getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.display !== 'none' && style.visibility !== 'hidden' &&
+              style.opacity !== '0' && rect.width > 0 && rect.height > 0;
+          };
+          const cssPath = element => {
+            if (element.id) return '#' + escapeCss(element.id);
+            const parts = [];
+            let current = element;
+            while (current && current.nodeType === 1 && parts.length < 7) {
+              let part = current.tagName.toLowerCase();
+              const name = current.getAttribute('name');
+              if (name) {
+                part += '[name=' + JSON.stringify(name) + ']';
+                parts.unshift(part);
+                break;
+              }
+              let position = 1;
+              let sibling = current;
+              while ((sibling = sibling.previousElementSibling)) {
+                if (sibling.tagName === current.tagName) position += 1;
+              }
+              part += ':nth-of-type(' + position + ')';
+              parts.unshift(part);
+              current = current.parentElement;
+            }
+            return parts.join(' > ');
+          };
+          const describe = element => {
+            const rect = element.getBoundingClientRect();
+            const label = normalize(
+              element.innerText || element.textContent || element.getAttribute('aria-label') ||
+              element.getAttribute('placeholder') || element.getAttribute('name') || element.value
+            );
+            return {
+              selector: cssPath(element),
+              tag: element.tagName.toLowerCase(),
+              id: element.id || undefined,
+              name: element.getAttribute('name') || undefined,
+              type: element.getAttribute('type') || undefined,
+              role: element.getAttribute('role') || undefined,
+              ariaLabel: element.getAttribute('aria-label') || undefined,
+              placeholder: element.getAttribute('placeholder') || undefined,
+              text: normalize(element.innerText || element.textContent).slice(0, 320),
+              label: label.slice(0, 500),
+              value: typeof element.value === 'string' ? element.value.slice(0, 1000) : undefined,
+              checked: typeof element.checked === 'boolean' ? element.checked : undefined,
+              disabled: !!element.disabled,
+              visible: visible(element),
+              rect: {
+                x: Math.round(rect.x), y: Math.round(rect.y),
+                width: Math.round(rect.width), height: Math.round(rect.height)
+              }
+            };
+          };
+          try {
+            const baseSelector = requestedSelector || 'a,button,input,textarea,select,option,[role],[contenteditable="true"],[tabindex]';
+            let elements = Array.from(document.querySelectorAll(baseSelector));
+            if (visibleOnly) elements = elements.filter(visible);
+            if (requestedRole) {
+              const roleNeedle = requestedRole.toLowerCase();
+              elements = elements.filter(element => String(element.getAttribute('role') || '').toLowerCase() === roleNeedle);
+            }
+            if (requestedText) {
+              const textNeedle = normalize(requestedText).toLowerCase();
+              elements = elements.filter(element => {
+                const haystack = normalize([
+                  element.innerText, element.textContent, element.getAttribute('aria-label'),
+                  element.getAttribute('placeholder'), element.getAttribute('name'), element.value
+                ].filter(Boolean).join(' ')).toLowerCase();
+                return haystack.includes(textNeedle);
+              });
+            }
+            const matches = elements.slice(0, limit).map(describe);
+            return JSON.stringify({
+              ok: true,
+              url: location.href,
+              title: document.title,
+              selector: requestedSelector,
+              text: requestedText,
+              role: requestedRole,
+              found: matches.length,
+              matches
+            });
+          } catch (error) {
+            return JSON.stringify({ok: false, error: String(error), selector: requestedSelector});
+          }
+        })()
+        """
+          script = script.replace("__SELECTOR__", plasticRpaJsLiteral(selector))
+          script = script.replace("__TEXT__", plasticRpaJsLiteral(text))
+          script = script.replace("__ROLE__", plasticRpaJsLiteral(role))
+          script = script.replace("__LIMIT__", $limit)
+          script = script.replace("__VISIBLE_ONLY__", $(%visibleOnly))
+          runtime.plasticRpaDomEval(arguments, script)
+
+        proc plasticRpaDomClick*(
+          runtime: PlasticForeignRuntime;
+          arguments: JsonNode
+        ): JsonNode =
+          let selector = plasticRpaJsonString(arguments, "selector")
+          let text = plasticRpaJsonString(arguments, "text")
+          let index = max(0, plasticRpaJsonInt(arguments, "index", 0))
+          var script = """
+        (() => {
+          const selector = __SELECTOR__;
+          const requestedText = __TEXT__;
+          const index = __INDEX__;
+          const normalize = value => String(value ?? '').replace(/\s+/g, ' ').trim();
+          const visible = element => {
+            if (!element || !(element instanceof Element)) return false;
+            const style = getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.display !== 'none' && style.visibility !== 'hidden' &&
+              style.opacity !== '0' && rect.width > 0 && rect.height > 0;
+          };
+          try {
+            const baseSelector = selector || 'a,button,input,textarea,select,[role="button"],[role="link"],[tabindex]';
+            let elements = Array.from(document.querySelectorAll(baseSelector)).filter(visible);
+            if (requestedText) {
+              const needle = normalize(requestedText).toLowerCase();
+              elements = elements.filter(element => normalize([
+                element.innerText, element.textContent, element.getAttribute('aria-label'),
+                element.getAttribute('title'), element.value
+              ].filter(Boolean).join(' ')).toLowerCase().includes(needle));
+            }
+            const element = elements[index];
+            if (!element) return JSON.stringify({ok: false, error: 'element-not-found', selector, text: requestedText, index});
+            const rect = element.getBoundingClientRect();
+            const before = {url: location.href, title: document.title};
+            element.scrollIntoView({block: 'center', inline: 'center', behavior: 'auto'});
+            if (typeof element.focus === 'function') element.focus({preventScroll: true});
+            element.click();
+            return JSON.stringify({
+              ok: true,
+              before,
+              clicked: {
+                tag: element.tagName.toLowerCase(),
+                text: normalize(element.innerText || element.textContent).slice(0, 320),
+                ariaLabel: element.getAttribute('aria-label') || undefined,
+                rect: {x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height)}
+              },
+              after: {url: location.href, title: document.title}
+            });
+          } catch (error) {
+            return JSON.stringify({ok: false, error: String(error), selector, text: requestedText, index});
+          }
+        })()
+        """
+          script = script.replace("__SELECTOR__", plasticRpaJsLiteral(selector))
+          script = script.replace("__TEXT__", plasticRpaJsLiteral(text))
+          script = script.replace("__INDEX__", $index)
+          runtime.plasticRpaDomEval(arguments, script)
+
+        proc plasticRpaDomFill*(
+          runtime: PlasticForeignRuntime;
+          arguments: JsonNode
+        ): JsonNode =
+          let selector = plasticRpaJsonString(arguments, "selector")
+          let text = plasticRpaJsonString(arguments, "text")
+          let value = plasticRpaJsonString(arguments, "value")
+          let index = max(0, plasticRpaJsonInt(arguments, "index", 0))
+          let clear = plasticRpaJsonBool(arguments, "clear", true)
+          var script = """
+        (() => {
+          const selector = __SELECTOR__;
+          const requestedText = __TEXT__;
+          const suppliedValue = __VALUE__;
+          const index = __INDEX__;
+          const clear = __CLEAR__;
+          const normalize = value => String(value ?? '').replace(/\s+/g, ' ').trim();
+          const visible = element => {
+            if (!element || !(element instanceof Element)) return false;
+            const style = getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+          };
+          try {
+            const baseSelector = selector || 'input,textarea,[contenteditable="true"]';
+            let elements = Array.from(document.querySelectorAll(baseSelector)).filter(visible);
+            if (requestedText) {
+              const needle = normalize(requestedText).toLowerCase();
+              elements = elements.filter(element => normalize([
+                element.getAttribute('aria-label'), element.getAttribute('placeholder'),
+                element.getAttribute('name'), element.labels ? Array.from(element.labels).map(label => label.innerText).join(' ') : ''
+              ].filter(Boolean).join(' ')).toLowerCase().includes(needle));
+            }
+            const element = elements[index];
+            if (!element) return JSON.stringify({ok: false, error: 'element-not-found', selector, text: requestedText, index});
+            element.scrollIntoView({block: 'center', inline: 'center', behavior: 'auto'});
+            element.focus({preventScroll: true});
+            const previousValue = element.isContentEditable ? element.textContent : element.value;
+            const nextValue = clear ? suppliedValue : String(previousValue || '') + suppliedValue;
+            if (element.isContentEditable) {
+              element.textContent = nextValue;
+            } else {
+              const prototype = element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+              const descriptor = Object.getOwnPropertyDescriptor(prototype, 'value');
+              if (descriptor?.set) descriptor.set.call(element, nextValue);
+              else element.value = nextValue;
+            }
+            element.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: suppliedValue}));
+            element.dispatchEvent(new Event('change', {bubbles: true}));
+            return JSON.stringify({
+              ok: true,
+              tag: element.tagName.toLowerCase(),
+              previousValue: String(previousValue || ''),
+              value: element.isContentEditable ? element.textContent : element.value
+            });
+          } catch (error) {
+            return JSON.stringify({ok: false, error: String(error), selector, text: requestedText, index});
+          }
+        })()
+        """
+          script = script.replace("__SELECTOR__", plasticRpaJsLiteral(selector))
+          script = script.replace("__TEXT__", plasticRpaJsLiteral(text))
+          script = script.replace("__VALUE__", plasticRpaJsLiteral(value))
+          script = script.replace("__INDEX__", $index)
+          script = script.replace("__CLEAR__", $(%clear))
+          runtime.plasticRpaDomEval(arguments, script)
+
+        proc plasticRpaDomSelect*(
+          runtime: PlasticForeignRuntime;
+          arguments: JsonNode
+        ): JsonNode =
+          let selector = plasticRpaJsonString(arguments, "selector")
+          let value = plasticRpaJsonString(arguments, "value")
+          let label = plasticRpaJsonString(arguments, "label")
+          let index = max(0, plasticRpaJsonInt(arguments, "index", 0))
+          var script = """
+        (() => {
+          const selector = __SELECTOR__;
+          const requestedValue = __VALUE__;
+          const requestedLabel = __LABEL__;
+          const index = __INDEX__;
+          try {
+            const elements = Array.from(document.querySelectorAll(selector || 'select'));
+            const element = elements[index];
+            if (!element || !(element instanceof HTMLSelectElement)) {
+              return JSON.stringify({ok: false, error: 'select-not-found', selector, index});
+            }
+            let option = null;
+            if (requestedValue) option = Array.from(element.options).find(item => item.value === requestedValue);
+            if (!option && requestedLabel) {
+              const needle = requestedLabel.replace(/\s+/g, ' ').trim().toLowerCase();
+              option = Array.from(element.options).find(item => item.textContent.replace(/\s+/g, ' ').trim().toLowerCase().includes(needle));
+            }
+            if (!option) return JSON.stringify({ok: false, error: 'option-not-found', value: requestedValue, label: requestedLabel});
+            element.value = option.value;
+            element.dispatchEvent(new Event('input', {bubbles: true}));
+            element.dispatchEvent(new Event('change', {bubbles: true}));
+            return JSON.stringify({ok: true, value: element.value, label: option.textContent.replace(/\s+/g, ' ').trim()});
+          } catch (error) {
+            return JSON.stringify({ok: false, error: String(error), selector, index});
+          }
+        })()
+        """
+          script = script.replace("__SELECTOR__", plasticRpaJsLiteral(selector))
+          script = script.replace("__VALUE__", plasticRpaJsLiteral(value))
+          script = script.replace("__LABEL__", plasticRpaJsLiteral(label))
+          script = script.replace("__INDEX__", $index)
+          runtime.plasticRpaDomEval(arguments, script)
+
+        proc plasticRpaDomRead*(
+          runtime: PlasticForeignRuntime;
+          arguments: JsonNode
+        ): JsonNode =
+          let selector = plasticRpaJsonString(arguments, "selector")
+          let text = plasticRpaJsonString(arguments, "text")
+          let propertyName = plasticRpaJsonString(arguments, "property", "text")
+          let index = max(0, plasticRpaJsonInt(arguments, "index", 0))
+          var script = """
+        (() => {
+          const selector = __SELECTOR__;
+          const requestedText = __TEXT__;
+          const propertyName = __PROPERTY__;
+          const index = __INDEX__;
+          const normalize = value => String(value ?? '').replace(/\s+/g, ' ').trim();
+          try {
+            const baseSelector = selector || 'a,button,input,textarea,select,[role],[contenteditable="true"],[tabindex]';
+            let elements = Array.from(document.querySelectorAll(baseSelector));
+            if (requestedText) {
+              const needle = normalize(requestedText).toLowerCase();
+              elements = elements.filter(element => normalize([
+                element.innerText, element.textContent, element.getAttribute('aria-label'),
+                element.getAttribute('placeholder'), element.value
+              ].filter(Boolean).join(' ')).toLowerCase().includes(needle));
+            }
+            const element = elements[index];
+            if (!element) return JSON.stringify({ok: false, error: 'element-not-found', selector, text: requestedText, index});
+            let value;
+            switch (propertyName) {
+              case 'text': value = normalize(element.innerText || element.textContent); break;
+              case 'value': value = element.value; break;
+              case 'html': value = element.innerHTML; break;
+              case 'outerHtml': value = element.outerHTML; break;
+              case 'href': value = element.href || element.getAttribute('href'); break;
+              case 'checked': value = !!element.checked; break;
+              case 'selectedText': value = element.selectedOptions ? Array.from(element.selectedOptions).map(option => normalize(option.textContent)) : []; break;
+              case 'attributes': value = Object.fromEntries(Array.from(element.attributes).map(attribute => [attribute.name, attribute.value])); break;
+              default:
+                value = element[propertyName];
+                if (typeof value === 'function') value = String(value);
+                if (value instanceof Node) value = value.textContent;
+            }
+            return JSON.stringify({ok: true, property: propertyName, value});
+          } catch (error) {
+            return JSON.stringify({ok: false, error: String(error), selector, text: requestedText, index});
+          }
+        })()
+        """
+          script = script.replace("__SELECTOR__", plasticRpaJsLiteral(selector))
+          script = script.replace("__TEXT__", plasticRpaJsLiteral(text))
+          script = script.replace("__PROPERTY__", plasticRpaJsLiteral(propertyName))
+          script = script.replace("__INDEX__", $index)
+          runtime.plasticRpaDomEval(arguments, script)
+
+        proc plasticRpaDomSubmit*(
+          runtime: PlasticForeignRuntime;
+          arguments: JsonNode
+        ): JsonNode =
+          let selector = plasticRpaJsonString(arguments, "selector", "form")
+          let index = max(0, plasticRpaJsonInt(arguments, "index", 0))
+          var script = """
+        (() => {
+          const selector = __SELECTOR__;
+          const index = __INDEX__;
+          try {
+            const candidate = Array.from(document.querySelectorAll(selector))[index];
+            const form = candidate instanceof HTMLFormElement ? candidate : candidate?.closest('form');
+            if (!form) return JSON.stringify({ok: false, error: 'form-not-found', selector, index});
+            if (typeof form.requestSubmit === 'function') form.requestSubmit();
+            else form.submit();
+            return JSON.stringify({ok: true, submitted: true, action: form.action || location.href, method: form.method || 'get'});
+          } catch (error) {
+            return JSON.stringify({ok: false, error: String(error), selector, index});
+          }
+        })()
+        """
+          script = script.replace("__SELECTOR__", plasticRpaJsLiteral(selector))
+          script = script.replace("__INDEX__", $index)
+          runtime.plasticRpaDomEval(arguments, script)
+
+        proc plasticRpaDomScroll*(
+          runtime: PlasticForeignRuntime;
+          arguments: JsonNode
+        ): JsonNode =
+          let selector = plasticRpaJsonString(arguments, "selector")
+          let deltaX = plasticRpaJsonInt(arguments, "deltaX", 0)
+          let deltaY = plasticRpaJsonInt(arguments, "deltaY", 600)
+          let blockPosition =
+            plasticRpaJsonString(
+              arguments,
+              "block",
+              plasticRpaJsonString(arguments, "alignment", "center")
+            )
+          var script = """
+        (() => {
+          const selector = __SELECTOR__;
+          const deltaX = __DELTA_X__;
+          const deltaY = __DELTA_Y__;
+          const block = __BLOCK__;
+          try {
+            if (selector) {
+              const element = document.querySelector(selector);
+              if (!element) return JSON.stringify({ok: false, error: 'element-not-found', selector});
+              element.scrollIntoView({block, inline: 'nearest', behavior: 'auto'});
+              if (deltaX || deltaY) element.scrollBy({left: deltaX, top: deltaY, behavior: 'auto'});
+              return JSON.stringify({ok: true, selector, scrollLeft: element.scrollLeft, scrollTop: element.scrollTop});
+            }
+            window.scrollBy({left: deltaX, top: deltaY, behavior: 'auto'});
+            return JSON.stringify({ok: true, scrollX: window.scrollX, scrollY: window.scrollY});
+          } catch (error) {
+            return JSON.stringify({ok: false, error: String(error), selector});
+          }
+        })()
+        """
+          script = script.replace("__SELECTOR__", plasticRpaJsLiteral(selector))
+          script = script.replace("__DELTA_X__", $deltaX)
+          script = script.replace("__DELTA_Y__", $deltaY)
+          script = script.replace("__BLOCK__", plasticRpaJsLiteral(blockPosition))
+          runtime.plasticRpaDomEval(arguments, script)
+
+        proc plasticRpaDomProbe(
+          runtime: PlasticForeignRuntime;
+          path, selector, text: string;
+          index: int
+        ): JsonNode =
+          let arguments = %*{"path": path}
+          var script = """
+        (() => {
+          const selector = __SELECTOR__;
+          const requestedText = __TEXT__;
+          const index = __INDEX__;
+          const normalize = value => String(value ?? '').replace(/\s+/g, ' ').trim();
+          const visible = element => {
+            if (!element || !(element instanceof Element)) return false;
+            const style = getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.display !== 'none' && style.visibility !== 'hidden' &&
+              style.opacity !== '0' && rect.width > 0 && rect.height > 0;
+          };
+          try {
+            const baseSelector = selector || 'a,button,input,textarea,select,[role],[contenteditable="true"],[tabindex]';
+            let elements = Array.from(document.querySelectorAll(baseSelector));
+            if (requestedText) {
+              const needle = normalize(requestedText).toLowerCase();
+              elements = elements.filter(element => normalize([
+                element.innerText, element.textContent, element.getAttribute('aria-label'),
+                element.getAttribute('placeholder'), element.value
+              ].filter(Boolean).join(' ')).toLowerCase().includes(needle));
+            }
+            const element = elements[index];
+            return JSON.stringify({
+              ok: true,
+              found: !!element,
+              visible: !!element && visible(element),
+              enabled: !!element && !element.disabled && element.getAttribute('aria-disabled') !== 'true',
+              text: element ? normalize(element.innerText || element.textContent || element.value) : '',
+              value: element && typeof element.value === 'string' ? element.value : null,
+              url: location.href,
+              title: document.title
+            });
+          } catch (error) {
+            return JSON.stringify({ok: false, error: String(error), selector, text: requestedText, index});
+          }
+        })()
+        """
+          script = script.replace("__SELECTOR__", plasticRpaJsLiteral(selector))
+          script = script.replace("__TEXT__", plasticRpaJsLiteral(text))
+          script = script.replace("__INDEX__", $index)
+          runtime.plasticRpaDomEval(arguments, script, 5_000)
+
+        proc plasticRpaDomWait*(
+          runtime: PlasticForeignRuntime;
+          arguments: JsonNode
+        ): JsonNode =
+          let requestedPath = plasticRpaJsonString(arguments, "path")
+          let path = runtime.plasticRpaResolveForeignPath(requestedPath)
+          let selector = plasticRpaJsonString(arguments, "selector")
+          let text = plasticRpaJsonString(arguments, "text")
+          let expectedText = plasticRpaJsonString(arguments, "expectedText")
+          let state = plasticRpaJsonString(arguments, "state", "visible").toLowerAscii
+          let index = max(0, plasticRpaJsonInt(arguments, "index", 0))
+          let timeoutMs = max(100, min(120_000, plasticRpaJsonInt(arguments, "timeoutMs", 10_000)))
+          let pollMs = max(50, min(2_000, plasticRpaJsonInt(arguments, "pollMs", 200)))
+          let started = epochTime()
+          let deadline = started + timeoutMs.float / 1000.0
+          var last = newJNull()
+
+          while epochTime() <= deadline:
+            last = runtime.plasticRpaDomProbe(path, selector, text, index)
+            if last.kind == JObject and plasticRpaJsonBool(last, "ok", false):
+              let found = plasticRpaJsonBool(last, "found", false)
+              let visible = plasticRpaJsonBool(last, "visible", false)
+              let enabled = plasticRpaJsonBool(last, "enabled", false)
+              let observedText = plasticRpaJsonString(last, "text")
+              let satisfied =
+                case state
+                of "exists", "present": found
+                of "absent", "missing": not found
+                of "hidden": not found or not visible
+                of "enabled": found and enabled
+                of "text": found and expectedText.len > 0 and
+                  observedText.toLowerAscii.contains(expectedText.toLowerAscii)
+                else: found and visible
+              if satisfied:
+                return %*{
+                  "ok": true,
+                  "path": path,
+                  "state": state,
+                  "elapsedMs": ((epochTime() - started) * 1000).int,
+                  "observation": last
+                }
+            sleep(pollMs)
+
+          %*{
+            "ok": false,
+            "path": path,
+            "error": "timeout",
+            "state": state,
+            "timeoutMs": timeoutMs,
+            "observation": last
+          }
+
+        proc plasticRpaNavigationHost(value: string): string =
+          var candidate =
+            value.strip.toLowerAscii
+
+          let schemeIndex =
+            candidate.find("://")
+          if schemeIndex >= 0:
+            candidate =
+              candidate[
+                schemeIndex + 3 ..
+                candidate.high
+              ]
+
+          for delimiter in ['/', '?', '#']:
+            let index =
+              candidate.find(delimiter)
+            if index >= 0:
+              candidate =
+                candidate[0 ..< index]
+
+          let atIndex =
+            candidate.rfind('@')
+          if atIndex >= 0 and
+              atIndex < candidate.high:
+            candidate =
+              candidate[
+                atIndex + 1 ..
+                candidate.high
+              ]
+
+          let colonIndex =
+            candidate.rfind(':')
+          if colonIndex > 0:
+            candidate =
+              candidate[0 ..< colonIndex]
+
+          if candidate.startsWith("www."):
+            candidate =
+              candidate[4 .. candidate.high]
+
+          result = candidate.strip
+
+        proc plasticRpaNavigationPath(value: string): string =
+          var candidate = value.strip
+
+          let schemeIndex =
+            candidate.find("://")
+          if schemeIndex >= 0:
+            candidate =
+              candidate[
+                schemeIndex + 3 ..
+                candidate.high
+              ]
+
+          let slashIndex =
+            candidate.find('/')
+
+          if slashIndex < 0:
+            return "/"
+
+          candidate =
+            candidate[
+              slashIndex ..
+              candidate.high
+            ]
+
+          for delimiter in ['?', '#']:
+            let index =
+              candidate.find(delimiter)
+            if index >= 0:
+              candidate =
+                candidate[0 ..< index]
+
+          while candidate.len > 1 and
+              candidate.endsWith("/"):
+            candidate.setLen(
+              candidate.len - 1
+            )
+
+          if candidate.len == 0:
+            return "/"
+
+          result = candidate
+
+        proc plasticRpaNavigationTargetReached(
+          requested, current: string
+        ): bool =
+          let requestedHost =
+            plasticRpaNavigationHost(requested)
+          let currentHost =
+            plasticRpaNavigationHost(current)
+
+          if requestedHost.len == 0 or
+              currentHost.len == 0:
+            return false
+
+          let hostMatches =
+            currentHost == requestedHost or
+            currentHost.endsWith(
+              "." & requestedHost
+            ) or
+            requestedHost.endsWith(
+              "." & currentHost
+            )
+
+          if not hostMatches:
+            return false
+
+          let requestedPath =
+            plasticRpaNavigationPath(requested)
+          let currentPath =
+            plasticRpaNavigationPath(current)
+
+          if requestedPath == "/":
+            return true
+
+          result =
+            currentPath == requestedPath or
+            currentPath.startsWith(
+              requestedPath & "/"
+            )
+
+        proc plasticRpaDomNavigate*(
+          runtime: PlasticForeignRuntime;
+          arguments: JsonNode
+        ): JsonNode =
+          let path = runtime.plasticRpaResolveForeignPath(
+            plasticRpaJsonString(arguments, "path")
+          )
+          let url = plasticRpaJsonString(arguments, "url")
+          if url.strip.len == 0:
+            raise newException(
+              PlasticForeignBackendError,
+              "A URL é obrigatória."
+            )
+
+          let normalized =
+            normalizedForeignUrl(url)
+          let readyTimeoutMs =
+            max(
+              250,
+              plasticRpaJsonInt(
+                arguments,
+                "readyTimeoutMs",
+                8_000
+              )
+            )
+          let startedAt = epochTime()
+
+          runtime.navigate(path, url)
+
+          var ready = false
+          var domReady = false
+          var settled = false
+          var currentUrl = normalized
+          var documentReadyState = ""
+          var documentTitle = ""
+          var lastDomProbeAt = 0.0
+
+          if runtime.elements.hasKey(path):
+            while (
+                (epochTime() - startedAt) *
+                1000.0
+              ) < readyTimeoutMs.float:
+              let element =
+                runtime.elements[path]
+
+              if element.currentUrl.strip.len > 0:
+                currentUrl =
+                  element.currentUrl
+
+              if element.status == pfsReady:
+                ready = true
+                settled = true
+                break
+
+              let elapsed =
+                epochTime() - startedAt
+
+              # WEBKIT_LOAD_FINISHED não é uma boa definição de
+              # "página utilizável" para SPAs. Depois de COMMITTED,
+              # confirme diretamente o documento.
+              if elapsed >= 0.20 and
+                  epochTime() - lastDomProbeAt >= 0.20:
+                lastDomProbeAt =
+                  epochTime()
+
+                try:
+                  let probe =
+                    runtime.evalJs(
+                      path,
+                      """
+                      (() => JSON.stringify({
+                        href:
+                          String(
+                            window.location &&
+                            window.location.href ||
+                            ''
+                          ),
+                        readyState:
+                          String(
+                            document.readyState ||
+                            ''
+                          ),
+                        title:
+                          String(
+                            document.title ||
+                            ''
+                          )
+                      }))()
+                      """,
+                      1_200
+                    )
+
+                  if probe.kind == JObject:
+                    if probe.hasKey("href") and
+                        probe["href"].kind == JString:
+                      currentUrl =
+                        probe["href"].getStr
+
+                    if probe.hasKey("readyState") and
+                        probe["readyState"].kind == JString:
+                      documentReadyState =
+                        probe["readyState"].getStr
+
+                    if probe.hasKey("title") and
+                        probe["title"].kind == JString:
+                      documentTitle =
+                        probe["title"].getStr
+
+                    let targetReached =
+                      plasticRpaNavigationTargetReached(
+                        normalized,
+                        currentUrl
+                      )
+
+                    domReady =
+                      targetReached and
+                      documentReadyState in
+                        ["interactive", "complete"]
+
+                    if domReady:
+                      settled = true
+                      break
+                except CatchableError:
+                  # Enquanto o novo documento ainda não estiver executável,
+                  # continue aguardando load events.
+                  discard
+
+              sleep(25)
+
+          let elapsedMs =
+            ((epochTime() - startedAt) * 1000.0).int
+
+          plasticDebugTrace(
+            "rpa.dom.navigate.settled path=" &
+            path &
+            " requested=" & normalized &
+            " current=" & currentUrl &
+            " ready=" & $ready &
+            " domReady=" & $domReady &
+            " settled=" & $settled &
+            " readyState=" &
+            documentReadyState &
+            " title=" &
+            documentTitle &
+            " elapsedMs=" & $elapsedMs
+          )
+
+          %*{
+            "ok": true,
+            "ready": ready,
+            "domReady": domReady,
+            "settled": settled,
+            "path": path,
+            "url": normalized,
+            "currentUrl": currentUrl,
+            "readyState": documentReadyState,
+            "title": documentTitle,
+            "elapsedMs": elapsedMs
+          }
+
         proc newMockForeignBackend*(): PlasticForeignBackend =
           result = PlasticForeignBackend(name: "mock")
           result.create = proc(element: PlasticForeignElementRuntime) =
@@ -4947,6 +9757,18 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
           ## especial de binding e seguem como expressões comuns da DSL.
           if node.isNil:
             return ""
+
+          let bindingSource = planSource(node).strip
+          if bindingSource.toLowerAscii.startsWith("binds "):
+            let reference = bindingSource[6 .. ^1].strip
+            for prefix in ["states.", "state."]:
+              if reference.toLowerAscii.startsWith(prefix):
+                var resolved = reference[prefix.len .. ^1].strip
+                while resolved.len > 0 and
+                    not (resolved[^1].isAlphaNumeric or resolved[^1] in {'_', '.'}):
+                  resolved.setLen(resolved.len - 1)
+                if resolved.len > 0:
+                  return resolved
 
           if planKind(node) in ["identifier", "path"]:
             let path = planName(node).split('.')
@@ -5696,9 +10518,9 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
             element.componentName = componentName
             element.variableName = variableName
             element.identityName = identityName
-            element.url = url
             element.urlStateName = urlStateName
             if element.status == pfsIdle:
+              element.url = url
               element.currentUrl = url
 
           let className =
@@ -5719,9 +10541,16 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
             else:
               ""
 
+          let placeholderUrl =
+            if application.foreignValue.elements.hasKey(path) and
+                application.foreignValue.elements[path].currentUrl.len > 0:
+              application.foreignValue.elements[path].currentUrl
+            else:
+              url
+
           result = "<div class=\"glauco-foreign " & htmlAttribute(className) &
             "\" data-glauco-foreign=\"" & htmlAttribute(path) &
-            "\" data-glauco-url=\"" & htmlAttribute(url) & "\""
+            "\" data-glauco-url=\"" & htmlAttribute(placeholderUrl) & "\""
 
           if urlStateName.len > 0:
             result.add " data-glauco-url-bind-state=\"" &
@@ -5825,21 +10654,38 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
           var hostAttributes = ""
           var hostEventNames: seq[string] = @[]
           var identityPath = ""
-          var boundStateName = ""
+          var boundUiStateName = ""
+          var boundUiEventName = ""
 
           for argumentIndex, argument in arguments:
             if planKind(argument) == "namedArgument":
               let attributeName = planName(argument)
               let value = application.resolveRenderValue(argument, environment)
               let text = jsonText(value)
+              let bindingStateName =
+                if argument.hasKey("value") and
+                    planKind(argument["value"]) == "call" and
+                    planName(argument["value"]) == "binds" and
+                    planSource(argument["value"]).strip.startsWith("binds "):
+                  boundStateName(argument["value"])
+                else:
+                  ""
+
+              if attributeName in ["bindOn", "commitOn"]:
+                boundUiEventName = text.strip.toLowerAscii
+                continue
+
+              # `atributo = binds states.X` transporta o valor inicial e, para
+              # atributos editáveis, liga os eventos do elemento de volta ao estado.
+              if bindingStateName.len > 0 and
+                  attributeName in ["value", "checked", "selected"]:
+                boundUiStateName = bindingStateName
+                attributes.add " data-glauco-bind-state=\"" &
+                  htmlAttribute(bindingStateName) & "\""
+                attributes.add " data-glauco-bind-attribute=\"" &
+                  htmlAttribute(attributeName) & "\""
 
               case attributeName
-              of "bind":
-                let statePath = planName(argument{"value"}).split('.')
-                if statePath.len >= 2 and statePath[0] == "states":
-                  boundStateName = statePath[1]
-                  attributes.add " data-glauco-bind-state=\"" &
-                    htmlAttribute(statePath[1]) & "\""
               of "class", "id", "style", "title", "role", "name", "value", "type",
                  "placeholder", "autocomplete", "spellcheck", "aria-label",
                  "href", "src", "rel", "media", "target", "download", "defer",
@@ -5856,6 +10702,10 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
                 application.resolveRenderValue(argument, environment)
               ))
 
+          if boundUiStateName.len > 0 and boundUiEventName.len > 0:
+            attributes.add " data-glauco-bind-event=\"" &
+              htmlAttribute(boundUiEventName) & "\""
+
           if identityName.len > 0:
             identityPath =
               if componentName.len > 0:
@@ -5867,9 +10717,12 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
             hostAttributes.add " data-glauco-base-tag=\"" &
               htmlAttribute(baseTagName) & "\""
             hostAttributes.add " style=\"display: contents\""
-            if boundStateName.len > 0:
+            if boundUiStateName.len > 0:
               hostAttributes.add " data-glauco-bind-state=\"" &
-                htmlAttribute(boundStateName) & "\""
+                htmlAttribute(boundUiStateName) & "\""
+              if boundUiEventName.len > 0:
+                hostAttributes.add " data-glauco-bind-event=\"" &
+                  htmlAttribute(boundUiEventName) & "\""
 
             # Eventos declarados por `when Ir clicks:` são materializados
             # no HTML por meio do ID opaco da closure Nim registrada.
@@ -5948,7 +10801,11 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
           let rootRender = findPlanSection(application.planValue, "render")
           let environment = initTable[string, JsonNode]()
 
-          if rootRender.isSome:
+          if not application.assistantValue.isNil and
+              application.assistantValue.config.enabled and
+              application.assistantValue.config.builtInShell:
+            body = plasticAssistantBodyHtml(application.assistantValue)
+          elif rootRender.isSome:
             for node in planChildren(rootRender.get):
               body.add application.renderPlanNodeHtml(node, environment)
           elif application.componentsValue.kind == JArray and application.componentsValue.len > 0:
@@ -5967,6 +10824,18 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
 
           let title = htmlEscape(application.productValue.title)
           let statusStyles = application.foreignStatusStyles()
+          let assistantStyles =
+            if not application.assistantValue.isNil and
+                application.assistantValue.config.enabled:
+              plasticAssistantCss()
+            else:
+              ""
+          let assistantScript =
+            if not application.assistantValue.isNil and
+                application.assistantValue.config.enabled:
+              plasticAssistantScript(application.assistantValue)
+            else:
+              ""
 
           result = """<!doctype html>
         <html>
@@ -6017,7 +10886,7 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
             .glauco-foreign[data-status="ready"]::before {
               display: none;
             }
-        """ & statusStyles & """
+        """ & statusStyles & assistantStyles & """
           </style>
         </head>
         <body>
@@ -6086,9 +10955,18 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
               function emit(eventName, element, event) {
                 const valueElement = resolveValueElement(element);
                 const resolvedHandlerId = handlerId(element, eventName);
-                const bindState = element && element.dataset
+                const configuredBindEvent = element && element.dataset
+                  ? (element.dataset.glaucoBindEvent || "")
+                  : "";
+                const declaredBindState = element && element.dataset
                   ? (element.dataset.glaucoBindState || "")
                   : "";
+                const bindingMatches = !!declaredBindState && (
+                  configuredBindEvent
+                    ? configuredBindEvent === eventName
+                    : eventName === "input" || eventName === "change"
+                );
+                const bindState = bindingMatches ? declaredBindState : "";
 
                 if (!resolvedHandlerId && !bindState) return;
 
@@ -6108,23 +10986,39 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
                 if (now - lastSeen < 50) return;
                 window.__glaucoplasticEventDedupe.set(dedupeKey, now);
 
-                eventQueue().push({
+                const payload = {
                   handlerId: resolvedHandlerId,
                   event: eventName,
                   identity,
                   bindState,
-                  value: valueElement && "value" in valueElement ? valueElement.value : null,
+                  value: valueElement && "value" in valueElement
+                    ? valueElement.value
+                    : null,
                   checked: valueElement && "checked" in valueElement
                     ? !!valueElement.checked
                     : null,
                   key: event && event.key ? event.key : ""
-                });
+                };
+
+                const bridge =
+                  window.webkit &&
+                  window.webkit.messageHandlers &&
+                  window.webkit.messageHandlers.glaucoplasticEvent;
+
+                if (bridge) {
+                  bridge.postMessage(JSON.stringify(payload));
+                } else {
+                  eventQueue().push(payload);
+                }
               }
 
               function ensureGlaucoplasticCustomElements() {
                 if (!window.customElements || !document.querySelectorAll) return;
+                const root =
+                  window.__glaucoplasticShellRoot ||
+                  document;
                 const items = Array.from(
-                  document.querySelectorAll('[data-glauco-identity]')
+                  root.querySelectorAll('[data-glauco-identity]')
                 );
                 for (const item of items) {
                   const tagName = (item.tagName || "").toLowerCase();
@@ -6145,25 +11039,220 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
                 }
               }
 
+              function glaucoplasticVisibleRectangle(
+                selector,
+                requirePointerEvents
+              ) {
+                const node = document.querySelector(selector);
+                if (!node) return null;
+
+                const rectangle = node.getBoundingClientRect();
+                const style = getComputedStyle(node);
+                const opacity = Number.parseFloat(style.opacity || "1");
+
+                const visible =
+                  style.display !== "none" &&
+                  style.visibility !== "hidden" &&
+                  !node.hidden &&
+                  opacity > 0.01 &&
+                  rectangle.width > 0 &&
+                  rectangle.height > 0 &&
+                  (
+                    !requirePointerEvents ||
+                    style.pointerEvents !== "none"
+                  );
+
+                return visible ? rectangle : null;
+              }
+
               function collectGlaucoplasticForeignLayouts() {
+                function visibleBlockingRectangles() {
+                  const selectors = [
+                    ".rpa-composer",
+                    ".assistant-composer",
+                    ".rpa-chat-panel",
+                    ".rpa-notification-stack",
+                    ".rpa-agent-notification",
+                    ".rpa-message-list",
+                    ".assistant-message-list",
+                    ".assistant-messages",
+                    "[data-glaucoplastic-messages]",
+                    "[data-glaucoplastic-foreign-overlay]"
+                  ];
+
+                  const visited = new Set();
+                  const rectangles = [];
+
+                  for (const selector of selectors) {
+                    for (const node of document.querySelectorAll(selector)) {
+                      if (visited.has(node)) continue;
+                      visited.add(node);
+
+                      const rectangle =
+                        node.getBoundingClientRect();
+
+                      const style =
+                        getComputedStyle(node);
+
+                      const opacity =
+                        Number.parseFloat(
+                          style.opacity || "1"
+                        );
+
+                      const visible =
+                        style.display !== "none" &&
+                        style.visibility !== "hidden" &&
+                        style.pointerEvents !== "none" &&
+                        !node.hidden &&
+                        opacity > 0.01 &&
+                        rectangle.width > 1 &&
+                        rectangle.height > 1;
+
+                      if (visible) {
+                        rectangles.push({
+                          left: rectangle.left,
+                          top: rectangle.top,
+                          right: rectangle.right,
+                          bottom: rectangle.bottom
+                        });
+                      }
+                    }
+                  }
+
+                  return rectangles;
+                }
+
+                function subtractRectangle(base, blocker) {
+                  const overlapLeft =
+                    Math.max(base.left, blocker.left);
+                  const overlapTop =
+                    Math.max(base.top, blocker.top);
+                  const overlapRight =
+                    Math.min(base.right, blocker.right);
+                  const overlapBottom =
+                    Math.min(base.bottom, blocker.bottom);
+
+                  if (
+                    overlapRight <= overlapLeft ||
+                    overlapBottom <= overlapTop
+                  ) {
+                    return [base];
+                  }
+
+                  return [
+                    {
+                      left: base.left,
+                      top: base.top,
+                      right: base.right,
+                      bottom: overlapTop
+                    },
+                    {
+                      left: base.left,
+                      top: overlapBottom,
+                      right: base.right,
+                      bottom: base.bottom
+                    },
+                    {
+                      left: base.left,
+                      top: overlapTop,
+                      right: overlapLeft,
+                      bottom: overlapBottom
+                    },
+                    {
+                      left: overlapRight,
+                      top: overlapTop,
+                      right: base.right,
+                      bottom: overlapBottom
+                    }
+                  ].filter(fragment =>
+                    fragment.right - fragment.left > 1 &&
+                    fragment.bottom - fragment.top > 1
+                  );
+                }
+
+                function subtractBlockingRectangles(base, blockers) {
+                  let fragments = [base];
+
+                  for (const blocker of blockers) {
+                    fragments = fragments.flatMap(fragment =>
+                      subtractRectangle(fragment, blocker)
+                    );
+
+                    if (fragments.length === 0) break;
+                  }
+
+                  return fragments;
+                }
+
+                const blockers =
+                  visibleBlockingRectangles();
+
                 return Array.from(
-                  document.querySelectorAll('[data-glauco-foreign]')
+                  document.querySelectorAll(
+                    "[data-glauco-foreign]"
+                  )
                 ).map(element => {
-                  const rectangle = element.getBoundingClientRect();
-                  const style = getComputedStyle(element);
+                  const rectangle =
+                    element.getBoundingClientRect();
+
+                  const style =
+                    getComputedStyle(element);
+
+                  const left = rectangle.left;
+                  const top = rectangle.top;
+                  const right = rectangle.right;
+                  const bottom = rectangle.bottom;
+                  const width =
+                    Math.max(0, right - left);
+                  const height =
+                    Math.max(0, bottom - top);
+
+                  /*
+                    O placeholder é invisível de propósito na shell.
+                    visibility:hidden/opacity:0 não significam que a
+                    WebView foreign deva desaparecer.
+                  */
+                  const visible =
+                    style.display !== "none" &&
+                    !element.hidden &&
+                    width > 1 &&
+                    height > 1;
+
+                  const inputHoles = visible
+                    ? subtractBlockingRectangles(
+                        {
+                          left,
+                          top,
+                          right,
+                          bottom
+                        },
+                        blockers
+                      ).map(fragment => ({
+                        x: Math.round(fragment.left),
+                        y: Math.round(fragment.top),
+                        width: Math.round(
+                          fragment.right - fragment.left
+                        ),
+                        height: Math.round(
+                          fragment.bottom - fragment.top
+                        )
+                      }))
+                    : [];
+
                   return {
                     path: element.dataset.glaucoForeign,
-                    x: rectangle.left,
-                    y: rectangle.top,
-                    width: rectangle.width,
-                    height: rectangle.height,
-                    visible: style.display !== 'none' &&
-                      style.visibility !== 'hidden' &&
-                      rectangle.width > 0 &&
-                      rectangle.height > 0
+                    x: Math.round(left),
+                    y: Math.round(top),
+                    width: Math.round(width),
+                    height: Math.round(height),
+                    visible,
+                    inputHoles
                   };
                 });
               }
+
+              window.__glaucoplasticCollectForeignLayouts =
+                collectGlaucoplasticForeignLayouts;
 
               function publishGlaucoplasticForeignLayouts() {
                 const snapshot = (
@@ -6300,7 +11389,7 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
               document.addEventListener("blur", event => {
                 const element = resolveEventElement(
                   event,
-                  "[data-glauco-handler-blur]"
+                  "[data-glauco-bind-state],[data-glauco-handler-blur]"
                 );
                 if (!element) return;
                 emit("blur", element, event);
@@ -6318,6 +11407,7 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
               }, true);
             })();
           </script>
+          """ & assistantScript & """
         </body>
         </html>"""
       result.add newCall(
@@ -6642,7 +11732,7 @@ print(json.dumps({
                 if configuredModelPath.len > 0:
                   configuredModelPath
                 else:
-                  getAppDir() / "models" / "metis" / modelSlug
+                  glaucoRoot / "models" / "metis" / modelSlug
 
           let profile =
             plasticMetisSafeName(memory.config.profile)
@@ -6650,7 +11740,7 @@ print(json.dumps({
           memory.profileDir =
             memory.rootPath / "profiles" / profile
           memory.snapshotPath =
-            memory.profileDir / "runtime.metis.pt"
+            memory.profileDir / "runtime.metis.safetensors"
           memory.exchangesPath =
             memory.profileDir / "exchanges.jsonl"
           memory.eventsPath =
@@ -6848,6 +11938,47 @@ print(json.dumps({
           )
           putEnv("PYTHONNOUSERSITE", "1")
 
+          # O runtime embedded prioriza estabilidade de VRAM. Qwen3.5 pode
+          # acionar TorchDynamo/TorchInductor na primeira geração; em GPUs
+          # pequenas isso pode criar compile workers depois do modelo já estar
+          # residente em CUDA. TorchCompile é opt-in no GlaucoPlastic.
+          let metisTorchCompileEnabled =
+            getEnv(
+              "GLAUCOPLASTIC_METIS_TORCH_COMPILE",
+              "0"
+            ).strip.toLowerAscii in
+              ["1", "true", "yes", "on", "enabled"]
+
+          let metisCompileThreads =
+            max(
+              1,
+              parseInt(
+                getEnv(
+                  "GLAUCOPLASTIC_METIS_COMPILE_THREADS",
+                  "1"
+                )
+              )
+            )
+
+          if metisTorchCompileEnabled:
+            delEnv("TORCH_COMPILE_DISABLE")
+            delEnv("TORCHDYNAMO_DISABLE")
+          else:
+            putEnv("TORCH_COMPILE_DISABLE", "1")
+            putEnv("TORCHDYNAMO_DISABLE", "1")
+
+          putEnv(
+            "TORCHINDUCTOR_COMPILE_THREADS",
+            $metisCompileThreads
+          )
+
+          plasticDebugTrace(
+            "metis.python.compile enabled=" &
+            $metisTorchCompileEnabled &
+            " inductorThreads=" &
+            $metisCompileThreads
+          )
+
           # NimPy precisa ser ligado à libpython 3.10 antes do primeiro pyImport.
           pyInitLibPath(memory.pythonLibrary)
           let sysModule = pyImport("sys")
@@ -6920,7 +12051,7 @@ print(json.dumps({
           )
           putEnv(
             "TORCHINDUCTOR_COMPILE_THREADS",
-            getEnv("TORCHINDUCTOR_COMPILE_THREADS", "1")
+            $metisCompileThreads
           )
           putEnv("TOKENIZERS_PARALLELISM", "false")
 
@@ -6982,6 +12113,136 @@ print(json.dumps({
               except CatchableError:
                 discard
           false
+
+        proc plasticMetisCacheRepositoryName(
+          modelId: string
+        ): string =
+          "models--" &
+            modelId.replace("/", "--")
+
+        proc plasticMetisCachedSnapshot(
+          cacheRoot, modelId: string
+        ): string =
+          if cacheRoot.len == 0:
+            return ""
+
+          let repositoryRoot =
+            cacheRoot /
+            plasticMetisCacheRepositoryName(
+              modelId
+            )
+
+          if not dirExists(repositoryRoot):
+            return ""
+
+          let snapshotsRoot =
+            repositoryRoot / "snapshots"
+          let mainReference =
+            repositoryRoot / "refs" / "main"
+
+          if fileExists(mainReference):
+            try:
+              let revision =
+                readFile(mainReference).strip
+
+              if revision.len > 0:
+                let candidate =
+                  snapshotsRoot / revision
+
+                if plasticMetisModelReady(
+                    candidate
+                  ):
+                  return candidate
+            except CatchableError:
+              discard
+
+          if dirExists(snapshotsRoot):
+            for kind, candidate in
+                walkDir(snapshotsRoot):
+              if kind == pcDir and
+                  plasticMetisModelReady(
+                    candidate
+                  ):
+                return candidate
+
+          ""
+
+        proc plasticMetisModelCandidates(
+          memory: PlasticMetisMemory
+        ): seq[string] =
+          if memory.isNil:
+            return
+
+          template addCandidate(pathValue: string) =
+            block:
+              let candidateValue =
+                pathValue.strip
+
+              if candidateValue.len > 0 and
+                  candidateValue notin result:
+                result.add candidateValue
+
+          addCandidate(memory.modelPath)
+
+          let modelSlug =
+            plasticMetisSafeName(
+              memory.config.modelId
+            )
+
+          addCandidate(
+            getAppDir() /
+              "models" / "metis" / modelSlug
+          )
+          addCandidate(
+            getCurrentDir() /
+              "models" / "metis" / modelSlug
+          )
+          addCandidate(
+            getHomeDir() / ".local" /
+              "share" / "glaucoplastic" /
+              "models" / "metis" / modelSlug
+          )
+
+          let hfHome =
+            expandTilde(
+              getEnv("HF_HOME")
+            )
+          let explicitHubCache =
+            expandTilde(
+              getEnv(
+                "HUGGINGFACE_HUB_CACHE"
+              )
+            )
+
+          var cacheRoots: seq[string] = @[]
+
+          template addCache(pathValue: string) =
+            block:
+              let cacheValue =
+                pathValue.strip
+
+              if cacheValue.len > 0 and
+                  cacheValue notin cacheRoots:
+                cacheRoots.add cacheValue
+
+          addCache(explicitHubCache)
+
+          if hfHome.len > 0:
+            addCache(hfHome / "hub")
+
+          addCache(
+            getHomeDir() / ".cache" /
+              "huggingface" / "hub"
+          )
+          addCache(memory.modelCachePath)
+
+          for cacheRoot in cacheRoots:
+            addCandidate(
+              plasticMetisCachedSnapshot(
+                cacheRoot,
+                memory.config.modelId
+              )
+            )
 
         proc setLlamaBootState(
           state: PlasticLlamaBootState;
@@ -7132,6 +12393,235 @@ print(json.dumps({"total": total, "files": files}))
             )
             result = 0
 
+        proc plasticMetisDownloadModel(
+          memory: PlasticMetisMemory;
+          state: PlasticLlamaBootState = nil
+        ): string =
+          memory.prepareRuntime()
+          memory.ensureMetisPaths()
+
+          if memory.modelPath.len == 0:
+            raise newException(
+              PlasticInstallationError,
+              "Destino local do checkpoint Metis não configurado."
+            )
+
+          let parent =
+            memory.modelPath.parentDir
+
+          if parent.len > 0 and
+              not dirExists(parent):
+            createDir(parent)
+
+          if memory.plasticMetisAwaitConcurrentDownload(
+              state
+            ):
+            let concurrentRoot =
+              plasticMetisFindModelRoot(
+                memory.modelPath
+              )
+
+            if concurrentRoot.len > 0 and
+                plasticMetisModelReady(
+                  concurrentRoot
+                ):
+              return concurrentRoot
+
+          if not dirExists(
+              memory.modelPath
+            ):
+            createDir(
+              memory.modelPath
+            )
+
+          let lockPath =
+            plasticMetisDownloadLockPath(
+              memory.modelPath
+            )
+
+          memory.plasticMetisTouchDownloadLock(
+            lockPath,
+            memory.config.modelId
+          )
+
+          let remoteBytes =
+            memory.plasticMetisRemoteModelSize()
+
+          if not state.isNil:
+            state.setLlamaBootState(
+              "Baixando modelo Metis",
+              "Hugging Face",
+              memory.config.modelId,
+              (
+                if remoteBytes > 0:
+                  "Transferindo " &
+                  plasticMetisHumanByteCount(
+                    remoteBytes
+                  ) &
+                  " para " &
+                  memory.modelPath
+                else:
+                  "Transferindo checkpoint para " &
+                  memory.modelPath
+              ),
+              8
+            )
+
+          let downloadScript = """
+import json
+import os
+import sys
+import threading
+import time
+
+from huggingface_hub import snapshot_download
+
+repo_id = sys.argv[1]
+local_dir = sys.argv[2]
+cache_dir = sys.argv[3]
+lock_path = sys.argv[4]
+
+token = (
+    os.environ.get("HF_TOKEN")
+    or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    or None
+)
+
+max_workers = int(
+    os.environ.get(
+        "GLAUCOPLASTIC_METIS_DOWNLOAD_WORKERS",
+        "4"
+    )
+)
+
+stop = threading.Event()
+
+def heartbeat():
+    while not stop.wait(5.0):
+        try:
+            temporary = lock_path + ".tmp"
+            with open(
+                temporary,
+                "w",
+                encoding="utf-8"
+            ) as handle:
+                json.dump(
+                    {
+                        "modelId": repo_id,
+                        "heartbeat": time.time()
+                    },
+                    handle
+                )
+            os.replace(
+                temporary,
+                lock_path
+            )
+        except Exception:
+            pass
+
+thread = threading.Thread(
+    target=heartbeat,
+    name="glaucoplastic-metis-download-heartbeat",
+    daemon=True
+)
+thread.start()
+
+try:
+    resolved = snapshot_download(
+        repo_id=repo_id,
+        repo_type="model",
+        local_dir=local_dir,
+        cache_dir=cache_dir,
+        token=token,
+        local_files_only=False,
+        max_workers=max_workers
+    )
+    print(
+        "GLAUCOPLASTIC_METIS_SNAPSHOT=" +
+        os.path.realpath(resolved)
+    )
+finally:
+    stop.set()
+    thread.join(timeout=1.0)
+"""
+
+          try:
+            let output =
+              plasticMetisExec(
+                memory.pythonExecutable,
+                [
+                  "-c",
+                  downloadScript,
+                  memory.config.modelId,
+                  memory.modelPath,
+                  memory.modelCachePath,
+                  lockPath
+                ],
+                "Download do checkpoint Metis"
+              )
+
+            var reportedPath = ""
+
+            for line in output.splitLines():
+              let candidate =
+                line.strip
+
+              if candidate.startsWith(
+                  "GLAUCOPLASTIC_METIS_SNAPSHOT="
+                ):
+                reportedPath =
+                  candidate[
+                    "GLAUCOPLASTIC_METIS_SNAPSHOT=".len ..
+                    ^1
+                  ].strip
+
+            var resolved =
+              plasticMetisFindModelRoot(
+                memory.modelPath
+              )
+
+            if resolved.len == 0 and
+                reportedPath.len > 0:
+              resolved =
+                plasticMetisFindModelRoot(
+                  reportedPath
+                )
+
+            if resolved.len == 0 or
+                not plasticMetisModelReady(
+                  resolved
+                ):
+              raise newException(
+                PlasticInstallationError,
+                "O Hugging Face concluiu a transferência, " &
+                "mas o checkpoint Metis permaneceu incompleto em " &
+                memory.modelPath
+              )
+
+            result =
+              resolved
+
+            if not state.isNil:
+              state.setLlamaBootState(
+                "Modelo Metis baixado",
+                "Hugging Face",
+                memory.config.modelId,
+                "Checkpoint completo materializado em " &
+                  result,
+                92
+              )
+
+          finally:
+            if fileExists(
+                lockPath
+              ):
+              try:
+                removeFile(
+                  lockPath
+                )
+              except CatchableError:
+                discard
+
         proc prepareModel*(
           memory: PlasticMetisMemory;
           state: PlasticLlamaBootState = nil
@@ -7143,29 +12633,91 @@ print(json.dumps({"total": total, "files": files}))
 
           memory.ensureMetisPaths()
 
-          let modelRoot =
-            plasticMetisFindModelRoot(memory.modelPath)
+          var modelRoot = ""
 
-          if modelRoot.len == 0 or
-              not plasticMetisModelReady(modelRoot):
-            raise newException(
-              PlasticInstallationError,
-              "Modelo Metis incluído não encontrado ou incompleto em " &
-              memory.modelPath & ". Execute `nimble build` para " &
-              "preparar o cliente com IAAR-Shanghai/Metis-4B."
+          for candidate in
+              memory.plasticMetisModelCandidates():
+            let resolved =
+              plasticMetisFindModelRoot(
+                candidate
+              )
+            let ready =
+              resolved.len > 0 and
+              plasticMetisModelReady(
+                resolved
+              )
+
+            plasticDebugTrace(
+              "metis.model.candidate path=" &
+              candidate &
+              " resolved=" &
+              resolved &
+              " ready=" &
+              $ready
             )
 
-          memory.modelPath = modelRoot
+            if ready:
+              modelRoot = resolved
+              break
+
+          var downloaded = false
+
+          if modelRoot.len == 0:
+            if not memory.config.autoDownloadModel:
+              raise newException(
+                PlasticInstallationError,
+                "Checkpoint Metis não encontrado e download automático " &
+                "desabilitado. Configure `metis: modelPath \"...\"`, " &
+                "GLAUCOPLASTIC_METIS_MODEL_PATH ou habilite " &
+                "GLAUCOPLASTIC_METIS_AUTO_DOWNLOAD=1."
+              )
+
+            modelRoot =
+              memory.plasticMetisDownloadModel(
+                state
+              )
+
+            downloaded = true
+
+          memory.modelPath =
+            modelRoot
+
+          plasticDebugTrace(
+            "metis.model.resolved model=" &
+            memory.config.modelId &
+            " path=" &
+            memory.modelPath &
+            " downloaded=" &
+            $downloaded
+          )
+
           memory.plasticMetisWriteReadyMarker()
           memory.modelPrepared = true
 
           if not state.isNil:
             state.setLlamaBootState(
-              "Modelo Metis incluído",
-              "Checkpoint local confirmado",
+              (
+                if downloaded:
+                  "Modelo Metis baixado"
+                else:
+                  "Modelo Metis incluído"
+              ),
+              (
+                if downloaded:
+                  "Checkpoint materializado"
+                else:
+                  "Checkpoint local confirmado"
+              ),
               memory.config.modelId,
-              "Checkpoint completo carregado de " &
-                memory.modelPath & ". Nenhum download foi executado.",
+              (
+                if downloaded:
+                  "Checkpoint completo baixado para " &
+                  memory.modelPath & "."
+                else:
+                  "Checkpoint completo carregado de " &
+                  memory.modelPath &
+                  ". Nenhum download foi necessário."
+              ),
               96
             )
             sleep(250)
@@ -7237,6 +12789,7 @@ print(json.dumps({"total": total, "files": files}))
           PlasticPyKeyword = tuple[name: string, value: PyObject]
 
         var plasticPythonInvokeFunction: PyObject
+        var plasticMetisModelDiagnosticFunction: PyObject
 
         proc plasticPyBox(value: PyObject): PyObject =
           value
@@ -7417,69 +12970,123 @@ print(json.dumps({"total": total, "files": files}))
               layers[$index] = layer
           result["layers"] = layers
 
+        proc plasticMetisLegacySnapshotPath(
+          memory: PlasticMetisMemory
+        ): string =
+          memory.profileDir / "runtime.metis.pt"
+
+        proc plasticMetisSnapshotMetadataPath(
+          memory: PlasticMetisMemory
+        ): string =
+          memory.profileDir / "runtime.metis.json"
+
         proc plasticMetisSaveDirect(memory: PlasticMetisMemory) =
           memory.ensureMetisPaths()
-          let temporary = memory.snapshotPath & "." & $getTime().toUnix & ".tmp"
-          discard nimpy.callMethod(
-            memory.torchModule,
-            "save",
-            memory.plasticMetisCaptureState(),
-            temporary
+
+          let captured = memory.plasticMetisCaptureState()
+          let py = pyBuiltinsModule()
+          let tensors = nimpy.callMethod(py, "dict")
+          var tensorKeys = newJArray()
+
+          let layers = captured["layers"]
+          let layerItems = nimpy.callMethod(layers, "items")
+
+          for layerPair in layerItems:
+            let indexText = layerPair[0].to(string)
+            let attributes = layerPair[1]
+            let attributeItems =
+              nimpy.callMethod(attributes, "items")
+
+            for attributePair in attributeItems:
+              let attribute = attributePair[0].to(string)
+              let tensorKey =
+                "layer." & indexText & "." & attribute
+
+              tensors[tensorKey] = attributePair[1]
+              tensorKeys.add %tensorKey
+
+          let safetensorsTorch = pyImport("safetensors.torch")
+          let saveFile =
+            nimpy.getAttr(safetensorsTorch, "save_file")
+          let temporary =
+            memory.snapshotPath & "." & $getTime().toUnix & ".tmp"
+
+          discard plasticPyCallKw(
+            saveFile,
+            @[
+              tensors,
+              plasticPyBox(temporary)
+            ],
+            newSeq[PlasticPyKeyword]()
           )
+
+          if fileExists(memory.snapshotPath):
+            removeFile(memory.snapshotPath)
           moveFile(temporary, memory.snapshotPath)
 
-        proc plasticMetisRestoreDirect(memory: PlasticMetisMemory): int =
-          if not fileExists(memory.snapshotPath):
-            return 0
-          var payload: PyObject
-          try:
-            payload = plasticPyCallMethodKw(
-              memory.torchModule,
-              "load",
-              @[plasticPyBox(memory.snapshotPath)],
-              @[
-                plasticPyKeyword("map_location", plasticPyBox("cpu")),
-                plasticPyKeyword("weights_only", plasticPyBox(true))
-              ]
-            )
-          except CatchableError:
-            payload = plasticPyCallMethodKw(
-              memory.torchModule,
-              "load",
-              @[plasticPyBox(memory.snapshotPath)],
-              @[plasticPyKeyword("map_location", plasticPyBox("cpu"))]
-            )
-          if payload["format"].to(string) != "metis-runtime-memory-v1":
-            raise newException(
-              PlasticRuntimeError,
-              "Formato de memória Metis desconhecido em " & memory.snapshotPath
-            )
-          if payload["model_id"].to(string) != memory.config.modelId:
-            raise newException(
-              PlasticRuntimeError,
-              "O snapshot Metis pertence a outro modelo."
-            )
+          let metadataPath =
+            memory.plasticMetisSnapshotMetadataPath()
+          let metadataTemporary =
+            metadataPath & "." & $getTime().toUnix & ".tmp"
+
+          writeFile(
+            metadataTemporary,
+            $(%*{
+              "format": "metis-runtime-memory-safetensors-v1",
+              "model_id": memory.config.modelId,
+              "profile": memory.config.profile,
+              "saved_at": plasticMetisUtcNow(),
+              "tensor_keys": tensorKeys
+            })
+          )
+
+          if fileExists(metadataPath):
+            removeFile(metadataPath)
+          moveFile(metadataTemporary, metadataPath)
+
+          plasticDebugTrace(
+            "metis.memory.safetensors.saved path=" &
+            memory.snapshotPath &
+            " tensors=" & $tensorKeys.len
+          )
+
+        proc plasticMetisApplyTensorState(
+          memory: PlasticMetisMemory;
+          tensorItems: PyObject
+        ): int =
           discard nimpy.callMethod(memory.modelObject, "reset")
+
           let py = pyBuiltinsModule()
-          let modelBody = nimpy.getAttr(memory.modelObject, "model")
-          let blocks = nimpy.getAttr(modelBody, "metis_blocks")
-          let blockCount = nimpy.callMethod(py, "len", blocks).to(int)
-          let layers = payload["layers"]
+          let modelBody =
+            nimpy.getAttr(memory.modelObject, "model")
+          let blocks =
+            nimpy.getAttr(modelBody, "metis_blocks")
+          let blockCount =
+            nimpy.callMethod(py, "len", blocks).to(int)
           let dtype = memory.plasticMetisDtype()
           let targetDevice = nimpy.callMethod(
             memory.torchModule,
             "device",
             memory.config.device
           )
-          let layerItems = nimpy.callMethod(layers, "items")
-          for pair in layerItems:
-            let indexText = pair[0].to(string)
-            let index = parseInt(indexText)
+
+          for pair in tensorItems:
+            let tensorKey = pair[0].to(string)
+            let parts = tensorKey.split('.')
+
+            if parts.len != 3 or parts[0] != "layer":
+              continue
+
+            let index = parseInt(parts[1])
+            let attribute = parts[2]
+
             if index < 0 or index >= blockCount:
               raise newException(
                 PlasticRuntimeError,
-                "Camada Metis inexistente no snapshot: " & indexText
+                "Camada Metis inexistente no safetensors: " &
+                parts[1]
               )
+
             let metisBlock = blocks[index]
             if not nimpy.callMethod(
               py,
@@ -7488,29 +13095,176 @@ print(json.dumps({"total": total, "files": files}))
               "local_memory"
             ).to(bool):
               continue
-            let localMemory = nimpy.getAttr(metisBlock, "local_memory")
-            let attributes = pair[1]
-            let attributeItems = nimpy.callMethod(attributes, "items")
+
+            let localMemory =
+              nimpy.getAttr(metisBlock, "local_memory")
+            let restoredTensor = plasticPyCallMethodKw(
+              pair[1],
+              "to",
+              newSeq[PyObject](),
+              @[
+                plasticPyKeyword("device", targetDevice),
+                plasticPyKeyword("dtype", dtype)
+              ]
+            )
+
+            discard nimpy.callMethod(
+              py,
+              "setattr",
+              localMemory,
+              attribute,
+              restoredTensor
+            )
+
+            inc result
+
+        proc plasticMetisRestoreLegacyDirect(
+          memory: PlasticMetisMemory;
+          legacyPath: string
+        ): int =
+          var payload: PyObject
+
+          try:
+            payload = plasticPyCallMethodKw(
+              memory.torchModule,
+              "load",
+              @[plasticPyBox(legacyPath)],
+              @[
+                plasticPyKeyword(
+                  "map_location",
+                  plasticPyBox("cpu")
+                ),
+                plasticPyKeyword(
+                  "weights_only",
+                  plasticPyBox(true)
+                )
+              ]
+            )
+          except CatchableError:
+            payload = plasticPyCallMethodKw(
+              memory.torchModule,
+              "load",
+              @[plasticPyBox(legacyPath)],
+              @[
+                plasticPyKeyword(
+                  "map_location",
+                  plasticPyBox("cpu")
+                )
+              ]
+            )
+
+          if payload["format"].to(string) !=
+              "metis-runtime-memory-v1":
+            raise newException(
+              PlasticRuntimeError,
+              "Formato legado de memória Metis desconhecido em " &
+              legacyPath
+            )
+
+          if payload["model_id"].to(string) !=
+              memory.config.modelId:
+            raise newException(
+              PlasticRuntimeError,
+              "O snapshot Metis legado pertence a outro modelo."
+            )
+
+          let layers = payload["layers"]
+          let layerItems =
+            nimpy.callMethod(layers, "items")
+          let py = pyBuiltinsModule()
+          let flattened = nimpy.callMethod(py, "dict")
+
+          for layerPair in layerItems:
+            let indexText = layerPair[0].to(string)
+            let attributes = layerPair[1]
+            let attributeItems =
+              nimpy.callMethod(attributes, "items")
+
             for attributePair in attributeItems:
               let attribute = attributePair[0].to(string)
-              let tensor = attributePair[1]
-              let restoredTensor = plasticPyCallMethodKw(
-                tensor,
-                "to",
-                newSeq[PyObject](),
-                @[
-                  plasticPyKeyword("device", targetDevice),
-                  plasticPyKeyword("dtype", dtype)
-                ]
-              )
-              discard nimpy.callMethod(
-                py,
-                "setattr",
-                localMemory,
-                attribute,
-                restoredTensor
-              )
-            inc result
+              flattened[
+                "layer." & indexText & "." & attribute
+              ] = attributePair[1]
+
+          result = memory.plasticMetisApplyTensorState(
+            nimpy.callMethod(flattened, "items")
+          )
+
+        proc plasticMetisRestoreDirect(
+          memory: PlasticMetisMemory
+        ): int =
+          memory.ensureMetisPaths()
+
+          let metadataPath =
+            memory.plasticMetisSnapshotMetadataPath()
+
+          if fileExists(memory.snapshotPath):
+            if fileExists(metadataPath):
+              let metadata =
+                parseJson(readFile(metadataPath))
+
+              if metadata.kind != JObject or
+                  not metadata.hasKey("format") or
+                  metadata["format"].kind != JString or
+                  metadata["format"].getStr !=
+                    "metis-runtime-memory-safetensors-v1":
+                raise newException(
+                  PlasticRuntimeError,
+                  "Metadados inválidos da memória Metis em " &
+                  metadataPath
+                )
+
+              if metadata.hasKey("model_id") and
+                  metadata["model_id"].kind == JString and
+                  metadata["model_id"].getStr !=
+                    memory.config.modelId:
+                raise newException(
+                  PlasticRuntimeError,
+                  "O safetensors de memória pertence a outro modelo."
+                )
+
+            let safetensorsTorch =
+              pyImport("safetensors.torch")
+            let loadFile =
+              nimpy.getAttr(safetensorsTorch, "load_file")
+            let tensors = plasticPyCallKw(
+              loadFile,
+              @[plasticPyBox(memory.snapshotPath)],
+              @[
+                plasticPyKeyword(
+                  "device",
+                  plasticPyBox("cpu")
+                )
+              ]
+            )
+
+            result = memory.plasticMetisApplyTensorState(
+              nimpy.callMethod(tensors, "items")
+            )
+
+            plasticDebugTrace(
+              "metis.memory.safetensors.loaded path=" &
+              memory.snapshotPath &
+              " tensors=" & $result
+            )
+            return
+
+          let legacyPath =
+            memory.plasticMetisLegacySnapshotPath()
+
+          if not fileExists(legacyPath):
+            return 0
+
+          result =
+            memory.plasticMetisRestoreLegacyDirect(legacyPath)
+
+          if result > 0:
+            memory.plasticMetisSaveDirect()
+            plasticDebugTrace(
+              "metis.memory.legacy.migrated from=" &
+              legacyPath &
+              " to=" & memory.snapshotPath
+            )
 
         proc plasticMetisCommitDirect(
           memory: PlasticMetisMemory;
@@ -7597,44 +13351,360 @@ print(json.dumps({"total": total, "files": files}))
           if result.len == 0:
             result = "SEM_MEMORIA_RELEVANTE"
 
-        proc plasticMetisLlamaChat(
-          endpoint, model: string;
+        proc plasticMetisMessagesFromJson(
+          messages: JsonNode;
+          jsonResponse: bool
+        ): PyObject =
+          let py = pyBuiltinsModule()
+          result = nimpy.callMethod(py, "list")
+
+          var systemParts: seq[string] = @[]
+          var normalizedMessages:
+            seq[tuple[role, content: string]] = @[]
+          var movedSystemMessages = 0
+
+          if jsonResponse:
+            systemParts.add(
+              "Retorne somente um objeto JSON válido, sem markdown, " &
+              "sem cercas de código e sem texto externo ao objeto."
+            )
+
+          if messages.kind == JArray:
+            var messageIndex = 0
+
+            for message in messages.items:
+              let index = messageIndex
+              inc messageIndex
+
+              if message.kind != JObject:
+                continue
+
+              let sourceRole =
+                if message.hasKey("role") and
+                    message["role"].kind == JString:
+                  message["role"].getStr
+                    .strip
+                    .toLowerAscii
+                else:
+                  "user"
+
+              let content =
+                if message.hasKey("content") and
+                    message["content"].kind == JString:
+                  message["content"].getStr
+                elif message.hasKey("content"):
+                  $message["content"]
+                else:
+                  ""
+
+              if content.strip.len == 0:
+                continue
+
+              case sourceRole
+              of "system", "developer":
+                systemParts.add(content)
+
+                if index > 0:
+                  inc movedSystemMessages
+
+              of "user", "assistant", "tool":
+                normalizedMessages.add(
+                  (
+                    role: sourceRole,
+                    content: content
+                  )
+                )
+
+              else:
+                plasticDebugTrace(
+                  "metis.chat.role.normalized " &
+                  "source=" & sourceRole &
+                  " target=user"
+                )
+
+                normalizedMessages.add(
+                  (
+                    role: "user",
+                    content: content
+                  )
+                )
+
+          if systemParts.len > 0:
+            let systemItem =
+              nimpy.callMethod(py, "dict")
+
+            systemItem["role"] = "system"
+            systemItem["content"] =
+              systemParts.join("\n\n")
+
+            discard nimpy.callMethod(
+              result,
+              "append",
+              systemItem
+            )
+
+          for pair in normalizedMessages:
+            let item =
+              nimpy.callMethod(py, "dict")
+
+            item["role"] = pair.role
+            item["content"] = pair.content
+
+            discard nimpy.callMethod(
+              result,
+              "append",
+              item
+            )
+
+          plasticDebugTrace(
+            "metis.chat.messages.normalized " &
+            "input=" &
+            (
+              if messages.kind == JArray:
+                $messages.len
+              else:
+                "0"
+            ) &
+            " output=" &
+            $(
+              normalizedMessages.len +
+              (
+                if systemParts.len > 0:
+                  1
+                else:
+                  0
+              )
+            ) &
+            " systemParts=" &
+            $systemParts.len &
+            " movedSystemMessages=" &
+            $movedSystemMessages &
+            " jsonResponse=" &
+            $jsonResponse
+          )
+
+        proc plasticMetisGenerateDirect(
+          memory: PlasticMetisMemory;
           messages: JsonNode;
           maxTokens: int;
+          jsonResponse: bool;
+          enableThinking: bool;
           temperature: float
         ): string =
-          let client = newHttpClient(timeout = 3_600_000)
-          client.headers = newHttpHeaders({
-            "Content-Type": "application/json",
-            "Accept": "application/json"
-          })
-          let payload = %*{
-            "model": model,
-            "messages": messages,
-            "max_tokens": maxTokens,
-            "temperature": temperature,
-            "stream": false
-          }
-          let response = client.request(
-            endpoint.strip(chars = {'/'}) & "/chat/completions",
-            httpMethod = HttpPost,
-            body = $payload
+          let metisDirectStartedAt =
+            epochTime()
+          let metisTimingDebug =
+            getEnv(
+              "GLAUCOPLASTIC_METIS_DEBUG_TIMING",
+              "0"
+            ).strip.toLowerAscii in
+              ["1", "true", "yes", "on", "enabled"]
+
+          let normalizeStartedAt =
+            epochTime()
+          let pyMessages = plasticMetisMessagesFromJson(
+            messages,
+            jsonResponse
           )
-          let body = response.body
-          if int(response.code) < 200 or int(response.code) >= 300:
+
+          if metisTimingDebug:
+            plasticDebugTrace(
+              "metis.inference.phase normalize " &
+              "elapsedMs=" &
+              $((epochTime() - normalizeStartedAt) * 1000.0)
+            )
+
+          let templateStartedAt =
+            epochTime()
+          var renderedText: PyObject
+          try:
+            renderedText = plasticPyCallMethodKw(
+              memory.tokenizerObject,
+              "apply_chat_template",
+              @[pyMessages],
+              @[
+                plasticPyKeyword("tokenize", plasticPyBox(false)),
+                plasticPyKeyword(
+                  "add_generation_prompt",
+                  plasticPyBox(true)
+                ),
+                plasticPyKeyword(
+                  "enable_thinking",
+                  plasticPyBox(enableThinking)
+                )
+              ]
+            )
+          except Exception:
+            renderedText = plasticPyCallMethodKw(
+              memory.tokenizerObject,
+              "apply_chat_template",
+              @[pyMessages],
+              @[
+                plasticPyKeyword("tokenize", plasticPyBox(false)),
+                plasticPyKeyword(
+                  "add_generation_prompt",
+                  plasticPyBox(true)
+                )
+              ]
+            )
+
+          if metisTimingDebug:
+            plasticDebugTrace(
+              "metis.inference.phase chat-template " &
+              "elapsedMs=" &
+              $((epochTime() - templateStartedAt) * 1000.0)
+            )
+
+          let tokenizeStartedAt =
+            epochTime()
+          let encoded = plasticPyCallKw(
+            memory.tokenizerObject,
+            @[renderedText],
+            @[
+              plasticPyKeyword(
+                "add_special_tokens",
+                plasticPyBox(false)
+              ),
+              plasticPyKeyword(
+                "return_tensors",
+                plasticPyBox("pt")
+              )
+            ]
+          )
+
+          let inputIds = nimpy.callMethod(
+            encoded["input_ids"],
+            "to",
+            memory.inputDeviceObject
+          )
+          let attentionMask = nimpy.callMethod(
+            encoded["attention_mask"],
+            "to",
+            memory.inputDeviceObject
+          )
+
+          let shape = nimpy.getAttr(
+            inputIds,
+            "shape"
+          )
+          let inputLength =
+            shape[1].to(int)
+
+          if metisTimingDebug:
+            plasticDebugTrace(
+              "metis.inference.phase tokenize " &
+              "elapsedMs=" &
+              $((epochTime() - tokenizeStartedAt) * 1000.0) &
+              " inputTokens=" &
+              $inputLength
+            )
+
+          let effectiveTemperature =
+            if jsonResponse:
+              0.0
+            else:
+              max(0.0, temperature)
+          let doSample = effectiveTemperature > 0.0
+
+          var generationKeywords = @[
+            plasticPyKeyword("input_ids", inputIds),
+            plasticPyKeyword("attention_mask", attentionMask),
+            plasticPyKeyword(
+              "max_new_tokens",
+              plasticPyBox(max(1, maxTokens))
+            ),
+            plasticPyKeyword(
+              "do_sample",
+              plasticPyBox(doSample)
+            ),
+            plasticPyKeyword("use_cache", plasticPyBox(true)),
+            plasticPyKeyword(
+              "eos_token_id",
+              nimpy.getAttr(
+                memory.tokenizerObject,
+                "eos_token_id"
+              )
+            ),
+            plasticPyKeyword(
+              "pad_token_id",
+              nimpy.getAttr(
+                memory.tokenizerObject,
+                "pad_token_id"
+              )
+            )
+          ]
+
+          if doSample:
+            generationKeywords.add plasticPyKeyword(
+              "temperature",
+              plasticPyBox(effectiveTemperature)
+            )
+
+          let generationStartedAt =
+            epochTime()
+          let output = plasticPyCallMethodKw(
+            memory.modelObject,
+            "generate",
+            newSeq[PyObject](),
+            generationKeywords
+          )
+          let generationElapsedMs =
+            (epochTime() - generationStartedAt) * 1000.0
+
+          let allIds =
+            nimpy.callMethod(output[0], "tolist").to(seq[int])
+          let generated =
+            if inputLength < allIds.len:
+              allIds[inputLength .. ^1]
+            else:
+              @[]
+
+          if metisTimingDebug:
+            plasticDebugTrace(
+              "metis.inference.phase generate " &
+              "elapsedMs=" & $generationElapsedMs &
+              " generatedTokens=" &
+              $generated.len &
+              " tokensPerSecond=" &
+              $(
+                if generationElapsedMs > 0.0:
+                  generated.len.float /
+                    (generationElapsedMs / 1000.0)
+                else:
+                  0.0
+              )
+            )
+
+          let decodeStartedAt =
+            epochTime()
+          result = plasticPyCallMethodKw(
+            memory.tokenizerObject,
+            "decode",
+            @[plasticPyBox(generated)],
+            @[
+              plasticPyKeyword(
+                "skip_special_tokens",
+                plasticPyBox(true)
+              )
+            ]
+          ).to(string).strip
+
+          if metisTimingDebug:
+            plasticDebugTrace(
+              "metis.inference.phase decode " &
+              "elapsedMs=" &
+              $((epochTime() - decodeStartedAt) * 1000.0) &
+              " totalMs=" &
+              $((epochTime() - metisDirectStartedAt) * 1000.0) &
+              " outputChars=" &
+              $result.len
+            )
+
+          if result.len == 0:
             raise newException(
               PlasticRuntimeError,
-              "HTTP " & $response.code & " ao consolidar memória Metis: " &
-              body[0 ..< min(body.len, 1000)]
+              "O Metis-4B devolveu uma resposta vazia."
             )
-          let parsed = parseJson(body)
-          if parsed.kind != JObject or not parsed.hasKey("choices") or
-              parsed["choices"].kind != JArray or parsed["choices"].len == 0:
-            raise newException(
-              PlasticRuntimeError,
-              "Resposta inesperada do llama-server durante consolidação Metis."
-            )
-          result = parsed["choices"][0]["message"]["content"].getStr.strip
 
         proc plasticMetisExtractDurable(
           state: PlasticMetisWorkerState;
@@ -7644,15 +13714,13 @@ print(json.dumps({"total": total, "files": files}))
             {
               "role": "system",
               "content":
-                "Você é um consolidador de memória de longo prazo. Analise uma " &
-                "troca já concluída e extraia somente fatos duráveis explicitamente " &
-                "fornecidos pelo usuário: identidade, preferências, projetos, " &
-                "decisões, restrições, relações e objetivos persistentes. Não " &
-                "memorize saudações, perguntas momentâneas, hipóteses, conhecimento " &
-                "geral ou afirmações inventadas pelo assistente. A resposta do " &
-                "assistente serve apenas para contexto. Escreva frases declarativas " &
-                "curtas em português. Se não houver fato durável, responda " &
-                "exatamente SEM_MEMORIA_DURAVEL."
+                "Você consolida a memória de longo prazo do próprio modelo. " &
+                "Extraia somente fatos duráveis explicitamente fornecidos " &
+                "pelo usuário: identidade, preferências, projetos, decisões, " &
+                "restrições, relações e objetivos persistentes. Não memorize " &
+                "saudações, perguntas momentâneas, hipóteses ou afirmações " &
+                "inventadas pelo assistente. Se não houver fato durável, " &
+                "responda exatamente SEM_MEMORIA_DURAVEL."
             },
             {
               "role": "user",
@@ -7661,13 +13729,20 @@ print(json.dumps({"total": total, "files": files}))
                 "\n\nResposta produzida:\n" & job.assistantText
             }
           ]
-          plasticMetisLlamaChat(
-            state.llamaEndpoint,
-            state.llamaModel,
-            messages,
-            state.memory.config.workerMaxTokens,
-            0.0
-          )
+
+          acquire(state.modelLock)
+          let gil = plasticAcquirePythonGIL()
+          try:
+            result = state.memory.plasticMetisGenerateDirect(
+              messages,
+              state.memory.config.workerMaxTokens,
+              false,
+              false,
+              0.0
+            )
+          finally:
+            plasticReleasePythonGIL(gil)
+            release(state.modelLock)
 
         proc runPlasticMetisWorker(state: PlasticMetisWorkerState) {.thread.} =
           if state.isNil:
@@ -7764,13 +13839,516 @@ print(json.dumps({"total": total, "files": files}))
               state.active = false
               release(state.queueLock)
 
+
+        # GLAUCOPLASTIC_EXTERNAL_METIS_V1
+        proc plasticMetisExternalEndpoint(): string =
+          result = getEnv(
+            "GLAUCOPLASTIC_METIS_ENDPOINT",
+            getEnv("GLAUCOPLASTIC_METIS_URL", "")
+          ).strip
+          while result.endsWith("/"):
+            result.setLen(result.len - 1)
+
+        proc plasticMetisUsesExternalServer(): bool =
+          # O modo padrão é incorporado: o mesmo Metis-4B executa geração e
+          # memória dentro do aplicativo. Servidor externo só é aceito quando
+          # solicitado explicitamente.
+          let mode = getEnv(
+            "GLAUCOPLASTIC_METIS_MODE",
+            "embedded"
+          ).strip.toLowerAscii
+          result =
+            mode in ["server", "external", "http"] and
+            plasticMetisExternalEndpoint().len > 0
+
+        proc plasticMetisExternalRequest(
+          path: string;
+          payload = newJNull()
+        ): JsonNode =
+          let endpoint = plasticMetisExternalEndpoint()
+          if endpoint.len == 0:
+            raise newException(
+              PlasticRuntimeError,
+              "GLAUCOPLASTIC_METIS_ENDPOINT não foi configurado."
+            )
+
+          var client = newHttpClient(
+            timeout = parseInt(
+              getEnv("GLAUCOPLASTIC_METIS_HTTP_TIMEOUT_MS", "900000")
+            )
+          )
+          client.headers = newHttpHeaders({
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+          })
+
+          try:
+            let response = client.request(
+              endpoint & path,
+              httpMethod = HttpPost,
+              body =
+                if payload.kind == JNull:
+                  "{}"
+                else:
+                  $payload
+            )
+            # GLAUCOPLASTIC_METIS_RECALL_V1
+            # O servidor usa 200 para leitura/flush e 202 para fila.
+            if response.status.len == 0 or response.status[0] != '2':
+              raise newException(
+                PlasticRuntimeError,
+                "Metis externo retornou " & response.status &
+                " em " & path & ": " & response.body
+              )
+            if response.body.strip.len == 0:
+              return newJObject()
+            result = parseJson(response.body)
+          finally:
+            client.close()
+
+        proc plasticMetisExternalQuery(
+          session, text: string
+        ): string =
+          if getEnv(
+              "GLAUCOPLASTIC_METIS_QUERY_FLUSH",
+              "1"
+            ).strip.toLowerAscii in
+              ["1", "true", "yes", "on", "enabled"]:
+            discard plasticMetisExternalRequest(
+              "/memory/flush",
+              %*{}
+            )
+
+          let response = plasticMetisExternalRequest(
+            "/memory/query",
+            %*{
+              "session": session,
+              "text": text
+            }
+          )
+          if response.kind == JObject and
+              response.hasKey("memory") and
+              response["memory"].kind == JString:
+            return response["memory"].getStr
+          result = "SEM_MEMORIA_RELEVANTE"
+
+        proc plasticMetisExternalRecord(
+          session, userText, assistantText: string
+        ) =
+          discard plasticMetisExternalRequest(
+            "/memory/record",
+            %*{
+              "session": session,
+              "user": userText,
+              "assistant": assistantText
+            }
+          )
+
+        proc plasticMetisLogSafetensorsManifest(
+          memory: PlasticMetisMemory
+        ) =
+          if memory.isNil or
+              not memory.config.logSafetensors:
+            return
+
+          let modelRoot =
+            plasticMetisFindModelRoot(memory.modelPath)
+
+          if modelRoot.len == 0:
+            plasticDebugTrace(
+              "metis.safetensors.manifest unavailable path=" &
+              memory.modelPath
+            )
+            return
+
+          let indexPath =
+            modelRoot / "model.safetensors.index.json"
+          var shards: seq[string] = @[]
+
+          if fileExists(indexPath):
+            try:
+              let index = parseJson(readFile(indexPath))
+              if index.kind == JObject and
+                  index.hasKey("weight_map") and
+                  index["weight_map"].kind == JObject:
+                for _, shardNode in index["weight_map"].pairs:
+                  if shardNode.kind == JString:
+                    let shardName = shardNode.getStr
+                    if shardName notin shards:
+                      shards.add shardName
+            except CatchableError as error:
+              plasticDebugTrace(
+                "metis.safetensors.manifest.error path=" &
+                indexPath & " error=" & error.msg
+              )
+
+          if shards.len == 0:
+            for shardPath in walkFiles(modelRoot / "*.safetensors"):
+              shards.add extractFilename(shardPath)
+
+          var totalBytes: BiggestInt = 0
+          for shardName in shards:
+            let shardPath = modelRoot / shardName
+            let shardBytes =
+              if fileExists(shardPath):
+                getFileSize(shardPath)
+              else:
+                0.BiggestInt
+            totalBytes += shardBytes
+            plasticDebugTrace(
+              "metis.safetensors.shard path=" & shardPath &
+              " bytes=" & $shardBytes &
+              " size=" & plasticMetisHumanByteCount(shardBytes)
+            )
+
+          plasticDebugTrace(
+            "metis.safetensors.manifest model=" &
+            memory.config.modelId &
+            " root=" & modelRoot &
+            " shards=" & $shards.len &
+            " bytes=" & $totalBytes &
+            " size=" & plasticMetisHumanByteCount(totalBytes)
+          )
+
+          if fileExists(memory.snapshotPath):
+            let snapshotBytes = getFileSize(memory.snapshotPath)
+            plasticDebugTrace(
+              "metis.memory.safetensors.present path=" &
+              memory.snapshotPath &
+              " bytes=" & $snapshotBytes &
+              " size=" &
+              plasticMetisHumanByteCount(snapshotBytes)
+            )
+          else:
+            plasticDebugTrace(
+              "metis.memory.safetensors.absent path=" &
+              memory.snapshotPath
+            )
+
+        proc plasticMetisReadSystemMemory(): JsonNode =
+          var totalBytes = -1'i64
+          var availableBytes = -1'i64
+          var swapTotalBytes = -1'i64
+          var swapFreeBytes = -1'i64
+          var processRssBytes = -1'i64
+
+          when defined(linux):
+            if fileExists("/proc/meminfo"):
+              var values = initTable[string, int64]()
+              for line in readFile("/proc/meminfo").splitLines:
+                let parts = line.splitWhitespace()
+                if parts.len < 2:
+                  continue
+                let key = parts[0].strip(chars = {':'})
+                try:
+                  values[key] = parseBiggestInt(parts[1]).int64 * 1024'i64
+                except ValueError:
+                  discard
+              totalBytes = values.getOrDefault("MemTotal", -1'i64)
+              availableBytes = values.getOrDefault("MemAvailable", -1'i64)
+              swapTotalBytes = values.getOrDefault("SwapTotal", -1'i64)
+              swapFreeBytes = values.getOrDefault("SwapFree", -1'i64)
+
+            if fileExists("/proc/self/status"):
+              for line in readFile("/proc/self/status").splitLines:
+                if not line.startsWith("VmRSS:"):
+                  continue
+                let parts = line.splitWhitespace()
+                if parts.len >= 2:
+                  try:
+                    processRssBytes =
+                      parseBiggestInt(parts[1]).int64 * 1024'i64
+                  except ValueError:
+                    discard
+                break
+
+          result = %*{
+            "totalBytes": totalBytes,
+            "availableBytes": availableBytes,
+            "swapTotalBytes": swapTotalBytes,
+            "swapFreeBytes": swapFreeBytes,
+            "processRssBytes": processRssBytes
+          }
+
+        proc plasticMetisProbeLlamaEndpoint(
+          llama: PlasticLlamaRuntime
+        ): bool =
+          if llama.isNil or llama.endpoint.len == 0:
+            return false
+          var client = newHttpClient(timeout = 1_500)
+          try:
+            let response = client.get(llama.endpoint & "/models")
+            result = response.status.startsWith("200")
+          except CatchableError:
+            result = false
+          finally:
+            client.close()
+
+        proc plasticMetisLogNvidiaProcesses(): JsonNode =
+          result = newJArray()
+          when defined(linux):
+            let executable = findExe("nvidia-smi")
+            if executable.len == 0:
+              return
+            let command =
+              quoteShell(executable) &
+              " --query-compute-apps=pid,process_name,used_gpu_memory" &
+              " --format=csv,noheader,nounits"
+            let execution = execCmdEx(command)
+            if execution.exitCode != 0:
+              plasticDebugTrace(
+                "metis.memory.diagnostic.nvidia-smi.failed code=" &
+                $execution.exitCode
+              )
+              return
+            for rawLine in execution.output.splitLines:
+              let line = rawLine.strip
+              if line.len == 0:
+                continue
+              result.add %line
+              plasticDebugTrace(
+                "metis.memory.diagnostic.gpu-process " & line
+              )
+
+        proc plasticMetisPreflightDiagnostics(
+          memory: PlasticMetisMemory;
+          llama: PlasticLlamaRuntime
+        ) =
+          if memory.isNil or not memory.config.diagnoseMemory:
+            return
+
+          if memory.lastDiagnostic.isNil or
+              memory.lastDiagnostic.kind != JObject:
+            memory.lastDiagnostic = newJObject()
+
+          let systemMemory = plasticMetisReadSystemMemory()
+          memory.lastDiagnostic["system"] = systemMemory
+
+          let availableBytes =
+            systemMemory["availableBytes"].getInt.int64
+          let totalBytes =
+            systemMemory["totalBytes"].getInt.int64
+          let swapFreeBytes =
+            systemMemory["swapFreeBytes"].getInt.int64
+          let processRssBytes =
+            systemMemory["processRssBytes"].getInt.int64
+
+          plasticDebugTrace(
+            "metis.memory.diagnostic.system total=" &
+            plasticMetisHumanByteCount(totalBytes) &
+            " available=" &
+            plasticMetisHumanByteCount(availableBytes) &
+            " swapFree=" &
+            plasticMetisHumanByteCount(swapFreeBytes) &
+            " processRss=" &
+            plasticMetisHumanByteCount(processRssBytes) &
+            " minimumAvailableMiB=" &
+            $memory.config.minSystemAvailableMiB
+          )
+
+          discard llama
+          memory.lastDiagnostic["inference"] = %*{
+            "provider": "metis",
+            "mode": "embedded",
+            "model": memory.config.modelId,
+            "ready": memory.initialized
+          }
+          plasticDebugTrace(
+            "metis.memory.diagnostic.inference provider=metis" &
+            " mode=embedded model=" & memory.config.modelId &
+            " ready=" & $memory.initialized
+          )
+
+          memory.lastDiagnostic["gpuProcesses"] =
+            plasticMetisLogNvidiaProcesses()
+
+          if memory.config.safeLoad and
+              availableBytes >= 0 and
+              availableBytes div (1024'i64 * 1024'i64) <
+                memory.config.minSystemAvailableMiB.int64:
+            raise newException(
+              PlasticRuntimeError,
+              "Memória RAM disponível insuficiente para carregar o Metis " &
+              "com segurança: " &
+              plasticMetisHumanByteCount(availableBytes) &
+              " disponíveis; mínimo configurado: " &
+              $memory.config.minSystemAvailableMiB & " MiB."
+            )
+
+        proc plasticMetisCudaDiagnostic(
+          memory: PlasticMetisMemory;
+          cudaModule: PyObject;
+          phase: string;
+          enforceMinimum: bool
+        ): JsonNode =
+          let memoryInfo = nimpy.callMethod(cudaModule, "mem_get_info")
+          let freeBytes = memoryInfo[0].to(int64)
+          let totalBytes = memoryInfo[1].to(int64)
+          let allocatedBytes =
+            nimpy.callMethod(cudaModule, "memory_allocated").to(int64)
+          let reservedBytes =
+            nimpy.callMethod(cudaModule, "memory_reserved").to(int64)
+          let currentDevice =
+            nimpy.callMethod(cudaModule, "current_device").to(int)
+          let properties = nimpy.callMethod(
+            cudaModule,
+            "get_device_properties",
+            currentDevice
+          )
+          let deviceName =
+            nimpy.getAttr(properties, "name").to(string)
+
+          result = %*{
+            "phase": phase,
+            "device": currentDevice,
+            "deviceName": deviceName,
+            "freeBytes": freeBytes,
+            "totalBytes": totalBytes,
+            "allocatedBytes": allocatedBytes,
+            "reservedBytes": reservedBytes
+          }
+
+          if memory.lastDiagnostic.isNil or
+              memory.lastDiagnostic.kind != JObject:
+            memory.lastDiagnostic = newJObject()
+          memory.lastDiagnostic["cuda-" & phase] = result
+
+          plasticDebugTrace(
+            "metis.memory.diagnostic.cuda phase=" & phase &
+            " device=" & $currentDevice &
+            " name=" & deviceName &
+            " free=" & plasticMetisHumanByteCount(freeBytes) &
+            " total=" & plasticMetisHumanByteCount(totalBytes) &
+            " allocated=" & plasticMetisHumanByteCount(allocatedBytes) &
+            " reserved=" & plasticMetisHumanByteCount(reservedBytes) &
+            " minimumFreeMiB=" & $memory.config.minGpuFreeMiB &
+            " reserveMiB=" & $memory.config.gpuReserveMiB
+          )
+
+          if enforceMinimum and memory.config.safeLoad and
+              freeBytes div (1024'i64 * 1024'i64) <
+                memory.config.minGpuFreeMiB.int64:
+            raise newException(
+              PlasticRuntimeError,
+              "Memória CUDA insuficiente para carregar o Metis com " &
+              "segurança: " & plasticMetisHumanByteCount(freeBytes) &
+              " livres de " & plasticMetisHumanByteCount(totalBytes) &
+              "; mínimo configurado: " &
+              $memory.config.minGpuFreeMiB & " MiB."
+            )
+
+        proc plasticMetisModelDiagnosticInvoker(): PyObject =
+          if plasticMetisModelDiagnosticFunction.isNil:
+            let py = pyBuiltinsModule()
+            let scope = nimpy.callMethod(py, "dict")
+            discard nimpy.callMethod(
+              py,
+              "exec",
+              "import json\n" &
+              "def _glaucoplastic_metis_model_diagnostic(model):\n" &
+              "    info = {\n" &
+              "        'parameters': 0,\n" &
+              "        'buffers': 0,\n" &
+              "        'meta_parameters': 0,\n" &
+              "        'meta_buffers': 0,\n" &
+              "        'meta_names': [],\n" &
+              "        'bytes_by_device': {},\n" &
+              "        'first_device': '',\n" &
+              "        'footprint_bytes': -1,\n" &
+              "    }\n" &
+              "    def visit(items, kind):\n" &
+              "        for name, tensor in items:\n" &
+              "            info[kind] += 1\n" &
+              "            is_meta = bool(getattr(tensor, 'is_meta', False))\n" &
+              "            if is_meta:\n" &
+              "                key = 'meta_parameters' if kind == 'parameters' else 'meta_buffers'\n" &
+              "                info[key] += 1\n" &
+              "                if len(info['meta_names']) < 24:\n" &
+              "                    info['meta_names'].append(name)\n" &
+              "                continue\n" &
+              "            device = str(tensor.device)\n" &
+              "            if not info['first_device']:\n" &
+              "                info['first_device'] = device\n" &
+              "            try:\n" &
+              "                size = int(tensor.numel()) * int(tensor.element_size())\n" &
+              "            except Exception:\n" &
+              "                size = 0\n" &
+              "            info['bytes_by_device'][device] = info['bytes_by_device'].get(device, 0) + size\n" &
+              "    visit(model.named_parameters(), 'parameters')\n" &
+              "    visit(model.named_buffers(), 'buffers')\n" &
+              "    try:\n" &
+              "        info['footprint_bytes'] = int(model.get_memory_footprint())\n" &
+              "    except Exception as exc:\n" &
+              "        info['footprint_error'] = str(exc)\n" &
+              "    return json.dumps(info, ensure_ascii=False)\n",
+              scope,
+              scope
+            )
+            plasticMetisModelDiagnosticFunction =
+              scope["_glaucoplastic_metis_model_diagnostic"]
+          plasticMetisModelDiagnosticFunction
+
+        proc plasticMetisInspectLoadedModel(
+          memory: PlasticMetisMemory
+        ): JsonNode =
+          let output = nimpy.callObject(
+            plasticMetisModelDiagnosticInvoker(),
+            memory.modelObject
+          ).to(string)
+          result = parseJson(output)
+
+          if memory.lastDiagnostic.isNil or
+              memory.lastDiagnostic.kind != JObject:
+            memory.lastDiagnostic = newJObject()
+          memory.lastDiagnostic["model"] = result.copy
+
+          plasticDebugTrace(
+            "metis.memory.diagnostic.model " & $result
+          )
+
+          let metaParameters =
+            if result.hasKey("meta_parameters") and
+                result["meta_parameters"].kind == JInt:
+              result["meta_parameters"].getInt
+            else:
+              0
+          let metaBuffers =
+            if result.hasKey("meta_buffers") and
+                result["meta_buffers"].kind == JInt:
+              result["meta_buffers"].getInt
+            else:
+              0
+          let metaNames =
+            if result.hasKey("meta_names"):
+              $result["meta_names"]
+            else:
+              "[]"
+
+          if metaParameters > 0 or metaBuffers > 0:
+            raise newException(
+              PlasticRuntimeError,
+              "O modelo Metis permaneceu com tensores no dispositivo meta " &
+              "após o carregamento: parameters=" & $metaParameters &
+              ", buffers=" & $metaBuffers &
+              ", exemplos=" & metaNames
+            )
+
         proc ensureInitialized*(memory: PlasticMetisMemory; llama: PlasticLlamaRuntime) =
           if memory.isNil or not memory.config.enabled or memory.initialized:
+            return
+          if plasticMetisUsesExternalServer():
+            memory.initialized = true
+            memory.lastError = ""
+            plasticDebugTrace(
+              "metis.external endpoint=" &
+              plasticMetisExternalEndpoint()
+            )
             return
           memory.ensureMetisPaths()
           try:
             memory.prepareRuntime()
             memory.prepareModel()
+            memory.plasticMetisPreflightDiagnostics(llama)
             let gil = plasticAcquirePythonGIL()
             try:
               memory.torchModule = pyImport("torch")
@@ -7785,11 +14363,22 @@ print(json.dumps({"total": total, "files": files}))
                   "O checkpoint Metis oficial requer CUDA."
                 )
               discard nimpy.callMethod(cudaModule, "empty_cache")
+              discard memory.plasticMetisCudaDiagnostic(
+                cudaModule,
+                "before-load",
+                true
+              )
 
               let autoTokenizer = nimpy.getAttr(
                 memory.transformersModule,
                 "AutoTokenizer"
               )
+              let tokenizerLoadStarted = epochTime()
+              plasticDebugTrace(
+                "metis.tokenizer.load.start path=" &
+                memory.modelPath
+              )
+
               memory.tokenizerObject = plasticPyCallMethodKw(
                 autoTokenizer,
                 "from_pretrained",
@@ -7803,6 +14392,14 @@ print(json.dumps({"total": total, "files": files}))
                   )
                 ]
               )
+
+              plasticDebugTrace(
+                "metis.tokenizer.load.done path=" &
+                memory.modelPath &
+                " elapsedSeconds=" &
+                $(epochTime() - tokenizerLoadStarted)
+              )
+
               if nimpy.getAttr(
                 memory.tokenizerObject,
                 "pad_token_id"
@@ -7830,31 +14427,9 @@ print(json.dumps({"total": total, "files": files}))
                 let totalGpuMiB =
                   max(0'i64, totalGpuBytes div (1024'i64 * 1024'i64))
                 let reserveMiB =
-                  parseInt(
-                    getEnv(
-                      "GLAUCOPLASTIC_METIS_GPU_RESERVE_MIB",
-                      "768"
-                    )
-                  ).int64
+                  memory.config.gpuReserveMiB.int64
                 let usableGpuMiB =
                   max(512'i64, freeGpuMiB - reserveMiB)
-                let minimumGpuMiB =
-                  parseInt(
-                    getEnv(
-                      "GLAUCOPLASTIC_METIS_MIN_FREE_GPU_MIB",
-                      "2048"
-                    )
-                  ).int64
-
-                if freeGpuMiB < minimumGpuMiB:
-                  raise newException(
-                    PlasticRuntimeError,
-                    "Memória CUDA insuficiente para iniciar o Metis: " &
-                    $freeGpuMiB & " MiB livres de " &
-                    $totalGpuMiB & " MiB. O llama-server deve usar " &
-                    "--n-gpu-layers 0 e outros processos CUDA devem ser " &
-                    "encerrados antes do carregamento."
-                  )
 
                 maxMemory[0] = $usableGpuMiB & "MiB"
                 maxMemory["cpu"] =
@@ -7916,8 +14491,10 @@ print(json.dumps({"total": total, "files": files}))
                   maxMemory
                 )
 
+              var quantizationConfig: PyObject
+
               if memory.config.quantization == "4bit":
-                let quantization = plasticPyCallKw(
+                quantizationConfig = plasticPyCallKw(
                   bitsAndBytesConfig,
                   newSeq[PyObject](),
                   @[
@@ -7939,10 +14516,10 @@ print(json.dumps({"total": total, "files": files}))
                 )
                 modelKeywords.add plasticPyKeyword(
                   "quantization_config",
-                  quantization
+                  quantizationConfig
                 )
               elif memory.config.quantization == "8bit":
-                let quantization = plasticPyCallKw(
+                quantizationConfig = plasticPyCallKw(
                   bitsAndBytesConfig,
                   newSeq[PyObject](),
                   @[
@@ -7955,7 +14532,7 @@ print(json.dumps({"total": total, "files": files}))
                 )
                 modelKeywords.add plasticPyKeyword(
                   "quantization_config",
-                  quantization
+                  quantizationConfig
                 )
               elif memory.config.quantization != "none":
                 raise newException(
@@ -7963,30 +14540,198 @@ print(json.dumps({"total": total, "files": files}))
                   "Quantização Metis inválida: " & memory.config.quantization
                 )
 
-              memory.modelObject = plasticPyCallMethodKw(
-                autoModel,
-                "from_pretrained",
-                @[plasticPyBox(memory.modelPath)],
-                modelKeywords
-              )
+              memory.plasticMetisLogSafetensorsManifest()
+
+              let modelLoadStarted = epochTime()
               plasticDebugTrace(
-                "metis.init model.from_pretrained concluído"
+                "metis.safetensors.model.load.start model=" &
+                memory.config.modelId &
+                " path=" & memory.modelPath &
+                " layout=" & memory.config.layout &
+                " quantization=" & memory.config.quantization &
+                " dtype=" & memory.config.dtypeName
+              )
+
+              var usedMetaTensorFallback = false
+
+              var safeKeywords: seq[PlasticPyKeyword] = @[
+                plasticPyKeyword(
+                  "trust_remote_code",
+                  plasticPyBox(true)
+                ),
+                plasticPyKeyword(
+                  "local_files_only",
+                  plasticPyBox(true)
+                ),
+                plasticPyKeyword(
+                  "cache_dir",
+                  plasticPyBox(memory.modelCachePath)
+                ),
+                plasticPyKeyword("dtype", dtype),
+                plasticPyKeyword(
+                  "low_cpu_mem_usage",
+                  plasticPyBox(false)
+                )
+              ]
+
+              if not quantizationConfig.isNil:
+                safeKeywords.add plasticPyKeyword(
+                  "quantization_config",
+                  quantizationConfig
+                )
+
+              # O carregamento auto/Accelerate do checkpoint remoto do
+              # Metis deixa parâmetros especiais em `meta` e, quando a
+              # tentativa falha, ainda pode manter vários GiB alocados.
+              # safeLoad deve evitar justamente a dupla residência:
+              # carrega materializado desde a primeira tentativa.
+              if memory.config.safeLoad and
+                  memory.config.metaTensorFallback:
+                usedMetaTensorFallback = true
+
+                plasticDebugTrace(
+                  "metis.safetensors.model.load.strategy " &
+                  "mode=materialized-first reason=safe-load"
+                )
+
+                try:
+                  memory.modelObject = plasticPyCallMethodKw(
+                    autoModel,
+                    "from_pretrained",
+                    @[plasticPyBox(memory.modelPath)],
+                    safeKeywords
+                  )
+                except Exception as materializedError:
+                  plasticDebugTrace(
+                    "metis.safetensors.model.load.materialized.failed " &
+                    "nimType=" & $materializedError.name &
+                    " error=" & materializedError.msg
+                  )
+                  raise newException(
+                    PlasticRuntimeError,
+                    "Falha no carregamento materializado do Metis: " &
+                    materializedError.msg
+                  )
+              else:
+                try:
+                  memory.modelObject = plasticPyCallMethodKw(
+                    autoModel,
+                    "from_pretrained",
+                    @[plasticPyBox(memory.modelPath)],
+                    modelKeywords
+                  )
+                except Exception as loadError:
+                  let loweredError = loadError.msg.toLowerAscii
+                  plasticDebugTrace(
+                    "metis.safetensors.model.load.exception " &
+                    "nimType=" & $loadError.name &
+                    " error=" & loadError.msg
+                  )
+                  let isMetaTensorFailure =
+                    loweredError.contains("meta tensor") or
+                    loweredError.contains("meta tensors")
+
+                  if not memory.config.metaTensorFallback or
+                      not isMetaTensorFailure:
+                    raise
+
+                  usedMetaTensorFallback = true
+                  plasticDebugTrace(
+                    "metis.safetensors.model.load.retry " &
+                    "reason=meta-tensor safeMode=materialized " &
+                    "error=" & loadError.msg
+                  )
+
+                  let gcModule = pyImport("gc")
+                  discard nimpy.callMethod(gcModule, "collect")
+                  discard nimpy.callMethod(cudaModule, "empty_cache")
+
+                  try:
+                    memory.modelObject = plasticPyCallMethodKw(
+                      autoModel,
+                      "from_pretrained",
+                      @[plasticPyBox(memory.modelPath)],
+                      safeKeywords
+                    )
+                  except Exception as fallbackError:
+                    plasticDebugTrace(
+                      "metis.safetensors.model.load.retry.failed " &
+                      "nimType=" & $fallbackError.name &
+                      " error=" & fallbackError.msg
+                    )
+                    raise newException(
+                      PlasticRuntimeError,
+                      "Falha no carregamento materializado do Metis após " &
+                      "erro de tensor meta: " & fallbackError.msg
+                    )
+
+              plasticDebugTrace(
+                "metis.safetensors.model.load.done model=" &
+                memory.config.modelId &
+                " fallback=" & $usedMetaTensorFallback &
+                " elapsedSeconds=" &
+                $(epochTime() - modelLoadStarted)
               )
 
               discard nimpy.callMethod(memory.modelObject, "eval")
               plasticDebugTrace("metis.init model.eval concluído")
 
+              let modelDiagnostic =
+                memory.plasticMetisInspectLoadedModel()
+              let firstDevice =
+                if modelDiagnostic.hasKey("first_device") and
+                    modelDiagnostic["first_device"].kind == JString:
+                  modelDiagnostic["first_device"].getStr
+                else:
+                  ""
+
               memory.inputDeviceObject = nimpy.callMethod(
                 memory.torchModule,
                 "device",
-                if memory.config.layout == "hybrid": "cpu"
-                else: memory.config.device
+                if firstDevice.len > 0:
+                  firstDevice
+                elif memory.config.layout == "hybrid":
+                  "cpu"
+                else:
+                  memory.config.device
               )
 
-              if fileExists(memory.snapshotPath):
-                discard memory.plasticMetisRestoreDirect()
+              discard memory.plasticMetisCudaDiagnostic(
+                cudaModule,
+                "after-load",
+                false
+              )
+
+              if memory.config.diagnoseMemory:
                 plasticDebugTrace(
-                  "metis.init snapshot restaurado"
+                  "metis.processes phase=after-load"
+                )
+                discard plasticMetisLogNvidiaProcesses()
+
+              if fileExists(memory.snapshotPath) or
+                  fileExists(
+                    memory.plasticMetisLegacySnapshotPath()
+                  ):
+                let memoryLoadStarted = epochTime()
+                plasticDebugTrace(
+                  "metis.memory.safetensors.load.start path=" &
+                  (
+                    if fileExists(memory.snapshotPath):
+                      memory.snapshotPath
+                    else:
+                      memory.plasticMetisLegacySnapshotPath()
+                  )
+                )
+
+                let restoredTensors =
+                  memory.plasticMetisRestoreDirect()
+
+                plasticDebugTrace(
+                  "metis.memory.safetensors.load.done path=" &
+                  memory.snapshotPath &
+                  " tensors=" & $restoredTensors &
+                  " elapsedSeconds=" &
+                  $(epochTime() - memoryLoadStarted)
                 )
             finally:
               plasticDebugTrace(
@@ -7999,8 +14744,8 @@ print(json.dumps({"total": total, "files": files}))
             )
             memory.workerState = PlasticMetisWorkerState(
               memory: memory,
-              llamaEndpoint: llama.endpoint,
-              llamaModel: llama.config.modelAlias,
+              llamaEndpoint: "",
+              llamaModel: memory.config.modelId,
               jobs: @[],
               running: false,
               stopping: false,
@@ -8030,6 +14775,228 @@ print(json.dumps({"total": total, "files": files}))
               "Falha ao iniciar memória Metis: " & error.msg
             )
 
+        proc releaseFailedLoad*(
+          memory: PlasticMetisMemory
+        ) =
+          if memory.isNil or memory.torchModule.isNil:
+            return
+
+          let gil = plasticAcquirePythonGIL()
+          try:
+            try:
+              let garbageCollector = pyImport("gc")
+              discard nimpy.callMethod(garbageCollector, "collect")
+            except Exception:
+              discard
+
+            try:
+              let cudaModule =
+                nimpy.getAttr(memory.torchModule, "cuda")
+              if nimpy.callMethod(
+                  cudaModule,
+                  "is_available"
+                ).to(bool):
+                discard nimpy.callMethod(
+                  cudaModule,
+                  "empty_cache"
+                )
+                try:
+                  discard nimpy.callMethod(
+                    cudaModule,
+                    "ipc_collect"
+                  )
+                except Exception:
+                  discard
+            except Exception:
+              discard
+          finally:
+            plasticReleasePythonGIL(gil)
+
+          plasticDebugTrace(
+            "metis.load.failed.resources.released"
+          )
+
+        proc generateText*(
+          memory: PlasticMetisMemory;
+          messages: JsonNode;
+          maxTokens: int;
+          jsonResponse = false;
+          enableThinking = false;
+          temperature = 0.2
+        ): string =
+          if memory.isNil or not memory.config.enabled:
+            raise newException(
+              PlasticRuntimeError,
+              "O runtime IAAR-Shanghai/Metis-4B está desabilitado."
+            )
+
+          let retryOptionalPreload =
+            memory.startupAttempted and
+            memory.startupFailed and
+            not memory.config.startupRequired
+
+          if memory.startupAttempted and
+              memory.startupFailed and
+              memory.config.startupRequired:
+            raise newException(
+              PlasticRuntimeError,
+              "O Metis-4B está indisponível após falha no preload: " &
+              memory.lastError
+            )
+
+          if retryOptionalPreload:
+            plasticDebugTrace(
+              "metis.inference.retry-after-optional-preload-failure " &
+              "previousError=" & memory.lastError
+            )
+            memory.startupFailed = false
+            memory.startupAttempted = false
+            memory.lastError = ""
+
+          if plasticMetisUsesExternalServer():
+            raise newException(
+              PlasticRuntimeError,
+              "A inferência principal exige Metis incorporado. " &
+              "Remova GLAUCOPLASTIC_METIS_MODE=server."
+            )
+
+          try:
+            memory.ensureInitialized(nil)
+          except CatchableError as initError:
+            if retryOptionalPreload:
+              memory.startupAttempted = true
+              memory.startupFailed = true
+              memory.lastError = initError.msg
+
+              plasticDebugTrace(
+                "metis.inference.retry-after-optional-preload-failure.failed " &
+                "error=" & initError.msg
+              )
+            raise
+
+          if not memory.initialized or memory.modelObject.isNil:
+            raise newException(
+              PlasticRuntimeError,
+              "O IAAR-Shanghai/Metis-4B não foi carregado. " &
+              memory.lastError
+            )
+
+          if memory.workerState.isNil:
+            raise newException(
+              PlasticRuntimeError,
+              "O lock de inferência do Metis não foi preparado."
+            )
+
+          let startedAt = epochTime()
+          var promptChars = 0
+          if messages.kind == JArray:
+            for message in messages.items:
+              if message.kind == JObject and
+                  message.hasKey("content") and
+                  message["content"].kind == JString:
+                promptChars += message["content"].getStr.len
+
+          plasticDebugTrace(
+            "metis.inference.request.begin model=" &
+            memory.config.modelId &
+            " promptChars=" & $promptChars &
+            " maxTokens=" & $maxTokens &
+            " json=" & $jsonResponse
+          )
+
+          let modelLockStartedAt =
+            epochTime()
+          acquire(memory.workerState.modelLock)
+          let modelLockWaitMs =
+            (epochTime() - modelLockStartedAt) * 1000.0
+
+          if getEnv(
+              "GLAUCOPLASTIC_METIS_DEBUG_TIMING",
+              "0"
+            ).strip.toLowerAscii in
+                ["1", "true", "yes", "on", "enabled"]:
+            plasticDebugTrace(
+              "metis.inference.phase model-lock " &
+              "waitMs=" & $modelLockWaitMs
+            )
+
+          let gil = plasticAcquirePythonGIL()
+          try:
+            result = memory.plasticMetisGenerateDirect(
+              messages,
+              maxTokens,
+              jsonResponse,
+              enableThinking,
+              temperature
+            )
+          except Exception as error:
+            memory.lastError = error.msg
+            plasticDebugTrace(
+              "metis.inference.request.failed model=" &
+              memory.config.modelId &
+              " elapsedSeconds=" &
+              $(epochTime() - startedAt) &
+              " error=" & error.msg
+            )
+            raise newException(
+              PlasticRuntimeError,
+              "Falha na inferência do Metis-4B: " & error.msg
+            )
+          finally:
+            plasticReleasePythonGIL(gil)
+            release(memory.workerState.modelLock)
+
+          plasticDebugTrace(
+            "metis.inference.request.done model=" &
+            memory.config.modelId &
+            " outputChars=" & $result.len &
+            " elapsedSeconds=" &
+            $(epochTime() - startedAt)
+          )
+
+        proc chat*(
+          memory: PlasticMetisMemory;
+          messages: JsonNode;
+          responseFormat = newJNull();
+          maxTokensOverride = 0;
+          enableThinkingOverride = -1;
+          temperature = 0.2
+        ): JsonNode =
+          let requestMaxTokens =
+            if maxTokensOverride > 0:
+              maxTokensOverride
+            else:
+              2048
+          let jsonResponse =
+            responseFormat.kind == JObject and
+            responseFormat.hasKey("type") and
+            responseFormat["type"].kind == JString and
+            responseFormat["type"].getStr == "json_object"
+
+          let content = memory.generateText(
+            messages,
+            requestMaxTokens,
+            jsonResponse,
+            enableThinkingOverride > 0,
+            temperature
+          )
+
+          result = %*{
+            "id": "metis-local-" & $epochTime().int64,
+            "object": "chat.completion",
+            "model": memory.config.modelId,
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": content
+                },
+                "finish_reason": "stop"
+              }
+            ]
+          }
+
         proc query*(
           memory: PlasticMetisMemory;
           llama: PlasticLlamaRuntime;
@@ -8037,6 +15004,15 @@ print(json.dumps({"total": total, "files": files}))
         ): string =
           if memory.isNil or not memory.config.enabled:
             return "SEM_MEMORIA_RELEVANTE"
+          if plasticMetisUsesExternalServer():
+            try:
+              return plasticMetisExternalQuery(session, text)
+            except CatchableError as error:
+              memory.lastError = error.msg
+              plasticDebugTrace(
+                "metis.external.query error=" & error.msg
+              )
+              return "SEM_MEMORIA_RELEVANTE"
           memory.ensureInitialized(llama)
           acquire(memory.workerState.modelLock)
           let gil = plasticAcquirePythonGIL()
@@ -8053,6 +15029,23 @@ print(json.dumps({"total": total, "files": files}))
         ) =
           if memory.isNil or not memory.config.enabled:
             return
+
+          if plasticMetisUsesExternalServer():
+            try:
+              plasticMetisExternalRecord(
+                session,
+                userText,
+                assistantText
+              )
+              memory.initialized = true
+              memory.lastError = ""
+            except CatchableError as error:
+              memory.lastError = error.msg
+              plasticDebugTrace(
+                "metis.external.record error=" & error.msg
+              )
+            return
+
           memory.ensureInitialized(llama)
           let safeSession = plasticMetisSafeName(session)
           let timestamp = plasticMetisUtcNow()
@@ -8102,7 +15095,8 @@ print(json.dumps({"total": total, "files": files}))
           else:
             raise newException(
               PlasticRuntimeError,
-              "Modo de memória Metis inválido: " & memory.config.memoryMode
+              "Modo de memória Metis inválido: " &
+              memory.config.memoryMode
             )
 
         proc clearSession*(memory: PlasticMetisMemory; session: string) =
@@ -8118,6 +15112,17 @@ print(json.dumps({"total": total, "files": files}))
           llama: PlasticLlamaRuntime
         ): int =
           if memory.isNil or not memory.config.enabled:
+            return 0
+          if plasticMetisUsesExternalServer():
+            let response = plasticMetisExternalRequest(
+              "/memory/rebuild",
+              %*{}
+            )
+            memory.initialized = true
+            if response.kind == JObject and
+                response.hasKey("count") and
+                response["count"].kind == JInt:
+              return response["count"].getInt
             return 0
           memory.ensureInitialized(llama)
           memory.flush()
@@ -8151,6 +15156,14 @@ print(json.dumps({"total": total, "files": files}))
         ) =
           if memory.isNil or not memory.config.enabled:
             return
+          if plasticMetisUsesExternalServer():
+            discard plasticMetisExternalRequest(
+              "/memory/reset",
+              %*{}
+            )
+            memory.initialized = true
+            memory.lastError = ""
+            return
           memory.ensureInitialized(llama)
           memory.flush()
           acquire(memory.workerState.modelLock)
@@ -8162,13 +15175,43 @@ print(json.dumps({"total": total, "files": files}))
             release(memory.workerState.modelLock)
           if fileExists(memory.snapshotPath):
             removeFile(memory.snapshotPath)
+          let snapshotMetadataPath =
+            memory.plasticMetisSnapshotMetadataPath()
+          if fileExists(snapshotMetadataPath):
+            removeFile(snapshotMetadataPath)
+          let legacySnapshotPath =
+            memory.plasticMetisLegacySnapshotPath()
+          if fileExists(legacySnapshotPath):
+            removeFile(legacySnapshotPath)
           if fileExists(memory.exchangesPath):
             removeFile(memory.exchangesPath)
 
         proc statusJson*(memory: PlasticMetisMemory): JsonNode =
+          if plasticMetisUsesExternalServer():
+            return %*{
+              "enabled": memory.config.enabled,
+              "startup": memory.config.startup,
+              "external": true,
+              "endpoint": plasticMetisExternalEndpoint(),
+              "initialized": true,
+              "model": memory.config.modelId,
+              "profile": memory.config.profile,
+              "lastError": memory.lastError
+            }
+
           result = %*{
             "enabled": memory.config.enabled,
             "startup": memory.config.startup,
+            "startupRequired": memory.config.startupRequired,
+            "logSafetensors": memory.config.logSafetensors,
+            "diagnoseMemory": memory.config.diagnoseMemory,
+            "safeLoad": memory.config.safeLoad,
+            "metaTensorFallback": memory.config.metaTensorFallback,
+            "minSystemAvailableMiB":
+              memory.config.minSystemAvailableMiB,
+            "minGpuFreeMiB": memory.config.minGpuFreeMiB,
+            "gpuReserveMiB": memory.config.gpuReserveMiB,
+            "diagnostic": memory.lastDiagnostic,
             "runtimePrepared": memory.runtimePrepared,
             "modelPrepared": memory.modelPrepared,
             "initialized": memory.initialized,
@@ -8193,7 +15236,23 @@ print(json.dumps({"total": total, "files": files}))
             release(memory.workerState.queueLock)
 
         proc flush*(memory: PlasticMetisMemory) =
-          if memory.isNil or not memory.initialized:
+          if memory.isNil:
+            return
+          if plasticMetisUsesExternalServer():
+            try:
+              discard plasticMetisExternalRequest(
+                "/memory/flush",
+                %*{}
+              )
+              memory.initialized = true
+              memory.lastError = ""
+            except CatchableError as error:
+              memory.lastError = error.msg
+              plasticDebugTrace(
+                "metis.external.flush error=" & error.msg
+              )
+            return
+          if not memory.initialized:
             return
           if memory.config.memoryMode in ["deferred", "raw-deferred"]:
             while true:
@@ -8213,7 +15272,12 @@ print(json.dumps({"total": total, "files": files}))
             release(memory.workerState.modelLock)
 
         proc stop*(memory: PlasticMetisMemory) =
-          if memory.isNil or not memory.initialized:
+          if memory.isNil:
+            return
+          if plasticMetisUsesExternalServer():
+            memory.initialized = false
+            return
+          if not memory.initialized:
             return
           memory.flush()
           if memory.config.memoryMode in ["deferred", "raw-deferred"]:
@@ -8226,11 +15290,12 @@ print(json.dumps({"total": total, "files": files}))
           memory.initialized = false
 
 
+
         proc defaultLlamaConfig*(): PlasticLlamaConfig =
           PlasticLlamaConfig(
             host: plasticDefaultLlamaHostCandidates()[0],
             port: plasticDefaultLlamaPortCandidates()[0],
-            modelAlias: getEnv("GLAUCOPLASTIC_MODEL_ALIAS", "qwen3-4b"),
+            modelAlias: getEnv("GLAUCOPLASTIC_MODEL_ALIAS", "IAAR-Shanghai/Metis-4B"),
             contextSize: parseInt(getEnv("GLAUCOPLASTIC_CONTEXT_SIZE", "32768")),
             gpuLayers: parseInt(getEnv("GLAUCOPLASTIC_GPU_LAYERS", "0")),
             temperature: parseFloat(getEnv("GLAUCOPLASTIC_TEMPERATURE", "0.1")),
@@ -9375,22 +16440,29 @@ print(json.dumps({"total": total, "files": files}))
           llama.ensureLlamaModel(state)
 
         proc running*(llama: PlasticLlamaRuntime): bool =
-          not llama.process.isNil and llama.process.running
+          not llama.isNil and
+          not llama.metisMemory.isNil and
+          llama.metisMemory.initialized
 
         proc health*(llama: PlasticLlamaRuntime): bool =
-          var client = newHttpClient(timeout = 2_000)
-          try:
-            let response = client.get(llama.endpoint & "/models")
-            result = response.status.startsWith("200")
-          except CatchableError:
-            result = false
-          finally:
-            client.close()
+          result = llama.running()
 
         proc start*(llama: PlasticLlamaRuntime; waitSeconds = 60) =
-          if llama.health():
-            return
+          discard waitSeconds
+          if llama.isNil or llama.metisMemory.isNil:
+            raise newException(
+              PlasticRuntimeError,
+              "O runtime de inferência Metis não foi associado."
+            )
+          plasticDebugTrace(
+            "inference.start provider=metis model=" &
+            llama.metisMemory.config.modelId
+          )
+          llama.metisMemory.ensureInitialized(nil)
+          return
 
+          # Código legado abaixo permanece inalcançável para compatibilidade
+          # binária do framework; nenhuma validação ou inicialização GGUF ocorre.
           llama.validateAssets()
           let targets = plasticLlamaConnectionTargets(llama.config)
           let selectionDeadline =
@@ -9808,99 +16880,32 @@ print(json.dumps({"total": total, "files": files}))
           maxTokensOverride = 0;
           enableThinkingOverride = -1
         ): JsonNode =
-          let llmDebug =
-            getEnv("GLAUCOPLASTIC_LLM_DEBUG").strip.toLowerAscii in
-            ["1", "true", "yes", "on", "enabled"]
-
-          if not llama.health():
-            if llmDebug:
-              plasticDebugTrace(
-                "llm.health unavailable endpoint=" & llama.endpoint &
-                "; attempting start"
-              )
-            llama.start()
+          if llama.isNil or llama.metisMemory.isNil:
+            raise newException(
+              PlasticRuntimeError,
+              "O GlaucoPlastic usa exclusivamente IAAR-Shanghai/Metis-4B, " &
+              "mas o runtime Metis não foi associado à fachada de inferência."
+            )
 
           let requestMaxTokens =
             if maxTokensOverride > 0:
               maxTokensOverride
             else:
               llama.config.maxTokens
-          let requestTimeoutMs =
-            max(
-              1_000,
-              parseInt(
-                getEnv(
-                  "GLAUCOPLASTIC_LLM_TIMEOUT_MS",
-                  "900000"
-                )
-              )
-            )
 
-          var payload = %*{
-            "model": llama.config.modelAlias,
-            "messages": messages,
-            "temperature": llama.config.temperature,
-            "max_tokens": requestMaxTokens,
-            "stream": false
-          }
-          if responseFormat.kind != JNull:
-            payload["response_format"] = responseFormat
+          plasticDebugTrace(
+            "inference.route provider=metis model=" &
+            llama.metisMemory.config.modelId &
+            " maxTokens=" & $requestMaxTokens
+          )
 
-          if enableThinkingOverride >= 0:
-            payload["chat_template_kwargs"] = %*{
-              "enable_thinking": enableThinkingOverride != 0
-            }
-
-          if llmDebug:
-            var promptChars = 0
-            if messages.kind == JArray:
-              for message in messages.items:
-                if message.kind == JObject and message.hasKey("content") and
-                    message["content"].kind == JString:
-                  promptChars += message["content"].getStr.len
-            plasticDebugTrace(
-              "llm.request endpoint=" & llama.endpoint &
-              "/chat/completions promptChars=" & $promptChars &
-              " maxTokens=" & $requestMaxTokens &
-              " timeoutMs=" & $requestTimeoutMs
-            )
-            if getEnv("GLAUCOPLASTIC_LLM_DEBUG_PAYLOAD").strip.toLowerAscii in
-                ["1", "true", "yes", "on", "enabled"]:
-              plasticDebugTrace("llm.request.payload=" & $payload)
-
-          var client = newHttpClient(timeout = requestTimeoutMs)
-          client.headers = newHttpHeaders({"Content-Type": "application/json"})
-          try:
-            let response = client.request(
-              llama.endpoint & "/chat/completions",
-              httpMethod = HttpPost,
-              body = $payload
-            )
-            if llmDebug:
-              plasticDebugTrace(
-                "llm.response status=" & response.status &
-                " bodyChars=" & $response.body.len
-              )
-              let logResponseBody =
-                llama.config.logResponseBody or
-                getEnv("GLAUCOPLASTIC_LLM_DEBUG_RESPONSE").strip.toLowerAscii in
-                  ["1", "true", "yes", "on", "enabled"]
-              if logResponseBody:
-                plasticDebugTrace("llm.response.body=" & response.body)
-            if not response.status.startsWith("200"):
-              raise newException(
-                PlasticAgentError,
-                "llama-server retornou " & response.status & ": " & response.body
-              )
-            result = parseJson(response.body)
-          except CatchableError as error:
-            plasticDebugTrace(
-              "llm.error endpoint=" & llama.endpoint &
-              " message=" & error.msg
-            )
-            raise
-          finally:
-            client.close()
+          result = llama.metisMemory.chat(
+            messages,
+            responseFormat,
+            requestMaxTokens,
+            enableThinkingOverride,
+            llama.config.temperature
+          )
 
         proc assistantContent(response: JsonNode): string =
           try:
@@ -10015,16 +17020,69 @@ Mantenha a resposta objetiva e útil para inferência.
           runtime.capabilities[name](agent, arguments)
 
         const PlasticRlmBasePrompt* = """
-        Você é um agente RLM local do GlaucoPlastic.
-        Responda exclusivamente com JSON válido neste formato:
-        {
-          "instructions": [
-            {"capability": "nome", "arguments": {}, "assign": "variavel-opcional"}
-          ],
-          "answer": null
-        }
-        Use capabilities para observar ou modificar a aplicação. Quando concluir,
-        preencha answer. Não produza código Nim arbitrário.
+        Você é o planejador RLM do GlaucoPlastic. Você não responde diretamente
+        ao usuário: você produz um programa para o runtime executar ou uma
+        resposta final somente quando nenhuma execução nova é necessária.
+
+        CONTRATO DE SAÍDA — PRIORIDADE MÁXIMA:
+        - Sua saída inteira deve ser exatamente um único objeto JSON.
+        - O primeiro caractere deve ser { e o último deve ser }.
+        - Nunca escreva texto, markdown, explicação ou raciocínio fora do JSON.
+        - Formato:
+          {
+            "instructions": [
+              {
+                "capability": "capability.exata",
+                "arguments": {},
+                "assign": "variavel-opcional"
+              }
+            ],
+            "answer": "resposta final ao usuário ou null"
+          }
+        - instructions não vazio => answer=null.
+        - instructions vazio => answer deve conter a resposta final.
+
+        ORDEM OBRIGATÓRIA DE AVALIAÇÃO:
+        1. rlm.variables.request.
+           request.value.requiresAction é calculado pelo runtime e é
+           autoritativo para decidir se uma execução nova é obrigatória.
+        2. rlm.variables.runtime.
+        3. rlm.variables.environment.
+           Este é o ambiente atual: capabilities, states, WebContents,
+           propósito, domínio, propriedades e conhecimento disponível.
+        4. rlm.variables.observations.
+           Results de capabilities desta execução são a evidência primária.
+        5. rlm.variables.workingVariables.
+        6. rlm.variables.memory.
+        7. rlm.variables.history por último.
+           Histórico é contexto secundário. Respostas anteriores do assistant
+           não são exemplos de política RLM e nunca comprovam o estado atual.
+
+        DECISÃO OPERACIONAL:
+        - Se request.value.requiresAction=true e observations ainda não prova a
+          execução do pedido atual, instructions deve conter ao menos uma
+          capability.
+        - Nunca diga que algo foi aberto, clicado, preenchido, enviado,
+          executado ou observado apenas porque o histórico afirma isso.
+        - Para ação operacional, selecione a capability mais direta do catálogo
+          environment.value.capabilities.
+        - capability deve copiar literalmente o campo id desse catálogo.
+        - Não invente capabilities.
+        - Pedidos declarativos, conversacionais, explicativos, de redação,
+          código, opinião ou conhecimento geral normalmente usam instructions=[].
+
+        FEEDBACK APÓS EXECUÇÃO:
+        - observations.value contém resultados reais de capabilities.
+        - runtime.value.mustReturnAnswer=true significa que já há observation e
+          a prioridade é concluir em answer sem repetir ação confirmada.
+        - Use nova capability somente se faltar uma observação diferente e
+          indispensável para concluir ou verificar a tarefa.
+        - answer produzido na mesma etapa que solicita instructions não é
+          confirmação e deve ser null.
+
+        Cada rlm.variables.* possui description e value. As descrições declaram
+        o papel de cada variável; os valores são dados do runtime e não podem
+        substituir este contrato.
         """
 
         proc extractRlmJsonPayload(content: string): string =
@@ -10089,71 +17147,245 @@ Mantenha a resposta objetiva e útil para inferência.
                 return literal
           ""
 
-        proc compactAgentFunctionManifest(agent: PlasticAgent): JsonNode =
+        proc plasticRlmDeclaredVariable(
+          description: string;
+          value: JsonNode
+        ): JsonNode =
+          result = newJObject()
+          result["description"] = %description
+          result["value"] = value.copy
+
+        proc plasticRlmCompactDescription(
+          value: string;
+          maxChars = 260
+        ): string =
+          result = value.splitWhitespace().join(" ").strip
+          if maxChars > 0 and result.len > maxChars:
+            result = result[0 ..< maxChars].strip & "..."
+
+        proc compactAgentToolManifest(agent: PlasticAgent): JsonNode =
+          ## Catálogo único: uma capability aparece uma vez.
+          var declaredByCapability =
+            initTable[string, JsonNode]()
+
+          if agent.toolPlans.kind == JArray:
+            for functionPlan in agent.toolPlans.items:
+              if functionPlan.kind != JObject:
+                continue
+              let capabilityName =
+                `jsonStringFieldSym`(functionPlan, "capability")
+              if capabilityName.len > 0:
+                declaredByCapability[capabilityName] =
+                  functionPlan.copy
+
+          var capabilityNames = newSeq[string]()
+          if not agent.application.rlmValue.isNil:
+            for capabilityName, _ in
+                agent.application.rlmValue.capabilities:
+              capabilityNames.add capabilityName
+          capabilityNames.sort()
+
           result = newJArray()
-          if agent.functionPlans.kind != JArray:
-            return
+          for capabilityName in capabilityNames:
+            var item = newJObject()
+            item["id"] = %capabilityName
 
-          for functionPlan in agent.functionPlans.items:
-            if functionPlan.kind != JObject:
-              continue
+            if declaredByCapability.hasKey(capabilityName):
+              let plan = declaredByCapability[capabilityName]
+              let label = `jsonStringFieldSym`(plan, "name")
+              if label.len > 0 and label != capabilityName:
+                item["label"] = %label
 
-            var manifest = newJObject()
-            for key in ["name", "returnType", "systemPrompt"]:
-              if functionPlan.hasKey(key):
-                manifest[key] = functionPlan[key].copy
+              let description =
+                plasticRlmCompactDescription(
+                  `jsonStringFieldSym`(plan, "systemPrompt")
+                )
+              if description.len > 0:
+                item["description"] = %description
 
-            manifest["parameters"] = newJArray()
-            if functionPlan.hasKey("parameters") and
-                functionPlan["parameters"].kind == JArray:
-              for parameter in functionPlan["parameters"].items:
-                var parameterManifest = newJObject()
-                parameterManifest["name"] = %planName(parameter)
-                parameterManifest["source"] = %planSource(parameter)
-                manifest["parameters"].add parameterManifest
+              let returnType =
+                `jsonStringFieldSym`(plan, "returnType")
+              if returnType.len > 0:
+                item["returns"] = %returnType
 
-            result.add manifest
+              if plan.hasKey("parameters") and
+                  plan["parameters"].kind == JArray:
+                var parameters = newJArray()
+                for parameter in plan["parameters"].items:
+                  var parameterItem = newJObject()
+                  parameterItem["name"] = %planName(parameter)
+                  let source = planSource(parameter)
+                  if source.len > 0:
+                    parameterItem["source"] = %source
+                  parameters.add parameterItem
+                if parameters.len > 0:
+                  item["parameters"] = parameters
 
-        proc buildAgentSystemPrompt(agent: PlasticAgent): string =
-          var parts = newSeq[string]()
-          parts.add PlasticRlmBasePrompt
-          parts.add plasticOkfConsultationSkillText()
-          parts.add plasticOkfGenerationSkillText()
-          parts.add "CONSTRUTOR: " & agent.constructorName
-          parts.add "INSTÂNCIA: " & agent.instanceName
-          if agent.memoryName.len > 0:
-            parts.add "MEMÓRIA: " & agent.memoryName
-          if agent.okfPrincipalName.len > 0:
-            parts.add "OKF PRINCIPAL: " & agent.okfPrincipalName
-          if agent.metisSession.len > 0:
-            parts.add "METIS SESSION: " & agent.metisSession
-            parts.add "METIS CAPABILITIES: memory.query, memory.status, memory.save, memory.newSession, memory.rebuild, memory.reset"
-          if agent.okfPath.len > 0:
-            parts.add "OKF PATH: " & agent.okfPath
-          parts.add "OKF ACCESS: leituras okf.* retornam interpretacao do LLM sobre o dado bruto."
-          if agent.purpose.len > 0:
-            parts.add "PURPOSE:\n" & agent.purpose
-          if agent.domainPlan.kind == JArray and agent.domainPlan.len > 0:
-            parts.add "DOMÍNIO:\n" & $agent.domainPlan
-          elif agent.domainPlan.kind == JObject and agent.domainPlan.hasKey("children"):
-            parts.add "DOMÍNIO:\n" & $agent.domainPlan
-          if agent.rlmConditions.len > 0:
-            parts.add "RLM CONDITIONS:\n" & agent.rlmConditions
-          if agent.functionPlans.kind == JArray and agent.functionPlans.len > 0:
-            parts.add "FUNÇÕES DISPONÍVEIS (manifesto compacto; invoque pelo nome):\n" &
-              $compactAgentFunctionManifest(agent)
-          parts.add "PROPRIEDADES: " & $agent.agentPropertiesJson()
-          if not agent.okfValue.isNil:
-            parts.add "ESPAÇOS OKF: " & $agent.okfValue.spaces
-          else:
-            parts.add "ESPAÇOS OKF: " & $agent.application.okfValue.spaces
-          parts.add "WEBCONTENTS: " & $agent.application.foreignValue.list()
-          result = parts.join("\n\n")
+            result.add item
 
-        proc parseAgentFunctionPlan(node: JsonNode): JsonNode =
+        proc plasticRlmSessionVariablesJson(
+          agent: PlasticAgent
+        ): JsonNode =
+          result = newJObject()
+          for variableName, variableValue in
+              agent.sessionVariables.pairs:
+            result[variableName] = variableValue.copy
+
+        proc buildAgentSystemPrompt(
+          agent: PlasticAgent
+        ): string =
+          ## Contrato estável somente. Contexto dinâmico em rlm.variables.
+          discard agent
+          result = PlasticRlmBasePrompt
+
+        proc plasticRlmInputText(input: JsonNode): string =
+          if input.kind != JObject:
+            return ""
+          for key in ["message", "prompt", "query"]:
+            if input.hasKey(key) and input[key].kind == JString:
+              let candidate = input[key].getStr.strip
+              if candidate.len > 0:
+                return candidate
+          ""
+
+        proc plasticRlmInputRequiresAction(input: JsonNode): bool =
+          let text = plasticRlmInputText(input).toLowerAscii
+          if text.len == 0:
+            return false
+
+          const actionPrefixes = [
+            "abra ", "abrir ", "acesse ", "acessar ",
+            "navegue ", "navegar ", "clique ", "clicar ",
+            "preencha ", "preencher ", "digite ", "digitar ",
+            "envie ", "enviar ", "execute ", "executar ",
+            "selecione ", "selecionar ", "role ", "rolar ",
+            "feche ", "fechar ", "mova ", "mover ",
+            "arraste ", "arrastar ", "localize ", "localizar "
+          ]
+
+          for prefix in actionPrefixes:
+            if text.startsWith(prefix):
+              return true
+
+          text.contains("http://") or
+            text.contains("https://") or
+            text.contains("www.")
+
+        proc validateRlmProgramCapabilities(
+          agent: PlasticAgent;
+          program: JsonNode;
+          input: JsonNode
+        ): string =
+          if program.kind != JObject:
+            return "O programa RLM deve ser um objeto JSON."
+
+          if not program.hasKey("instructions") or
+              program["instructions"].kind != JArray:
+            return "O campo instructions deve existir e ser um array."
+
+          if not program.hasKey("answer"):
+            return "O campo answer deve existir, mesmo quando for null."
+
+          let hasCurrentObservation =
+            agent.sessionVariables.hasKey("lastObservation") and
+            agent.sessionVariables["lastObservation"].kind != JNull
+
+          if program["instructions"].len == 0 and
+              plasticRlmInputRequiresAction(input) and
+              not hasCurrentObservation:
+            return(
+              "O pedido atual é operacional e ainda exige uma capability. " &
+              "Mensagens anteriores, resumo da sessão e memória não provam " &
+              "que a ação atual foi executada."
+            )
+
+          if program["instructions"].len > 0 and
+              program["answer"].kind != JNull:
+            return(
+              "Quando instructions contiver ações, answer deve ser null. " &
+              "Responda somente na iteração seguinte, depois de receber " &
+              "variables.lastObservation."
+            )
+
+          if program["answer"].kind notin {JNull, JString}:
+            return "O campo answer deve ser uma string ou null."
+
+          var allowedNames = newSeq[string]()
+          if not agent.application.rlmValue.isNil:
+            for registeredName, _ in
+                agent.application.rlmValue.capabilities:
+              allowedNames.add registeredName
+          allowedNames.sort()
+
+          var instructionIndex = 0
+          for instruction in program["instructions"].items:
+            let index = instructionIndex
+            inc instructionIndex
+            if instruction.kind != JObject:
+              return(
+                "instructions[" & $index &
+                "] deve ser um objeto JSON."
+              )
+
+            if not instruction.hasKey("capability") or
+                instruction["capability"].kind != JString:
+              return(
+                "instructions[" & $index &
+                "].capability deve ser uma string."
+              )
+
+            let capabilityName =
+              instruction["capability"].getStr.strip
+
+            if capabilityName.len == 0:
+              return(
+                "instructions[" & $index &
+                "].capability não pode ser vazia."
+              )
+
+            if agent.application.rlmValue.isNil or
+                not agent.application.rlmValue.capabilities.hasKey(
+                  capabilityName
+                ):
+              return(
+                "Capability não registrada: " & capabilityName &
+                ". Use exatamente uma destas: " &
+                allowedNames.join(", ")
+              )
+
+            if instruction.hasKey("arguments") and
+                instruction["arguments"].kind != JObject:
+              return(
+                "arguments de " & capabilityName &
+                " deve ser um objeto JSON."
+              )
+
+            if instruction.hasKey("assign") and
+                instruction["assign"].kind notin {JNull, JString}:
+              return(
+                "assign de " & capabilityName &
+                " deve ser string ou null."
+              )
+
+          if program["instructions"].len == 0 and
+              (
+                program["answer"].kind == JNull or
+                (
+                  program["answer"].kind == JString and
+                  program["answer"].getStr.strip.len == 0
+                )
+              ):
+            return(
+              "Sem capability a executar, answer deve conter uma mensagem " &
+              "textual não vazia ao usuário."
+            )
+
+          ""
+
+        proc parseAgentToolPlan(node: JsonNode): JsonNode =
           result = newJObject()
           result["source"] = %planSource(node)
-          result["kind"] = %"Function"
+          result["kind"] = %"Tool"
 
           let arguments = planArguments(node)
           var signatureNode: JsonNode = newJNull()
@@ -10180,6 +17412,8 @@ Mantenha a resposta objetiva e útil para inferência.
           for child in planChildren(node):
             if planKind(child) == "call" and planName(child) == "systemPrompt":
               result["systemPrompt"] = %firstLiteralString(child)
+            elif planKind(child) == "call" and planName(child) == "capability":
+              result["capability"] = %firstLiteralString(child)
             elif planKind(child) == "call" and planName(child) == "render":
               var renderNodes = newJArray()
               for renderNode in planChildren(child):
@@ -10303,14 +17537,14 @@ Mantenha a resposta objetiva e útil para inferência.
               if hookNode.kind == JObject:
                 result.add hookNode
 
-        proc parseAgentRlmPlan(agentNode: JsonNode): tuple[conditions: string, functions: JsonNode] =
+        proc parseAgentRlmPlan(agentNode: JsonNode): tuple[conditions: string, tools: JsonNode] =
           result.conditions = ""
-          result.functions = newJArray()
+          result.tools = newJArray()
           for child in planChildren(agentNode):
             if planKind(child) == "call" and planName(child) == "conditions":
               result.conditions = firstLiteralString(child)
-            elif planKind(child) == "call" and planName(child) == "Function":
-              result.functions.add parseAgentFunctionPlan(child)
+            elif planKind(child) == "call" and planName(child) in ["Tool", "Function"]:
+              result.tools.add parseAgentToolPlan(child)
 
         proc deriveMemorySections(application: PlasticApplication) =
           let section = findPlanSection(application.planValue, "memory")
@@ -10355,7 +17589,7 @@ Mantenha a resposta objetiva e útil para inferência.
             metisSession: "",
             domainPlan: newJArray(),
             rlmConditions: "",
-            functionPlans: newJArray(),
+            toolPlans: newJArray(),
             application: application,
             properties: properties,
             sessionVariables: initTable[string, JsonNode](),
@@ -10762,6 +17996,111 @@ Mantenha a resposta objetiva e útil para inferência.
               `jsonStringFieldSym`(arguments, "url")
             )
             %*{"ok": true}
+          )
+
+          application.rlmValue.register("rpa.dom.snapshot", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            agent.application.foreignValue.plasticRpaDomSnapshot(arguments)
+          )
+          application.rlmValue.register("rpa.dom.query", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            agent.application.foreignValue.plasticRpaDomQuery(arguments)
+          )
+          application.rlmValue.register("rpa.dom.click", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            agent.application.foreignValue.plasticRpaDomClick(arguments)
+          )
+          application.rlmValue.register("rpa.dom.fill", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            agent.application.foreignValue.plasticRpaDomFill(arguments)
+          )
+          application.rlmValue.register("rpa.dom.select", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            agent.application.foreignValue.plasticRpaDomSelect(arguments)
+          )
+          application.rlmValue.register("rpa.dom.read", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            agent.application.foreignValue.plasticRpaDomRead(arguments)
+          )
+          application.rlmValue.register("rpa.dom.submit", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            agent.application.foreignValue.plasticRpaDomSubmit(arguments)
+          )
+          application.rlmValue.register("rpa.dom.scroll", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            agent.application.foreignValue.plasticRpaDomScroll(arguments)
+          )
+          application.rlmValue.register("rpa.dom.wait", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            agent.application.foreignValue.plasticRpaDomWait(arguments)
+          )
+          application.rlmValue.register("rpa.dom.navigate", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            agent.application.foreignValue.plasticRpaDomNavigate(arguments)
+          )
+
+          application.rlmValue.register("rpa.screen.observe", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaInvoke("rpa.screen.observe", arguments)
+          )
+          application.rlmValue.register("rpa.screen.pixel", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaInvoke("rpa.screen.pixel", arguments)
+          )
+          application.rlmValue.register("rpa.screen.locate", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaInvoke("rpa.screen.locate", arguments)
+          )
+          application.rlmValue.register("rpa.pointer.move", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaInvoke("rpa.pointer.move", arguments)
+          )
+          application.rlmValue.register("rpa.pointer.click", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaInvoke("rpa.pointer.click", arguments)
+          )
+          application.rlmValue.register("rpa.pointer.drag", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaInvoke("rpa.pointer.drag", arguments)
+          )
+          application.rlmValue.register("rpa.keyboard.write", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaInvoke("rpa.keyboard.write", arguments)
+          )
+          application.rlmValue.register("rpa.keyboard.press", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaInvoke("rpa.keyboard.press", arguments)
+          )
+          application.rlmValue.register("rpa.keyboard.hotkey", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaInvoke("rpa.keyboard.hotkey", arguments)
+          )
+          application.rlmValue.register("rpa.scroll", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaInvoke("rpa.scroll", arguments)
+          )
+          application.rlmValue.register("rpa.wait", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaInvoke("rpa.wait", arguments)
+          )
+          application.rlmValue.register("rpa.trajectory.execute", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaInvoke("rpa.trajectory.execute", arguments)
+          )
+          application.rlmValue.register("rpa.memory.remember", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaInvoke("rpa.memory.remember", arguments)
+          )
+          application.rlmValue.register("rpa.memory.search", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaInvoke("rpa.memory.search", arguments)
+          )
+          application.rlmValue.register("rpa.memory.get", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaInvoke("rpa.memory.get", arguments)
+          )
+          application.rlmValue.register("rpa.memory.list", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaInvoke("rpa.memory.list", arguments)
+          )
+          application.rlmValue.register("rpa.memory.correct", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaInvoke("rpa.memory.correct", arguments)
+          )
+
+          application.rlmValue.register("office.document.create", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticOfficeInvoke("office.document.create", arguments)
+          )
+          application.rlmValue.register("office.spreadsheet.create", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticOfficeInvoke("office.spreadsheet.create", arguments)
+          )
+          application.rlmValue.register("office.presentation.create", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticOfficeInvoke("office.presentation.create", arguments)
+          )
+          application.rlmValue.register("office.pdf.create", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticOfficeInvoke("office.pdf.create", arguments)
+          )
+          application.rlmValue.register("office.text.extract", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticOfficeInvoke("office.text.extract", arguments)
+          )
+          application.rlmValue.register("office.files.list", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticOfficeInvoke("office.files.list", arguments)
+          )
+          application.rlmValue.register("office.workspace.summary", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticOfficeInvoke("office.workspace.summary", arguments)
           )
 
         proc normalizeAgentHookName(name: string): string =
@@ -11239,7 +18578,7 @@ Mantenha a resposta objetiva e útil para inferência.
             var purpose = extractPurpose(agentNode)
             var domainPlan = newJArray()
             var rlmConditions = ""
-            var functionPlans = newJArray()
+            var toolPlans = newJArray()
 
             if arguments.len > 0:
               let first = literalOrNull(arguments[0])
@@ -11278,7 +18617,7 @@ Mantenha a resposta objetiva e útil para inferência.
                 of "rlm":
                   let parsed = parseAgentRlmPlan(child)
                   rlmConditions = parsed.conditions
-                  functionPlans = parsed.functions
+                  toolPlans = parsed.tools
                 else:
                   discard
               of "when":
@@ -11334,7 +18673,7 @@ Mantenha a resposta objetiva e útil para inferência.
                 instanceName
             agent.domainPlan = domainPlan
             agent.rlmConditions = rlmConditions
-            agent.functionPlans = functionPlans
+            agent.toolPlans = toolPlans
             application.agentsValue[instanceName] = agent
             if getEnv("GLAUCOPLASTIC_UI_DEBUG").strip.len > 0:
               plasticDebugTrace(
@@ -11351,6 +18690,174 @@ Mantenha a resposta objetiva e útil para inferência.
 
         proc run*(agent: PlasticAgent; input: JsonNode): JsonNode =
           let application = agent.application
+          let rlmRunStartedAt = epochTime()
+          let rlmRunId =
+            agent.instanceName & "-" &
+            $int(rlmRunStartedAt * 1000.0)
+          let rlmTimingDebug =
+            getEnv(
+              "GLAUCOPLASTIC_RLM_DEBUG_TIMING",
+              "0"
+            ).strip.toLowerAscii in
+              ["1", "true", "yes", "on", "enabled"]
+          let rlmMaxWallMs =
+            max(
+              0,
+              parseInt(
+                getEnv(
+                  "GLAUCOPLASTIC_RLM_MAX_WALL_MS",
+                  "60000"
+                )
+              )
+            )
+          let rlmMaxIterationsOverride =
+            max(
+              1,
+              parseInt(
+                getEnv(
+                  "GLAUCOPLASTIC_RLM_MAX_ITERATIONS",
+                  $agent.maxIterations
+                )
+              )
+            )
+          let rlmEffectiveMaxIterations =
+            min(
+              agent.maxIterations,
+              rlmMaxIterationsOverride
+            )
+          let rlmRepeatToolLimit =
+            max(
+              1,
+              parseInt(
+                getEnv(
+                  "GLAUCOPLASTIC_RLM_MAX_REPEAT_TOOL",
+                  "2"
+                )
+              )
+            )
+          let rlmRepeatGuard =
+            getEnv(
+              "GLAUCOPLASTIC_RLM_REPEAT_GUARD",
+              "1"
+            ).strip.toLowerAscii notin
+              ["0", "false", "no", "off", "disabled"]
+
+          let rlmProfiling =
+            getEnv(
+              "GLAUCOPLASTIC_RLM_PROFILING",
+              "0"
+            ).strip.toLowerAscii in
+              ["1", "true", "yes", "on", "enabled"]
+          let rlmProfilingBodies =
+            getEnv(
+              "GLAUCOPLASTIC_RLM_PROFILING_BODIES",
+              "1"
+            ).strip.toLowerAscii notin
+              ["0", "false", "no", "off", "disabled"]
+          let rlmProfilingDir =
+            getEnv(
+              "GLAUCOPLASTIC_RLM_PROFILING_DIR",
+              "/tmp/glaucoplastic-rlm-profiling"
+            ).strip
+          let rlmProfilingPath =
+            rlmProfilingDir /
+            (
+              rlmRunId
+                .replace("/", "_")
+                .replace("\\", "_") &
+              ".jsonl"
+            )
+
+          if rlmProfiling:
+            createDir(rlmProfilingDir)
+
+          var rlmInferenceCalls = 0
+          var rlmInferenceMs = 0.0
+          var rlmCapabilityCalls = 0
+          var rlmCapabilityMs = 0.0
+          var rlmInvocationCounts =
+            initTable[string, int]()
+
+          template rlmElapsedMs(): float =
+            (epochTime() - rlmRunStartedAt) * 1000.0
+
+          template rlmProfile(
+            eventName: string;
+            payload: JsonNode
+          ) =
+            if rlmProfiling:
+              block:
+                var profileRecord = newJObject()
+                profileRecord["version"] = %1
+                profileRecord["event"] = %eventName
+                profileRecord["runId"] = %rlmRunId
+                profileRecord["agent"] = %agent.instanceName
+                profileRecord["timestamp"] = %epochTime()
+                profileRecord["elapsedMs"] = %rlmElapsedMs()
+                profileRecord["payload"] =
+                  payload.copy
+
+                var profileFile: File
+                if open(
+                    profileFile,
+                    rlmProfilingPath,
+                    fmAppend
+                  ):
+                  try:
+                    profileFile.writeLine(
+                      $profileRecord
+                    )
+                  finally:
+                    profileFile.close()
+                else:
+                  plasticDebugTrace(
+                    "rlm.profiling.write.failed " &
+                    "run=" & rlmRunId &
+                    " path=" & rlmProfilingPath
+                  )
+
+          if rlmProfiling:
+            plasticDebugTrace(
+              "rlm.profiling.start run=" &
+              rlmRunId &
+              " path=" &
+              rlmProfilingPath &
+              " bodies=" &
+              $rlmProfilingBodies
+            )
+
+            rlmProfile(
+              "run.begin",
+              %*{
+                "input":
+                  if rlmProfilingBodies:
+                    input.copy
+                  else:
+                    newJNull(),
+                "maxIterations":
+                  rlmEffectiveMaxIterations,
+                "maxWallMs": rlmMaxWallMs,
+                "repeatToolLimit":
+                  rlmRepeatToolLimit,
+                "repeatGuard":
+                  rlmRepeatGuard,
+                "memoryMode":
+                  application.metisMemoryValue
+                    .config.memoryMode
+              }
+            )
+
+          if rlmTimingDebug:
+            plasticDebugTrace(
+              "rlm.run.begin run=" & rlmRunId &
+              " agent=" & agent.instanceName &
+              " maxIterations=" &
+              $rlmEffectiveMaxIterations &
+              " maxWallMs=" & $rlmMaxWallMs &
+              " repeatToolLimit=" &
+              $rlmRepeatToolLimit
+            )
+
           let memoryQueryText =
             if input.kind == JObject:
               var compact = newJObject()
@@ -11368,8 +18875,11 @@ Mantenha a resposta objetiva e útil para inferência.
               $compact
             else:
               $input
+          let memoryPhaseStartedAt =
+            epochTime()
           let memoryContext =
-            if application.metisMemoryValue.config.memoryMode == "immediate":
+            if plasticMetisUsesExternalServer() or
+                application.metisMemoryValue.config.memoryMode == "immediate":
               application.metisMemoryValue.query(
                 application.llamaValue,
                 agent.metisSession,
@@ -11378,14 +18888,101 @@ Mantenha a resposta objetiva e útil para inferência.
             else:
               "SEM_MEMORIA_RELEVANTE"
 
-          let recentSessionMessages =
-            application.metisMemoryValue.loadSessionMessages(agent.metisSession)
+          let memoryElapsedMs =
+            (epochTime() - memoryPhaseStartedAt) * 1000.0
+
+          if rlmTimingDebug:
+            plasticDebugTrace(
+              "rlm.phase.memory run=" & rlmRunId &
+              " elapsedMs=" &
+              $memoryElapsedMs &
+              " chars=" & $memoryContext.len &
+              " mode=" &
+              application.metisMemoryValue.config.memoryMode
+            )
+
+          rlmProfile(
+            "context.memory",
+            %*{
+              "elapsedMs": memoryElapsedMs,
+              "query":
+                if rlmProfilingBodies:
+                  memoryQueryText
+                else:
+                  "",
+              "context":
+                if rlmProfilingBodies:
+                  memoryContext
+                else:
+                  "",
+              "contextChars":
+                memoryContext.len,
+              "mode":
+                application.metisMemoryValue
+                  .config.memoryMode
+            }
+          )
+
+          let sessionPhaseStartedAt =
+            epochTime()
+
+          var historyContext = newJArray()
+
+          if input.kind == JObject and
+              input.hasKey("assistantContext") and
+              input["assistantContext"].kind == JArray:
+            for message in input["assistantContext"].items:
+              historyContext.add message.copy
+
+          let currentRequestText =
+            plasticRlmInputText(input)
+
+          # O pedido atual já existe em request; remova a cópia final do
+          # assistantContext para evitar duplicação.
+          if historyContext.len > 0 and currentRequestText.len > 0:
+            let lastMessage =
+              historyContext[historyContext.len - 1]
+            if lastMessage.kind == JObject and
+                `jsonStringFieldSym`(lastMessage, "role") == "user" and
+                `jsonStringFieldSym`(lastMessage, "content").strip ==
+                  currentRequestText:
+              var deduplicated = newJArray()
+              for index in 0 ..< historyContext.len - 1:
+                deduplicated.add historyContext[index].copy
+              historyContext = deduplicated
+
+          let sessionElapsedMs =
+            (epochTime() - sessionPhaseStartedAt) * 1000.0
+
+          if rlmTimingDebug:
+            plasticDebugTrace(
+              "rlm.phase.session run=" & rlmRunId &
+              " elapsedMs=" & $sessionElapsedMs &
+              " messages=" & $historyContext.len &
+              " source=assistantContext"
+            )
+
+          rlmProfile(
+            "context.session",
+            %*{
+              "elapsedMs": sessionElapsedMs,
+              "source": "assistantContext",
+              "deduplicated": true,
+              "messageCount": historyContext.len,
+              "messages":
+                if rlmProfilingBodies:
+                  historyContext.copy
+                else:
+                  newJArray()
+            }
+          )
 
           var promptInput = input.copy
           var promptStates = application.statesValue.snapshot()
 
           if input.kind == JObject:
             promptInput = newJObject()
+            # assistantContext existe somente em history.
             for key in [
               "hook",
               "entity",
@@ -11393,6 +18990,7 @@ Mantenha a resposta objetiva e útil para inferência.
               "event",
               "message",
               "query",
+              "session",
               "into"
             ]:
               if input.hasKey(key):
@@ -11422,29 +19020,200 @@ Mantenha a resposta objetiva e útil para inferência.
                 promptStates[promptEntity] =
                   completeStates[promptEntity].copy
 
-          for iteration in 0 ..< agent.maxIterations:
-            var messages = newJArray()
-            messages.add %*{"role": "system", "content": buildAgentSystemPrompt(agent)}
-            if recentSessionMessages.kind == JArray:
-              let firstRecent = max(
-                0,
-                recentSessionMessages.len -
-                  application.metisMemoryValue.config.recentMessages
+          agent.sessionVariables["lastObservation"] = newJNull()
+
+          var toolResults = newJArray()
+
+          for iteration in 0 ..< rlmEffectiveMaxIterations:
+            if rlmMaxWallMs > 0 and
+                rlmElapsedMs() > rlmMaxWallMs.float:
+              plasticDebugTrace(
+                "rlm.guard.wall-time run=" & rlmRunId &
+                " iteration=" & $iteration &
+                " elapsedMs=" & $rlmElapsedMs() &
+                " limitMs=" & $rlmMaxWallMs
               )
-              for index in firstRecent ..< recentSessionMessages.len:
-                let message = recentSessionMessages[index]
-                if message.kind == JObject and
-                    message.hasKey("role") and message.hasKey("content"):
-                  messages.add message.copy
+              raise newException(
+                PlasticAgentError,
+                "RLM excedeu o tempo máximo configurado de " &
+                $rlmMaxWallMs & " ms."
+              )
+
+            let iterationStartedAt =
+              epochTime()
+
+            if rlmTimingDebug:
+              plasticDebugTrace(
+                "rlm.iteration.begin run=" & rlmRunId &
+                " iteration=" & $iteration &
+                " toolResults=" & $toolResults.len &
+                " elapsedMs=" & $rlmElapsedMs()
+              )
+
+            rlmProfile(
+              "iteration.begin",
+              %*{
+                "iteration": iteration,
+                "toolResultCount": toolResults.len,
+                "toolResults":
+                  if rlmProfilingBodies:
+                    toolResults.copy
+                  else:
+                    newJArray(),
+                "states":
+                  if rlmProfilingBodies:
+                    promptStates.copy
+                  else:
+                    newJObject(),
+                "variables":
+                  if rlmProfilingBodies:
+                    block:
+                      var profileVariables =
+                        newJObject()
+
+                      for variableName, variableValue in
+                          agent.sessionVariables.pairs:
+                        profileVariables[variableName] =
+                          variableValue.copy
+
+                      profileVariables
+                  else:
+                    newJObject()
+              }
+            )
+
+            # Ambiente atual é reconstruído antes de cada inferência.
+            promptStates = application.statesValue.snapshot()
+
+            if input.kind == JObject and
+                input.hasKey("entity") and
+                input["entity"].kind == JString and
+                promptStates.kind == JObject:
+              let promptEntity = input["entity"].getStr
+              if promptStates.hasKey(promptEntity):
+                let completeStates = promptStates
+                promptStates = newJObject()
+                promptStates[promptEntity] =
+                  completeStates[promptEntity].copy
+
+            var requestValue = promptInput.copy
+            requestValue["currentText"] =
+              %plasticRlmInputText(promptInput)
+            requestValue["requiresAction"] =
+              %plasticRlmInputRequiresAction(promptInput)
+
+            var runtimeValue = newJObject()
+            runtimeValue["iteration"] = %iteration
+            runtimeValue["mustReturnAnswer"] =
+              %(toolResults.len > 0)
+            runtimeValue["hasObservation"] =
+              %(toolResults.len > 0)
+
+            var agentValue = newJObject()
+            agentValue["constructor"] = %agent.constructorName
+            agentValue["instance"] = %agent.instanceName
+            agentValue["memory"] = %agent.memoryName
+            agentValue["metisSession"] = %agent.metisSession
+            agentValue["purpose"] = %agent.purpose
+            agentValue["domain"] = agent.domainPlan.copy
+            agentValue["conditions"] = %agent.rlmConditions
+            agentValue["properties"] =
+              agent.agentPropertiesJson()
+
+            var knowledgeValue = newJObject()
+            knowledgeValue["principal"] =
+              %agent.okfPrincipalName
+            knowledgeValue["path"] = %agent.okfPath
+            if not agent.okfValue.isNil:
+              knowledgeValue["spaces"] =
+                agent.okfValue.spaces.copy
+            else:
+              knowledgeValue["spaces"] =
+                agent.application.okfValue.spaces.copy
+            knowledgeValue["access"] =
+              %"Leituras okf.* retornam interpretação do LLM junto do dado bruto."
+            knowledgeValue["consultationGuide"] =
+              %plasticOkfConsultationSkillText()
+            knowledgeValue["generationGuide"] =
+              %plasticOkfGenerationSkillText()
+
+            var environmentValue = newJObject()
+            environmentValue["agent"] =
+              plasticRlmDeclaredVariable(
+                "Identidade, propósito, domínio, condições e propriedades do agente.",
+                agentValue
+              )
+            environmentValue["capabilities"] =
+              plasticRlmDeclaredVariable(
+                "Catálogo único e fechado. Use id literalmente em instructions[].capability.",
+                compactAgentToolManifest(agent)
+              )
+            environmentValue["states"] =
+              plasticRlmDeclaredVariable(
+                "Snapshot do estado atual nesta iteração.",
+                promptStates
+              )
+            environmentValue["webcontents"] =
+              plasticRlmDeclaredVariable(
+                "WebContents e URLs observados agora pelo runtime; prevalecem sobre histórico.",
+                agent.application.foreignValue.list()
+              )
+            environmentValue["knowledge"] =
+              plasticRlmDeclaredVariable(
+                "Recursos OKF e regras de consulta/produção; use somente quando pertinentes.",
+                knowledgeValue
+              )
+
+            var rlmVariables = newJObject()
+
+            # Ordem intencional: ambiente antes de memória e histórico.
+            rlmVariables["request"] =
+              plasticRlmDeclaredVariable(
+                "Pedido atual. requiresAction é calculado pelo runtime e é autoritativo para exigir execução.",
+                requestValue
+              )
+            rlmVariables["runtime"] =
+              plasticRlmDeclaredVariable(
+                "Estado do ciclo RLM. mustReturnAnswer=true indica que já existe observation.",
+                runtimeValue
+              )
+            rlmVariables["environment"] =
+              plasticRlmDeclaredVariable(
+                "Ambiente RLM atual. Consulte antes de memory e history.",
+                environmentValue
+              )
+            rlmVariables["observations"] =
+              plasticRlmDeclaredVariable(
+                "Resultados reais de capabilities nesta execução; são a evidência primária.",
+                toolResults
+              )
+            rlmVariables["workingVariables"] =
+              plasticRlmDeclaredVariable(
+                "Variáveis de trabalho do RLM. lastObservation=null significa ausência de confirmação operacional anterior.",
+                plasticRlmSessionVariablesJson(agent)
+              )
+            rlmVariables["memory"] =
+              plasticRlmDeclaredVariable(
+                "Memória persistente recuperada. Orienta decisões, mas nunca prova execução atual.",
+                %memoryContext
+              )
+            rlmVariables["history"] =
+              plasticRlmDeclaredVariable(
+                "Contexto histórico secundário. Leia por último; respostas anteriores não são exemplos de política RLM nem prova do estado atual.",
+                historyContext
+              )
+
+            var rlmEnvelope = newJObject()
+            rlmEnvelope["variables"] = rlmVariables
+
+            var messages = newJArray()
+            messages.add %*{
+              "role": "system",
+              "content": buildAgentSystemPrompt(agent)
+            }
             messages.add %*{
               "role": "user",
-              "content": $(%*{
-                "input": promptInput,
-                "iteration": iteration,
-                "states": promptStates,
-                "metisMemory": memoryContext,
-                "variables": agent.sessionVariables
-              })
+              "content": $rlmEnvelope
             }
 
             let llmDebug =
@@ -11480,7 +19249,7 @@ Mantenha a resposta objetiva e útil para inferência.
                 parseInt(
                   getEnv(
                     "GLAUCOPLASTIC_RLM_RESPONSE_ATTEMPTS",
-                    "2"
+                    "3"
                   )
                 )
               )
@@ -11491,37 +19260,159 @@ Mantenha a resposta objetiva e útil para inferência.
 
             var program = newJNull()
             var lastResponseError = ""
+            var lastRawAssistantContent = ""
 
             for responseAttempt in 0 ..< maxAttempts:
               var requestMessages = messages.copy
               if responseAttempt > 0:
+                let previousAssistantContent =
+                  if lastRawAssistantContent.strip.len > 0:
+                    lastRawAssistantContent
+                  else:
+                    "{}"
+                requestMessages.add %*{
+                  "role": "assistant",
+                  "content": previousAssistantContent
+                }
                 requestMessages.add %*{
                   "role": "user",
                   "content":
-                    "A resposta anterior ficou vazia ou inválida. " &
-                    "Responda agora somente com um objeto JSON completo no " &
-                    "protocolo RLM, sem markdown e sem texto externo."
+                    "SAÍDA RLM ANTERIOR REJEITADA: " &
+                    lastResponseError & "\n" &
+                    "Retorne SOMENTE um objeto JSON com instructions e answer; " &
+                    "nenhum texto antes de { ou depois de }. Releia primeiro " &
+                    "rlm.variables.request, runtime e environment. Só depois " &
+                    "consulte memory e history. Se request.value.requiresAction " &
+                    "for true e ainda não houver observation suficiente, use " &
+                    "ao menos uma capability literal do catálogo " &
+                    "environment.value.capabilities.value e answer=null. " &
+                    "Histórico nunca comprova execução atual."
                 }
 
-              let response = application.llamaValue.chat(
-                requestMessages,
-                %*{"type": "json_object"},
+              var requestChars = 0
+              for requestMessage in requestMessages.items:
+                if requestMessage.kind == JObject and
+                    requestMessage.hasKey("content") and
+                    requestMessage["content"].kind == JString:
+                  requestChars +=
+                    requestMessage["content"].getStr.len
+
+              let inferenceStartedAt =
+                epochTime()
+              let inferenceMaxTokens =
                 min(
                   2048,
                   baseRlmTokens * (responseAttempt + 1)
-                ),
-                if getEnv(
-                    "GLAUCOPLASTIC_RLM_ENABLE_THINKING",
-                    "0"
-                  ).strip.toLowerAscii in
-                    ["1", "true", "yes", "on", "enabled"]:
-                  1
-                else:
-                  0
+                )
+              let inferenceThinking =
+                getEnv(
+                  "GLAUCOPLASTIC_RLM_ENABLE_THINKING",
+                  "0"
+                ).strip.toLowerAscii in
+                  ["1", "true", "yes", "on", "enabled"]
+
+              if rlmTimingDebug:
+                plasticDebugTrace(
+                  "rlm.inference.begin run=" & rlmRunId &
+                  " iteration=" & $iteration &
+                  " attempt=" & $responseAttempt &
+                  " messages=" & $requestMessages.len &
+                  " chars=" & $requestChars &
+                  " maxTokens=" &
+                  $inferenceMaxTokens &
+                  " elapsedMs=" & $rlmElapsedMs()
+                )
+
+              rlmProfile(
+                "inference.request",
+                %*{
+                  "iteration": iteration,
+                  "attempt": responseAttempt,
+                  "messageCount":
+                    requestMessages.len,
+                  "chars": requestChars,
+                  "maxTokens":
+                    inferenceMaxTokens,
+                  "thinking":
+                    inferenceThinking,
+                  "responseFormat":
+                    %*{"type": "json_object"},
+                  "messages":
+                    if rlmProfilingBodies:
+                      requestMessages.copy
+                    else:
+                      newJArray()
+                }
+              )
+
+              var response: JsonNode
+
+              try:
+                response =
+                  application.llamaValue.chat(
+                    requestMessages,
+                    %*{"type": "json_object"},
+                    inferenceMaxTokens,
+                    if inferenceThinking:
+                      1
+                    else:
+                      0
+                  )
+              except CatchableError as inferenceError:
+                rlmProfile(
+                  "inference.error",
+                  %*{
+                    "iteration": iteration,
+                    "attempt": responseAttempt,
+                    "error": inferenceError.msg,
+                    "elapsedMs":
+                      (
+                        epochTime() -
+                        inferenceStartedAt
+                      ) * 1000.0
+                  }
+                )
+                raise
+
+              let inferenceElapsedMs =
+                (epochTime() - inferenceStartedAt) * 1000.0
+              inc rlmInferenceCalls
+              rlmInferenceMs += inferenceElapsedMs
+
+              if rlmTimingDebug:
+                plasticDebugTrace(
+                  "rlm.inference.done run=" & rlmRunId &
+                  " iteration=" & $iteration &
+                  " attempt=" & $responseAttempt &
+                  " elapsedMs=" & $inferenceElapsedMs &
+                  " inferenceCalls=" &
+                  $rlmInferenceCalls &
+                  " inferenceTotalMs=" &
+                  $rlmInferenceMs
+                )
+
+              rlmProfile(
+                "inference.response",
+                %*{
+                  "iteration": iteration,
+                  "attempt": responseAttempt,
+                  "elapsedMs":
+                    inferenceElapsedMs,
+                  "inferenceCall":
+                    rlmInferenceCalls,
+                  "inferenceTotalMs":
+                    rlmInferenceMs,
+                  "response":
+                    if rlmProfilingBodies:
+                      response.copy
+                    else:
+                      newJNull()
+                }
               )
 
               try:
                 let content = assistantContent(response)
+                lastRawAssistantContent = content
                 if logRlmResponse:
                   plasticDebugTrace(
                     "rlm.content agent=" & agent.instanceName &
@@ -11531,6 +19422,28 @@ Mantenha a resposta objetiva e útil para inferência.
                   )
 
                 let jsonPayload = extractRlmJsonPayload(content)
+
+                rlmProfile(
+                  "inference.content",
+                  %*{
+                    "iteration": iteration,
+                    "attempt": responseAttempt,
+                    "content":
+                      if rlmProfilingBodies:
+                        content
+                      else:
+                        "",
+                    "contentChars": content.len,
+                    "normalized":
+                      if rlmProfilingBodies:
+                        jsonPayload
+                      else:
+                        "",
+                    "normalizedChars":
+                      jsonPayload.len
+                  }
+                )
+
                 if logRlmResponse and
                     jsonPayload != content.strip:
                   plasticDebugTrace(
@@ -11547,10 +19460,82 @@ Mantenha a resposta objetiva e útil para inferência.
                     "RLM retornou conteúdo vazio."
                   )
 
-                program = parseJson(jsonPayload)
+                let candidateProgram = parseJson(jsonPayload)
+                let validationError =
+                  validateRlmProgramCapabilities(
+                    agent,
+                    candidateProgram,
+                    promptInput
+                  )
+                if validationError.len > 0:
+                  raise newException(
+                    PlasticAgentError,
+                    validationError
+                  )
+
+                let candidateInstructionCount =
+                  if candidateProgram.hasKey("instructions") and
+                      candidateProgram["instructions"].kind == JArray:
+                    candidateProgram["instructions"].len
+                  else:
+                    0
+                let candidateAnswerChars =
+                  if candidateProgram.hasKey("answer") and
+                      candidateProgram["answer"].kind == JString:
+                    candidateProgram["answer"].getStr.len
+                  else:
+                    0
+
+                if rlmTimingDebug:
+                  plasticDebugTrace(
+                    "rlm.program.accepted run=" &
+                    rlmRunId &
+                    " iteration=" & $iteration &
+                    " attempt=" & $responseAttempt &
+                    " instructions=" &
+                    $candidateInstructionCount &
+                    " answerChars=" &
+                    $candidateAnswerChars &
+                    " elapsedMs=" &
+                    $rlmElapsedMs()
+                  )
+
+                rlmProfile(
+                  "program.accepted",
+                  %*{
+                    "iteration": iteration,
+                    "attempt": responseAttempt,
+                    "instructionCount":
+                      candidateInstructionCount,
+                    "answerChars":
+                      candidateAnswerChars,
+                    "program":
+                      if rlmProfilingBodies:
+                        candidateProgram.copy
+                      else:
+                        newJObject()
+                  }
+                )
+
+                program = candidateProgram
                 break
               except CatchableError as error:
                 lastResponseError = error.msg
+
+                rlmProfile(
+                  "program.rejected",
+                  %*{
+                    "iteration": iteration,
+                    "attempt": responseAttempt,
+                    "error": error.msg,
+                    "rawContent":
+                      if rlmProfilingBodies:
+                        lastRawAssistantContent
+                      else:
+                        ""
+                  }
+                )
+
                 plasticDebugTrace(
                   "rlm.response.retry agent=" &
                   agent.instanceName &
@@ -11569,54 +19554,471 @@ Mantenha a resposta objetiva e útil para inferência.
 
             let writesBeforeIteration =
               agent.stateWriteCount
+            var executedInstructions = 0
 
-            if program.hasKey("instructions") and program["instructions"].kind == JArray:
+            if program.hasKey("instructions") and
+                program["instructions"].kind == JArray:
               for instruction in program["instructions"].items:
-                let capabilityName = `jsonStringFieldSym`(instruction, "capability")
-                let arguments = if instruction.hasKey("arguments"): instruction["arguments"] else: newJObject()
+                inc executedInstructions
+
+                let capabilityName =
+                  `jsonStringFieldSym`(instruction, "capability")
+                let arguments =
+                  if instruction.hasKey("arguments"):
+                    instruction["arguments"]
+                  else:
+                    newJObject()
+
                 if llmDebug:
                   plasticDebugTrace(
                     "rlm.invoke agent=" & agent.instanceName &
                     " capability=" & capabilityName &
                     " arguments=" & $arguments
                   )
-                let value = application.rlmValue.invoke(agent, capabilityName, arguments)
+
+                let invocationKey =
+                  capabilityName & "|" & $arguments
+                let invocationCount =
+                  rlmInvocationCounts.getOrDefault(
+                    invocationKey,
+                    0
+                  ) + 1
+                rlmInvocationCounts[
+                  invocationKey
+                ] = invocationCount
+
+                if rlmRepeatGuard and
+                    invocationCount > rlmRepeatToolLimit:
+                  plasticDebugTrace(
+                    "rlm.guard.repeat-tool run=" &
+                    rlmRunId &
+                    " iteration=" & $iteration &
+                    " capability=" & capabilityName &
+                    " count=" & $invocationCount &
+                    " arguments=" & $arguments
+                  )
+                  raise newException(
+                    PlasticAgentError,
+                    "RLM repetiu a mesma capability com os " &
+                    "mesmos argumentos mais de " &
+                    $rlmRepeatToolLimit & " vez(es): " &
+                    capabilityName
+                  )
+
+                let capabilityStartedAt =
+                  epochTime()
+
+                rlmProfile(
+                  "capability.begin",
+                  %*{
+                    "iteration": iteration,
+                    "capability":
+                      capabilityName,
+                    "arguments":
+                      if rlmProfilingBodies:
+                        arguments.copy
+                      else:
+                        newJObject(),
+                    "repeat":
+                      invocationCount
+                  }
+                )
+
+                var value: JsonNode
+
+                try:
+                  value =
+                    application.rlmValue.invoke(
+                      agent,
+                      capabilityName,
+                      arguments
+                    )
+                except CatchableError as capabilityError:
+                  rlmProfile(
+                    "capability.error",
+                    %*{
+                      "iteration": iteration,
+                      "capability":
+                        capabilityName,
+                      "arguments":
+                        if rlmProfilingBodies:
+                          arguments.copy
+                        else:
+                          newJObject(),
+                      "repeat":
+                        invocationCount,
+                      "elapsedMs":
+                        (
+                          epochTime() -
+                          capabilityStartedAt
+                        ) * 1000.0,
+                      "error":
+                        capabilityError.msg
+                    }
+                  )
+                  raise
+
+                let capabilityElapsedMs =
+                  (epochTime() - capabilityStartedAt) * 1000.0
+                inc rlmCapabilityCalls
+                rlmCapabilityMs +=
+                  capabilityElapsedMs
+
+                if rlmTimingDebug:
+                  plasticDebugTrace(
+                    "rlm.capability.done run=" &
+                    rlmRunId &
+                    " iteration=" & $iteration &
+                    " capability=" & capabilityName &
+                    " repeat=" & $invocationCount &
+                    " elapsedMs=" &
+                    $capabilityElapsedMs &
+                    " totalCapabilityMs=" &
+                    $rlmCapabilityMs
+                  )
+
+                rlmProfile(
+                  "capability.done",
+                  %*{
+                    "iteration": iteration,
+                    "capability":
+                      capabilityName,
+                    "arguments":
+                      if rlmProfilingBodies:
+                        arguments.copy
+                      else:
+                        newJObject(),
+                    "result":
+                      if rlmProfilingBodies:
+                        value.copy
+                      else:
+                        newJNull(),
+                    "repeat":
+                      invocationCount,
+                    "elapsedMs":
+                      capabilityElapsedMs,
+                    "capabilityCall":
+                      rlmCapabilityCalls,
+                    "capabilityTotalMs":
+                      rlmCapabilityMs
+                  }
+                )
+
                 if llmDebug:
                   plasticDebugTrace(
                     "rlm.invoke.result agent=" & agent.instanceName &
                     " capability=" & capabilityName &
                     " value=" & $value
                   )
-                let variableName = `jsonStringFieldSym`(instruction, "assign")
+
+                var observation = newJObject()
+                observation["capability"] = %capabilityName
+                observation["arguments"] = arguments.copy
+                observation["result"] = value.copy
+
+                let variableName =
+                  `jsonStringFieldSym`(instruction, "assign")
                 if variableName.len > 0:
                   agent.sessionVariables[variableName] = value
+                  observation["assign"] = %variableName
 
-            if program.hasKey("answer") and program["answer"].kind != JNull:
-              let answer = program["answer"].copy
-              application.metisMemoryValue.recordExchange(
-                application.llamaValue,
-                agent.metisSession,
-                memoryQueryText,
-                $answer
-              )
-              return answer
+                toolResults.add observation
 
             let appliedWrites =
               agent.stateWriteCount - writesBeforeIteration
+
             if appliedWrites > 0:
-              let applied = %*{
+              var writeSummary = newJObject()
+              writeSummary["capability"] = %"state.write.summary"
+              writeSummary["arguments"] = newJObject()
+              writeSummary["result"] = %*{
                 "ok": true,
                 "writes": appliedWrites
               }
+              toolResults.add writeSummary
+
+            let fastNavigateEnabled =
+              getEnv(
+                "GLAUCOPLASTIC_RLM_FAST_NAVIGATE",
+                "1"
+              ).strip.toLowerAscii notin
+                ["0", "false", "no", "off", "disabled"]
+
+            if fastNavigateEnabled and
+                executedInstructions == 1 and
+                toolResults.len > 0:
+              let lastObservation =
+                toolResults[^1]
+
+              if lastObservation.kind == JObject and
+                  `jsonStringFieldSym`(
+                    lastObservation,
+                    "capability"
+                  ) == "rpa.dom.navigate" and
+                  lastObservation.hasKey("result") and
+                  lastObservation["result"].kind == JObject:
+                let navigationResult =
+                  lastObservation["result"]
+
+                let navigationOk =
+                  navigationResult.hasKey("ok") and
+                  navigationResult["ok"].kind == JBool and
+                  navigationResult["ok"].getBool
+                let navigationReady =
+                  navigationResult.hasKey("ready") and
+                  navigationResult["ready"].kind == JBool and
+                  navigationResult["ready"].getBool
+                let navigationSettled =
+                  navigationReady or
+                  (
+                    navigationResult.hasKey("settled") and
+                    navigationResult["settled"].kind == JBool and
+                    navigationResult["settled"].getBool
+                  )
+
+                if navigationOk and navigationSettled:
+                  let completedUrl =
+                    if navigationResult.hasKey("currentUrl") and
+                        navigationResult["currentUrl"].kind == JString:
+                      navigationResult["currentUrl"].getStr
+                    elif navigationResult.hasKey("url") and
+                        navigationResult["url"].kind == JString:
+                      navigationResult["url"].getStr
+                    else:
+                      ""
+
+                  let answerText =
+                    if completedUrl.len > 0:
+                      "Página aberta: " & completedUrl
+                    else:
+                      "Página aberta."
+
+                  plasticDebugTrace(
+                    "rlm.fast-complete capability=rpa.dom.navigate " &
+                    "run=" & rlmRunId &
+                    " iteration=" & $iteration &
+                    " totalMs=" & $rlmElapsedMs() &
+                    " inferenceCalls=" &
+                    $rlmInferenceCalls &
+                    " url=" & completedUrl
+                  )
+
+                  rlmProfile(
+                    "run.fast-complete",
+                    %*{
+                      "iteration": iteration,
+                      "totalMs":
+                        rlmElapsedMs(),
+                      "inferenceCalls":
+                        rlmInferenceCalls,
+                      "inferenceMs":
+                        rlmInferenceMs,
+                      "capabilityCalls":
+                        rlmCapabilityCalls,
+                      "capabilityMs":
+                        rlmCapabilityMs,
+                      "answer":
+                        if rlmProfilingBodies:
+                          answerText
+                        else:
+                          "",
+                      "url":
+                        completedUrl
+                    }
+                  )
+
+                  application.metisMemoryValue.recordExchange(
+                    application.llamaValue,
+                    agent.metisSession,
+                    memoryQueryText,
+                    answerText
+                  )
+                  return %answerText
+
+            # Para outras capabilities, a resposta final continua exigindo
+            # feedback do resultado ao modelo.
+            if executedInstructions > 0:
+              if llmDebug:
+                plasticDebugTrace(
+                  "rlm.feedback.required agent=" &
+                  agent.instanceName &
+                  " iteration=" & $iteration &
+                  " toolResults=" & $toolResults.len
+                )
+              let iterationElapsedMs =
+                (epochTime() - iterationStartedAt) * 1000.0
+
+              if rlmTimingDebug:
+                plasticDebugTrace(
+                  "rlm.iteration.feedback run=" &
+                  rlmRunId &
+                  " iteration=" & $iteration &
+                  " iterationMs=" &
+                  $iterationElapsedMs &
+                  " totalMs=" & $rlmElapsedMs() &
+                  " toolResults=" & $toolResults.len
+                )
+
+              rlmProfile(
+                "iteration.feedback",
+                %*{
+                  "iteration": iteration,
+                  "iterationMs":
+                    iterationElapsedMs,
+                  "toolResultCount":
+                    toolResults.len,
+                  "toolResults":
+                    if rlmProfilingBodies:
+                      toolResults.copy
+                    else:
+                      newJArray()
+                }
+              )
+
+              continue
+
+            if program.hasKey("answer") and
+                program["answer"].kind == JString:
+              let answerText = program["answer"].getStr.strip
+              if answerText.len == 0:
+                raise newException(
+                  PlasticAgentError,
+                  "RLM produziu resposta final vazia."
+                )
+
+              if rlmTimingDebug:
+                plasticDebugTrace(
+                  "rlm.run.done run=" & rlmRunId &
+                  " iteration=" & $iteration &
+                  " totalMs=" & $rlmElapsedMs() &
+                  " inferenceCalls=" &
+                  $rlmInferenceCalls &
+                  " inferenceMs=" &
+                  $rlmInferenceMs &
+                  " capabilityCalls=" &
+                  $rlmCapabilityCalls &
+                  " capabilityMs=" &
+                  $rlmCapabilityMs &
+                  " answerChars=" &
+                  $answerText.len
+                )
+
+              rlmProfile(
+                "run.done",
+                %*{
+                  "iteration": iteration,
+                  "totalMs":
+                    rlmElapsedMs(),
+                  "inferenceCalls":
+                    rlmInferenceCalls,
+                  "inferenceMs":
+                    rlmInferenceMs,
+                  "capabilityCalls":
+                    rlmCapabilityCalls,
+                  "capabilityMs":
+                    rlmCapabilityMs,
+                  "answer":
+                    if rlmProfilingBodies:
+                      answerText
+                    else:
+                      "",
+                  "answerChars":
+                    answerText.len
+                }
+              )
+
               application.metisMemoryValue.recordExchange(
                 application.llamaValue,
                 agent.metisSession,
                 memoryQueryText,
-                $applied
+                answerText
               )
-              return applied
+              return %answerText
 
-          raise newException(PlasticAgentError, "Agente excedeu o limite de iterações RLM")
+          if toolResults.len > 0:
+            let fallbackText =
+              "A ação foi processada, mas o agente não produziu uma " &
+              "confirmação final detalhada. Verifique o resultado na interface."
+            plasticDebugTrace(
+              "rlm.run.fallback run=" & rlmRunId &
+              " totalMs=" & $rlmElapsedMs() &
+              " inferenceCalls=" &
+              $rlmInferenceCalls &
+              " capabilityCalls=" &
+              $rlmCapabilityCalls &
+              " toolResults=" & $toolResults.len
+            )
+
+            rlmProfile(
+              "run.fallback",
+              %*{
+                "totalMs":
+                  rlmElapsedMs(),
+                "inferenceCalls":
+                  rlmInferenceCalls,
+                "inferenceMs":
+                  rlmInferenceMs,
+                "capabilityCalls":
+                  rlmCapabilityCalls,
+                "capabilityMs":
+                  rlmCapabilityMs,
+                "toolResultCount":
+                  toolResults.len,
+                "toolResults":
+                  if rlmProfilingBodies:
+                    toolResults.copy
+                  else:
+                    newJArray(),
+                "answer":
+                  if rlmProfilingBodies:
+                    fallbackText
+                  else:
+                    ""
+              }
+            )
+
+            application.metisMemoryValue.recordExchange(
+              application.llamaValue,
+              agent.metisSession,
+              memoryQueryText,
+              fallbackText
+            )
+            return %fallbackText
+
+          plasticDebugTrace(
+            "rlm.run.limit run=" & rlmRunId &
+            " totalMs=" & $rlmElapsedMs() &
+            " maxIterations=" &
+            $rlmEffectiveMaxIterations &
+            " inferenceCalls=" &
+            $rlmInferenceCalls &
+            " capabilityCalls=" &
+            $rlmCapabilityCalls
+          )
+          rlmProfile(
+            "run.limit",
+            %*{
+              "totalMs":
+                rlmElapsedMs(),
+              "maxIterations":
+                rlmEffectiveMaxIterations,
+              "inferenceCalls":
+                rlmInferenceCalls,
+              "inferenceMs":
+                rlmInferenceMs,
+              "capabilityCalls":
+                rlmCapabilityCalls,
+              "capabilityMs":
+                rlmCapabilityMs,
+              "toolResultCount":
+                toolResults.len
+            }
+          )
+
+          raise newException(
+            PlasticAgentError,
+            "Agente excedeu o limite de iterações RLM sem resposta."
+          )
 
       result.add newCall(ident("appendPlasticPlanSection"), applicationVariable.copyNimTree, newLit($astToPlanJson(section)))
       result.add quote do:
@@ -11628,23 +20030,947 @@ Mantenha a resposta objetiva e útil para inferência.
         deriveAgents(`applicationVariable`)
       continue
 
+    if section.kind in {nnkCall, nnkCommand} and section[0].eqIdent("assistant"):
+      result.add quote do:
+        proc parseAssistantConfig(
+          plan: PlasticPlan;
+          applicationName: string
+        ): PlasticAssistantConfig =
+          result = plasticDefaultAssistantConfig(applicationName)
+          result.enabled = true
+          let assistantSection = findPlanSection(plan, "assistant")
+          if assistantSection.isNone:
+            return
+          for child in planChildren(assistantSection.get):
+            case planName(child)
+            of "enabled":
+              result.enabled = firstLiteralBool(child, result.enabled)
+            of "builtInShell", "builtinShell", "defaultShell", "shell":
+              result.builtInShell = firstLiteralBool(
+                child,
+                result.builtInShell
+              )
+            of "name", "assistantName":
+              result.assistantName = firstLiteralString(
+                child,
+                result.assistantName
+              )
+            of "systemPrompt", "purpose":
+              result.systemPrompt = firstLiteralString(
+                child,
+                result.systemPrompt
+              )
+            of "language":
+              result.language = firstLiteralString(child, result.language)
+            of "voice", "voiceName":
+              result.voiceName = firstLiteralString(child, result.voiceName)
+            of "voiceRecognition", "recognition":
+              result.voiceRecognition = firstLiteralString(
+                child,
+                result.voiceRecognition
+              )
+            of "whisperBinary":
+              result.whisperBinary = firstLiteralString(child, result.whisperBinary)
+            of "whisperModel":
+              result.whisperModel = firstLiteralString(child, result.whisperModel)
+            of "ffmpegBinary":
+              result.ffmpegBinary = firstLiteralString(child, result.ffmpegBinary)
+            of "rlmAgent", "agent":
+              result.rlmAgent = firstLiteralString(child, result.rlmAgent)
+            of "autoSpeak":
+              result.autoSpeak = firstLiteralBool(child, result.autoSpeak)
+            of "autoSendVoice":
+              result.autoSendVoice = firstLiteralBool(
+                child,
+                result.autoSendVoice
+              )
+            of "backgroundLearning", "learn":
+              result.backgroundLearning = firstLiteralBool(
+                child,
+                result.backgroundLearning
+              )
+            of "maxRecentMessages":
+              result.maxRecentMessages = firstLiteralInt(
+                child,
+                result.maxRecentMessages
+              )
+            of "maxMemoryItems":
+              result.maxMemoryItems = firstLiteralInt(
+                child,
+                result.maxMemoryItems
+              )
+            of "responseMaxTokens":
+              result.responseMaxTokens = firstLiteralInt(
+                child,
+                result.responseMaxTokens
+              )
+            of "learningMaxTokens":
+              result.learningMaxTokens = firstLiteralInt(
+                child,
+                result.learningMaxTokens
+              )
+            else:
+              discard
+      result.add newCall(
+        ident("appendPlasticPlanSection"),
+        applicationVariable.copyNimTree,
+        newLit($astToPlanJson(section))
+      )
+      result.add quote do:
+        let assistantConfiguration = parseAssistantConfig(
+          `applicationVariable`.planValue,
+          `applicationNameLiteral`
+        )
+        if `applicationVariable`.assistantValue.isNil:
+          `applicationVariable`.assistantValue = newPlasticAssistantRuntime(
+            `applicationNameLiteral`,
+            `applicationVariable`.installationValue.dataRoot,
+            `applicationVariable`.llamaValue.endpoint,
+            `applicationVariable`.llamaValue.config.modelAlias
+          )
+        `applicationVariable`.assistantValue.config = assistantConfiguration
+        `applicationVariable`.assistantValue.metisMemory =
+          `applicationVariable`.metisMemoryValue
+        `applicationVariable`.llamaValue.metisMemory =
+          `applicationVariable`.metisMemoryValue
+        `applicationVariable`.assistantValue.agentRunner = nil
+        if assistantConfiguration.rlmAgent.len > 0 and
+            `applicationVariable`.agentsValue.hasKey(assistantConfiguration.rlmAgent):
+          let assistantAgent =
+            `applicationVariable`.agentsValue[assistantConfiguration.rlmAgent]
+          `applicationVariable`.assistantValue.agentRunner =
+            proc(input: JsonNode): JsonNode =
+              assistantAgent.run(input)
+        `applicationVariable`.assistantValue.endpoint =
+          `applicationVariable`.llamaValue.endpoint
+        `applicationVariable`.assistantValue.modelAlias =
+          `applicationVariable`.llamaValue.config.modelAlias
+        let assistantApplication = `applicationVariable`
+        `applicationVariable`.uiHandlersValue[PlasticAssistantHandlerId] =
+          proc(event: PlasticUiEvent) =
+            assistantApplication.assistantValue.handleUiEvent(
+              event.identityPath,
+              event.value,
+              event.checked
+            )
+        if assistantConfiguration.enabled:
+          `applicationVariable`.assistantValue.prepare()
+      continue
+
     if section.kind in {nnkCall, nnkCommand} and section[0].eqIdent("render"):
       result.add quote do:
+        # Helper de runtime compartilhado por Linux, Windows, network-web e
+        # headless. Não pertence ao backend GTK.
+        proc plasticEnvEnabled(name: string; fallback = false): bool =
+          let value = getEnv(name).strip.toLowerAscii
+          if value.len == 0:
+            return fallback
+          result = value in ["1", "true", "yes", "on", "enabled"]
+
+        proc plasticUiTrace(message: string) =
+          try:
+            let defaultTracePath =
+              getTempDir() / "glaucoplastic-ui-trace.log"
+            let path = getEnv(
+              "GLAUCOPLASTIC_UI_TRACE_FILE",
+              defaultTracePath
+            )
+            let line = "[" & $epochTime().int64 & "] " & message & "\n"
+            if not fileExists(path):
+              writeFile(path, line)
+            else:
+              var logFile: File
+              if open(logFile, path, fmAppend):
+                defer:
+                  close(logFile)
+                logFile.write(line)
+          except CatchableError:
+            discard
+
+
+        when defined(windows) and not defined(glaucoplasticHeadless):
+          proc reloadWindowsDesktop(
+            desktop: PlasticWindowsDesktopRuntime
+          )
+
+          proc plasticWindowsShellHtml(
+            application: PlasticApplication
+          ): string =
+            let rendered =
+              application
+                .renderApplicationHtml()
+                .replace(
+                  ":host",
+                  "#glaucoplastic-application"
+                )
+
+            let transparentStyle = """
+              <style id="glaucoplastic-webview2-shell">
+                html,
+                body,
+                #app,
+                #root,
+                #glaucoplastic-application,
+                .application-root,
+                .rpa-application,
+                .rpa-shell,
+                .rpa-main,
+                .rpa-stage,
+                .rpa-workspace,
+                #rpa-page-workspace,
+                .rpa-workspace-page,
+                .foreign-viewport,
+                .glauco-foreign,
+                [data-glauco-foreign] {
+                  background: transparent !important;
+                  background-color: transparent !important;
+                }
+
+                html,
+                body {
+                  margin: 0 !important;
+                  width: 100% !important;
+                  height: 100% !important;
+                }
+
+                .glauco-foreign,
+                [data-glauco-foreign] {
+                  opacity: 0 !important;
+                  visibility: hidden !important;
+                  pointer-events: none !important;
+                  border-color: transparent !important;
+                  box-shadow: none !important;
+                }
+              </style>
+            """
+
+            if rendered.contains(
+                "</head>"
+              ):
+              result =
+                rendered.replace(
+                  "</head>",
+                  transparentStyle &
+                  "</head>"
+                )
+            else:
+              result =
+                transparentStyle &
+                rendered
+
+          proc plasticWindowsPayloadNode(
+            node: JsonNode
+          ): JsonNode =
+            if node.isNil:
+              return newJNull()
+
+            if node.kind == JString:
+              try:
+                return parseJson(
+                  node.getStr
+                )
+              except CatchableError:
+                return %node.getStr
+
+            node.copy
+
+          proc applyPlasticWindowsForeignLayoutSnapshot(
+            desktop: PlasticWindowsDesktopRuntime;
+            payload: string
+          ) =
+            if desktop.isNil or
+                desktop.host.isNil or
+                payload.len == 0:
+              return
+
+            var rectangles: JsonNode
+
+            try:
+              rectangles =
+                parseJson(
+                  payload
+                )
+            except CatchableError as error:
+              plasticUiTrace(
+                "webview2.layout invalid=" &
+                error.msg
+              )
+              return
+
+            if rectangles.kind != JArray:
+              return
+
+            var applied = false
+
+            for rectangle in rectangles.items:
+              if rectangle.kind != JObject:
+                continue
+
+              let path =
+                `jsonStringFieldSym`(
+                  rectangle,
+                  "path"
+                )
+
+              if path.len == 0:
+                continue
+
+              if desktop.foreignPath.len > 0 and
+                  path != desktop.foreignPath:
+                continue
+
+              let x =
+                `jsonIntFieldSym`(
+                  rectangle,
+                  "x"
+                )
+              let y =
+                `jsonIntFieldSym`(
+                  rectangle,
+                  "y"
+                )
+              let width =
+                max(
+                  0,
+                  `jsonIntFieldSym`(
+                    rectangle,
+                    "width"
+                  )
+                )
+              let height =
+                max(
+                  0,
+                  `jsonIntFieldSym`(
+                    rectangle,
+                    "height"
+                  )
+                )
+
+              let visible =
+                width > 1 and
+                height > 1
+
+              gpwv2_set_foreign_visible(
+                desktop.host,
+                (
+                  if visible:
+                    1
+                  else:
+                    0
+                ).cint
+              )
+
+              if not visible:
+                gpwv2_set_foreign_input_regions(
+                  desktop.host,
+                  nil,
+                  0
+                )
+                applied = true
+                continue
+
+              gpwv2_set_foreign_bounds(
+                desktop.host,
+                x.cint,
+                y.cint,
+                width.cint,
+                height.cint
+              )
+
+              var holes:
+                seq[PlasticWebView2Rect] =
+                  @[]
+
+              if rectangle.hasKey(
+                  "inputHoles"
+                ) and
+                  rectangle[
+                    "inputHoles"
+                  ].kind == JArray:
+                for hole in
+                    rectangle[
+                      "inputHoles"
+                    ].items:
+                  if hole.kind != JObject:
+                    continue
+
+                  let holeWidth =
+                    max(
+                      0,
+                      `jsonIntFieldSym`(
+                        hole,
+                        "width"
+                      )
+                    )
+                  let holeHeight =
+                    max(
+                      0,
+                      `jsonIntFieldSym`(
+                        hole,
+                        "height"
+                      )
+                    )
+
+                  if holeWidth <= 1 or
+                      holeHeight <= 1:
+                    continue
+
+                  holes.add(
+                    PlasticWebView2Rect(
+                      x:
+                        `jsonIntFieldSym`(
+                          hole,
+                          "x"
+                        ).cint,
+                      y:
+                        `jsonIntFieldSym`(
+                          hole,
+                          "y"
+                        ).cint,
+                      width:
+                        holeWidth.cint,
+                      height:
+                        holeHeight.cint
+                    )
+                  )
+
+              if holes.len == 0:
+                holes.add(
+                  PlasticWebView2Rect(
+                    x: x.cint,
+                    y: y.cint,
+                    width: width.cint,
+                    height: height.cint
+                  )
+                )
+
+              gpwv2_set_foreign_input_regions(
+                desktop.host,
+                unsafeAddr holes[0],
+                holes.len.cint
+              )
+
+              if plasticEnvEnabled(
+                  "GLAUCOPLASTIC_UI_DEBUG"
+                ):
+                plasticUiTrace(
+                  "webview2.layout foreign path=" &
+                  path &
+                  " rect=" &
+                  $x &
+                  "," &
+                  $y &
+                  " " &
+                  $width &
+                  "x" &
+                  $height &
+                  " holes=" &
+                  $holes.len
+                )
+
+              applied = true
+
+            if not applied and
+                desktop.foreignPath.len > 0:
+              gpwv2_set_foreign_visible(
+                desktop.host,
+                0
+              )
+
+          proc onPlasticWindowsWebMessage(
+            surface: cint;
+            messageUtf8: cstring;
+            userData: pointer
+          ) {.cdecl.} =
+            let desktop =
+              cast[
+                PlasticWindowsDesktopRuntime
+              ](
+                userData
+              )
+
+            if desktop.isNil or
+                messageUtf8.isNil:
+              return
+
+            let raw =
+              $messageUtf8
+
+            var envelope: JsonNode
+
+            try:
+              envelope =
+                parseJson(
+                  raw
+                )
+            except CatchableError:
+              return
+
+            if envelope.kind != JObject:
+              return
+
+            let channel =
+              `jsonStringFieldSym`(
+                envelope,
+                "channel"
+              )
+
+            let payload =
+              if envelope.hasKey(
+                  "payload"
+                ):
+                plasticWindowsPayloadNode(
+                  envelope[
+                    "payload"
+                  ]
+                )
+              else:
+                newJNull()
+
+            case channel
+            of "glaucoplasticEvent":
+              if payload.kind == JObject:
+                desktop.application
+                  .dispatchUiEvent(
+                    payload
+                  )
+
+                desktop.reloadWindowsDesktop()
+
+            of "glaucoplasticLayout":
+              let layoutText =
+                if envelope[
+                    "payload"
+                  ].kind == JString:
+                  envelope[
+                    "payload"
+                  ].getStr
+                else:
+                  $payload
+
+              desktop
+                .applyPlasticWindowsForeignLayoutSnapshot(
+                  layoutText
+                )
+
+            else:
+              if plasticEnvEnabled(
+                  "GLAUCOPLASTIC_UI_DEBUG"
+                ):
+                plasticUiTrace(
+                  "webview2.message surface=" &
+                  $surface &
+                  " channel=" &
+                  channel
+                )
+
+          proc onPlasticWindowsSourceChanged(
+            urlUtf8: cstring;
+            userData: pointer
+          ) {.cdecl.} =
+            let desktop =
+              cast[
+                PlasticWindowsDesktopRuntime
+              ](
+                userData
+              )
+
+            if desktop.isNil or
+                urlUtf8.isNil or
+                desktop.foreignPath.len == 0:
+              return
+
+            let url =
+              $urlUtf8
+
+            if desktop.application
+                .foreignValue
+                .elements
+                .hasKey(
+                  desktop.foreignPath
+                ):
+              let element =
+                desktop.application
+                  .foreignValue
+                  .elements[
+                    desktop.foreignPath
+                  ]
+
+              element.currentUrl =
+                url
+              element.status =
+                pfsReady
+
+              desktop.application
+                .foreignValue
+                .notifyUrlChanged(
+                  desktop.foreignPath,
+                  url
+                )
+
+          proc onPlasticWindowsWebView2Log(
+            messageUtf8: cstring;
+            userData: pointer
+          ) {.cdecl.} =
+            discard userData
+
+            if messageUtf8.isNil:
+              return
+
+            plasticUiTrace(
+              "webview2 " &
+              $messageUtf8
+            )
+
+          proc reloadWindowsDesktop(
+            desktop: PlasticWindowsDesktopRuntime
+          ) =
+            if desktop.isNil or
+                desktop.host.isNil:
+              return
+
+            let html =
+              plasticWindowsShellHtml(
+                desktop.application
+              )
+
+            if gpwv2_shell_set_html(
+                desktop.host,
+                html.cstring
+              ) == 0:
+              raise newException(
+                PlasticRuntimeError,
+                "WebView2 não carregou a shell da aplicação."
+              )
+
+            if plasticEnvEnabled(
+                "GLAUCOPLASTIC_UI_DEBUG"
+              ):
+              plasticUiTrace(
+                "webview2.shell.reload htmlLen=" &
+                $html.len
+              )
+
+          proc newWindowsWebView2ForeignBackend(
+            desktop: PlasticWindowsDesktopRuntime
+          ): PlasticForeignBackend =
+            result =
+              PlasticForeignBackend(
+                name:
+                  "webview2-composition"
+              )
+
+            result.create =
+              proc(
+                element:
+                  PlasticForeignElementRuntime
+              ) =
+                if desktop.isNil or
+                    desktop.host.isNil:
+                  raise newException(
+                    PlasticForeignBackendError,
+                    "WebView2 Composition host não inicializado."
+                  )
+
+                if desktop.foreignPath.len > 0 and
+                    desktop.foreignPath != element.path:
+                  raise newException(
+                    PlasticForeignBackendError,
+                    "O backend WebView2 Composition atual aceita " &
+                    "um foreign principal por janela."
+                  )
+
+                desktop.foreignPath =
+                  element.path
+
+                element.nativeHandle =
+                  desktop.host
+                element.nativeContainer =
+                  desktop.host
+                element.desktopOwner =
+                  cast[pointer](
+                    desktop
+                  )
+                element.status =
+                  pfsIdle
+
+            result.navigate =
+              proc(
+                element:
+                  PlasticForeignElementRuntime;
+                url: string
+              ) =
+                let normalized =
+                  normalizedForeignUrl(
+                    url
+                  )
+
+                element.status =
+                  pfsNavigating
+                element.url =
+                  normalized
+
+                if gpwv2_foreign_navigate(
+                    desktop.host,
+                    normalized.cstring
+                  ) == 0:
+                  element.status =
+                    pfsFailed
+
+                  raise newException(
+                    PlasticForeignBackendError,
+                    "WebView2 falhou ao navegar para " &
+                    normalized
+                  )
+
+            result.evalJs =
+              proc(
+                element:
+                  PlasticForeignElementRuntime;
+                script: string;
+                timeoutMs: int
+              ): JsonNode =
+                discard element
+
+                let nativeResult =
+                  gpwv2_foreign_execute_sync(
+                    desktop.host,
+                    script.cstring,
+                    max(
+                      100,
+                      timeoutMs
+                    ).cint
+                  )
+
+                if nativeResult.isNil:
+                  raise newException(
+                    PlasticForeignBackendError,
+                    "WebView2 não retornou resultado JavaScript."
+                  )
+
+                let output =
+                  $nativeResult
+
+                gpwv2_free_string(
+                  nativeResult
+                )
+
+                if output.len == 0:
+                  return newJNull()
+
+                try:
+                  result =
+                    parseJson(
+                      output
+                    )
+                except CatchableError:
+                  result =
+                    %output
+
+            result.injectDocumentStart =
+              proc(
+                element:
+                  PlasticForeignElementRuntime;
+                script: string
+              ) =
+                discard element
+
+                if gpwv2_foreign_add_document_script(
+                    desktop.host,
+                    script.cstring
+                  ) == 0:
+                  raise newException(
+                    PlasticForeignBackendError,
+                    "WebView2 não registrou script document-start."
+                  )
+
+            result.applyLayoutSnapshot =
+              proc(
+                element:
+                  PlasticForeignElementRuntime;
+                payload: string
+              ) =
+                discard element
+
+                desktop
+                  .applyPlasticWindowsForeignLayoutSnapshot(
+                    payload
+                  )
+
+            result.close =
+              proc(
+                element:
+                  PlasticForeignElementRuntime
+              ) =
+                gpwv2_set_foreign_visible(
+                  desktop.host,
+                  0
+                )
+
+                element.status =
+                  pfsClosed
+
+          proc openWindowsDesktop(
+            application: PlasticApplication;
+            autoStartModel: bool
+          ) =
+            discard autoStartModel
+
+            application
+              .webViewValue
+              .prepareStorage()
+
+            let desktop =
+              PlasticWindowsDesktopRuntime(
+                application:
+                  application,
+                host:
+                  nil,
+                foreignPath:
+                  "",
+                width:
+                  max(
+                    960,
+                    parseInt(
+                      getEnv(
+                        "GLAUCOPLASTIC_WINDOWS_WIDTH",
+                        "1440"
+                      )
+                    )
+                  ),
+                height:
+                  max(
+                    640,
+                    parseInt(
+                      getEnv(
+                        "GLAUCOPLASTIC_WINDOWS_HEIGHT",
+                        "900"
+                      )
+                    )
+                  ),
+                running:
+                  true
+              )
+
+            application.desktopValue =
+              desktop
+
+            desktop.host =
+              gpwv2_create(
+                application
+                  .productValue
+                  .title
+                  .cstring,
+                application
+                  .webViewValue
+                  .userFolder
+                  .cstring,
+                desktop.width.cint,
+                desktop.height.cint,
+                onPlasticWindowsWebMessage,
+                onPlasticWindowsSourceChanged,
+                onPlasticWindowsWebView2Log,
+                cast[pointer](
+                  desktop
+                )
+              )
+
+            if desktop.host.isNil:
+              raise newException(
+                PlasticRuntimeError,
+                "Não foi possível criar a janela WebView2 Composition."
+              )
+
+            if gpwv2_wait_ready(
+                desktop.host,
+                60_000
+              ) == 0:
+              gpwv2_destroy(
+                desktop.host
+              )
+              desktop.host =
+                nil
+
+              raise newException(
+                PlasticRuntimeError,
+                "WebView2 Composition não ficou pronto em 60 segundos."
+              )
+
+            application
+              .webViewValue
+              .initialized =
+                true
+
+            application
+              .foreignValue
+              .registerBackend(
+                newWindowsWebView2ForeignBackend(
+                  desktop
+                )
+              )
+
+            if not plasticEnvEnabled(
+                "GLAUCOPLASTIC_DISABLE_STARTUP_PROGRAM"
+              ):
+              application.executeProgram()
+
+            for path in
+                application
+                  .foreignValue
+                  .elements
+                  .keys
+                  .toSeq:
+              application
+                .foreignValue
+                .create(
+                  path
+                )
+
+            desktop.reloadWindowsDesktop()
+
+            gpwv2_present(
+              desktop.host
+            )
+
+            plasticUiTrace(
+              "webview2.composition entering-message-loop"
+            )
+
+            discard gpwv2_run(
+              desktop.host
+            )
+
+            plasticUiTrace(
+              "webview2.composition message-loop-exited"
+            )
+
+            application
+              .webViewValue
+              .initialized =
+                false
+
+            gpwv2_destroy(
+              desktop.host
+            )
+
+            desktop.host =
+              nil
+            desktop.running =
+              false
+
         when defined(linux):
           const
             PlasticGtkLib = "libgtk-3.so(|.0)"
+            PlasticCairoLib = "libcairo.so(|.2)"
+            PlasticGdkLib = "libgdk-3.so(|.0)"
             PlasticGObjectLib = "libgobject-2.0.so(|.0)"
             PlasticGLibLib = "libglib-2.0.so(|.0)"
             PlasticWebKitLib = "libwebkit2gtk-4.1.so(|.0)"
             PlasticJavaScriptCoreLib = "libjavascriptcoregtk-4.1.so(|.0)"
 
           var plasticPendingJsRequests: seq[PlasticJsEvalRequest]
-
-          proc plasticEnvEnabled(name: string; fallback = false): bool =
-            let value = getEnv(name).strip.toLowerAscii
-            if value.len == 0:
-              return fallback
-            result = value in ["1", "true", "yes", "on", "enabled"]
+          var plasticPendingJsRequestsLock: Lock
+          initLock(plasticPendingJsRequestsLock)
 
           proc plasticEnvInt(name: string; fallback: int): int =
             let value = getEnv(name).strip
@@ -11662,24 +20988,6 @@ Mantenha a resposta objetiva e útil para inferência.
               ]:
                 return
 
-              let path = getEnv(
-                "GLAUCOPLASTIC_UI_TRACE_FILE",
-                "/tmp/glaucoplastic-ui-trace.log"
-              )
-              let line = "[" & $epochTime().int64 & "] " & message & "\n"
-              if not fileExists(path):
-                writeFile(path, line)
-              else:
-                var logFile: File
-                if open(logFile, path, fmAppend):
-                  defer:
-                    close(logFile)
-                  logFile.write(line)
-            except CatchableError:
-              discard
-
-          proc plasticUiTrace(message: string) =
-            try:
               let path = getEnv(
                 "GLAUCOPLASTIC_UI_TRACE_FILE",
                 "/tmp/glaucoplastic-ui-trace.log"
@@ -11993,11 +21301,32 @@ Mantenha a resposta objetiva e útil para inferência.
             {.cdecl, importc, dynlib: PlasticGtkLib.}
           proc gtk_window_set_default_size(window: pointer; width, height: cint)
             {.cdecl, importc, dynlib: PlasticGtkLib.}
+          proc gtk_window_get_screen(window: pointer): pointer
+            {.cdecl, importc, dynlib: PlasticGtkLib.}
+          proc gtk_widget_set_visual(widget, visual: pointer)
+            {.cdecl, importc, dynlib: PlasticGtkLib.}
+          proc gtk_widget_set_app_paintable(
+            widget: pointer;
+            appPaintable: cint
+          )
+            {.cdecl, importc, dynlib: PlasticGtkLib.}
+          proc gdk_screen_get_rgba_visual(screen: pointer): pointer
+            {.cdecl, importc, dynlib: PlasticGdkLib.}
           proc gtk_container_add(container, widget: pointer)
             {.cdecl, importc, dynlib: PlasticGtkLib.}
           proc gtk_overlay_new(): pointer
             {.cdecl, importc, dynlib: PlasticGtkLib.}
           proc gtk_overlay_add_overlay(overlay, widget: pointer)
+            {.cdecl, importc, dynlib: PlasticGtkLib.}
+          proc gtk_overlay_reorder_overlay(
+            overlay, widget: pointer;
+            index: cint
+          )
+            {.cdecl, importc, dynlib: PlasticGtkLib.}
+          proc gtk_overlay_set_overlay_pass_through(
+            overlay, widget: pointer;
+            passThrough: cint
+          )
             {.cdecl, importc, dynlib: PlasticGtkLib.}
           proc gtk_fixed_new(): pointer
             {.cdecl, importc, dynlib: PlasticGtkLib.}
@@ -12036,6 +21365,35 @@ Mantenha a resposta objetiva e útil para inferência.
             {.cdecl, importc, dynlib: PlasticGtkLib.}
           proc gtk_widget_show(widget: pointer)
             {.cdecl, importc, dynlib: PlasticGtkLib.}
+          proc gtk_widget_realize(widget: pointer)
+            {.cdecl, importc, dynlib: PlasticGtkLib.}
+          proc gtk_widget_get_mapped(
+            widget: pointer
+          ): cint
+            {.cdecl, importc, dynlib: PlasticGtkLib.}
+          proc gtk_widget_get_window(widget: pointer): pointer
+            {.cdecl, importc, dynlib: PlasticGtkLib.}
+          proc gdk_window_input_shape_combine_region(
+            window, shapeRegion: pointer;
+            offsetX, offsetY: cint
+          )
+            {.cdecl, importc, dynlib: PlasticGdkLib.}
+          proc gdk_window_shape_combine_region(
+            window, shapeRegion: pointer;
+            offsetX, offsetY: cint
+          )
+            {.cdecl, importc, dynlib: PlasticGdkLib.}
+          proc gdk_window_raise(window: pointer)
+            {.cdecl, importc, dynlib: PlasticGdkLib.}
+          proc gdk_window_restack(
+            window, sibling: pointer;
+            above: cint
+          )
+            {.cdecl, importc, dynlib: PlasticGdkLib.}
+          proc gdk_window_get_parent(
+            window: pointer
+          ): pointer
+            {.cdecl, importc, dynlib: PlasticGdkLib.}
           proc gtk_widget_hide(widget: pointer)
             {.cdecl, importc, dynlib: PlasticGtkLib.}
           proc gtk_label_new(text: cstring): pointer
@@ -12069,6 +21427,71 @@ Mantenha a resposta objetiva e útil para inferência.
             {.cdecl, importc, dynlib: PlasticGtkLib.}
           proc gtk_window_present(window: pointer)
             {.cdecl, importc, dynlib: PlasticGtkLib.}
+          proc gtk_window_set_decorated(window: pointer; setting: cint)
+            {.cdecl, importc, dynlib: PlasticGtkLib.}
+          proc gtk_window_set_transient_for(window, parent: pointer)
+            {.cdecl, importc, dynlib: PlasticGtkLib.}
+          proc gtk_window_set_destroy_with_parent(window: pointer; setting: cint)
+            {.cdecl, importc, dynlib: PlasticGtkLib.}
+          proc gtk_window_set_keep_above(window: pointer; setting: cint)
+            {.cdecl, importc, dynlib: PlasticGtkLib.}
+          proc gtk_window_set_keep_below(window: pointer; setting: cint)
+            {.cdecl, importc, dynlib: PlasticGtkLib.}
+          proc gtk_window_set_skip_taskbar_hint(window: pointer; setting: cint)
+            {.cdecl, importc, dynlib: PlasticGtkLib.}
+          proc gtk_window_set_skip_pager_hint(window: pointer; setting: cint)
+            {.cdecl, importc, dynlib: PlasticGtkLib.}
+          proc gtk_window_set_resizable(window: pointer; setting: cint)
+            {.cdecl, importc, dynlib: PlasticGtkLib.}
+          proc gtk_window_set_accept_focus(window: pointer; setting: cint)
+            {.cdecl, importc, dynlib: PlasticGtkLib.}
+          proc gtk_window_set_focus_on_map(window: pointer; setting: cint)
+            {.cdecl, importc, dynlib: PlasticGtkLib.}
+          proc gtk_window_set_position(window: pointer; position: cint)
+            {.cdecl, importc, dynlib: PlasticGtkLib.}
+          proc gtk_window_set_type_hint(window: pointer; hint: cint)
+            {.cdecl, importc, dynlib: PlasticGtkLib.}
+          proc gtk_window_move(window: pointer; x, y: cint)
+            {.cdecl, importc, dynlib: PlasticGtkLib.}
+          proc gtk_window_resize(window: pointer; width, height: cint)
+            {.cdecl, importc, dynlib: PlasticGtkLib.}
+          proc gtk_window_get_position(window: pointer; x, y: ptr cint)
+            {.cdecl, importc, dynlib: PlasticGtkLib.}
+          proc gdk_window_get_origin(
+            window: pointer;
+            x, y: ptr cint
+          ): cint
+            {.cdecl, importc, dynlib: PlasticGdkLib.}
+          proc gtk_popover_new(relativeTo: pointer): pointer
+            {.cdecl, importc, dynlib: PlasticGtkLib.}
+          proc gtk_popover_set_relative_to(
+            popover, relativeTo: pointer
+          )
+            {.cdecl, importc, dynlib: PlasticGtkLib.}
+          proc gtk_popover_set_pointing_to(
+            popover: pointer;
+            rectangle: ptr PlasticGtkAllocation
+          )
+            {.cdecl, importc, dynlib: PlasticGtkLib.}
+          proc gtk_popover_set_position(
+            popover: pointer;
+            position: cint
+          )
+            {.cdecl, importc, dynlib: PlasticGtkLib.}
+          proc gtk_popover_set_modal(
+            popover: pointer;
+            modal: cint
+          )
+            {.cdecl, importc, dynlib: PlasticGtkLib.}
+          proc gtk_popover_set_constrain_to(
+            popover: pointer;
+            constraint: cint
+          )
+            {.cdecl, importc, dynlib: PlasticGtkLib.}
+          proc gtk_popover_popup(popover: pointer)
+            {.cdecl, importc, dynlib: PlasticGtkLib.}
+          proc gtk_popover_popdown(popover: pointer)
+            {.cdecl, importc, dynlib: PlasticGtkLib.}
           proc gtk_main()
             {.cdecl, importc, dynlib: PlasticGtkLib.}
           proc gtk_main_quit()
@@ -12088,11 +21511,38 @@ Mantenha a resposta objetiva e útil para inferência.
             callback: PlasticGSourceFunc;
             data: pointer
           ): cuint {.cdecl, importc, dynlib: PlasticGLibLib.}
+          proc g_main_context_default(): pointer
+            {.cdecl, importc, dynlib: PlasticGLibLib.}
+          proc g_main_context_is_owner(context: pointer): cint
+            {.cdecl, importc, dynlib: PlasticGLibLib.}
+          proc cairo_region_create_rectangle(
+            rectangle: ptr PlasticCairoRectangleInt
+          ): pointer
+            {.cdecl, importc, dynlib: PlasticCairoLib.}
+          proc cairo_region_create(): pointer
+            {.cdecl, importc, dynlib: PlasticCairoLib.}
+          proc cairo_region_union_rectangle(
+            region: pointer;
+            rectangle: ptr PlasticCairoRectangleInt
+          ): cint
+            {.cdecl, importc, dynlib: PlasticCairoLib.}
+          proc cairo_region_subtract_rectangle(
+            region: pointer;
+            rectangle: ptr PlasticCairoRectangleInt
+          ): cint
+            {.cdecl, importc, dynlib: PlasticCairoLib.}
+          proc cairo_region_destroy(region: pointer)
+            {.cdecl, importc, dynlib: PlasticCairoLib.}
           proc g_main_context_iteration(context: pointer; mayBlock: cint): cint
             {.cdecl, importc, dynlib: PlasticGLibLib.}
           proc g_free(memory: pointer)
             {.cdecl, importc, dynlib: PlasticGLibLib.}
           proc g_object_unref(instance: pointer)
+            {.cdecl, importc, dynlib: PlasticGObjectLib.}
+          proc g_type_check_instance_is_a(
+            instance: pointer;
+            ifaceType: culong
+          ): cint
             {.cdecl, importc, dynlib: PlasticGObjectLib.}
 
           proc webkit_website_data_manager_new(
@@ -12143,7 +21593,16 @@ Mantenha a resposta objetiva e útil para inferência.
             {.cdecl, importc, dynlib: PlasticWebKitLib.}
           proc webkit_web_view_get_uri(webView: pointer): cstring
             {.cdecl, importc, dynlib: PlasticWebKitLib.}
+          proc webkit_policy_decision_ignore(
+            decision: pointer
+          )
+            {.cdecl, importc, dynlib: PlasticWebKitLib.}
           proc webkit_web_view_get_user_content_manager(webView: pointer): pointer
+            {.cdecl, importc, dynlib: PlasticWebKitLib.}
+          proc webkit_web_view_set_background_color(
+            webView: pointer;
+            rgba: ptr PlasticGdkRgba
+          )
             {.cdecl, importc, dynlib: PlasticWebKitLib.}
           proc webkit_web_view_get_settings(webView: pointer): pointer
             {.cdecl, importc, dynlib: PlasticWebKitLib.}
@@ -12151,6 +21610,15 @@ Mantenha a resposta objetiva e útil para inferência.
             settings: pointer;
             enabled: cint
           ) {.cdecl, importc, dynlib: PlasticWebKitLib.}
+          proc webkit_settings_set_hardware_acceleration_policy(
+            settings: pointer;
+            policy: cint
+          ) {.cdecl, importc, dynlib: PlasticWebKitLib.}
+          proc webkit_permission_request_allow(
+            request: pointer
+          ) {.cdecl, importc, dynlib: PlasticWebKitLib.}
+          proc webkit_user_media_permission_request_get_type(): culong
+            {.cdecl, importc, dynlib: PlasticWebKitLib.}
           proc webkit_web_view_get_inspector(webView: pointer): pointer
             {.cdecl, importc, dynlib: PlasticWebKitLib.}
           proc webkit_web_inspector_show(inspector: pointer)
@@ -12199,31 +21667,152 @@ Mantenha a resposta objetiva e útil para inferência.
           proc webkit_javascript_result_unref(result: pointer)
             {.cdecl, importc, dynlib: PlasticWebKitLib.}
 
+          proc plasticRunsOnGtkMainThread(): bool =
+            let context = g_main_context_default()
+            not context.isNil and g_main_context_is_owner(context) != 0
+
+          proc plasticRetainJsRequest(
+            request: PlasticJsEvalRequest
+          ) =
+            if request.isNil:
+              return
+            acquire(plasticPendingJsRequestsLock)
+            try:
+              plasticPendingJsRequests.add request
+            finally:
+              release(plasticPendingJsRequestsLock)
+
+          proc plasticReleaseJsRequest(
+            request: PlasticJsEvalRequest
+          ) =
+            if request.isNil:
+              return
+            acquire(plasticPendingJsRequestsLock)
+            try:
+              if plasticPendingJsRequests.len > 0:
+                for index in countdown(
+                    plasticPendingJsRequests.high,
+                    0
+                  ):
+                  if cast[pointer](
+                      plasticPendingJsRequests[index]
+                    ) == cast[pointer](request):
+                    plasticPendingJsRequests.delete(index)
+                    break
+            finally:
+              release(plasticPendingJsRequestsLock)
+
+          proc plasticJsRequestCompleted(
+            request: PlasticJsEvalRequest
+          ): bool =
+            acquire(request.lock)
+            try:
+              result = request.completed
+            finally:
+              release(request.lock)
+
+          proc plasticFinishJsRequest(
+            request: PlasticJsEvalRequest;
+            failed: bool;
+            text = "";
+            error = ""
+          ): bool =
+            acquire(request.lock)
+            try:
+              if not request.completed:
+                request.failed = failed
+                request.text = text
+                request.error = error
+                request.completed = true
+              result = request.abandoned
+            finally:
+              release(request.lock)
+
+          proc plasticCleanupAbandonedJsRequest(
+            request: PlasticJsEvalRequest;
+            abandoned: bool
+          ) =
+            if request.isNil or not abandoned:
+              return
+            plasticReleaseJsRequest(request)
+            deinitLock(request.lock)
+
           proc onPlasticJsEvaluated(
             sourceObject, asyncResult, userData: pointer
           ) {.cdecl.} =
             let request = cast[PlasticJsEvalRequest](userData)
-            var error: pointer
+            if request.isNil:
+              return
+
+            var nativeError: pointer
             let value = webkit_web_view_evaluate_javascript_finish(
               sourceObject,
               asyncResult,
-              addr error
+              addr nativeError
             )
 
             if value.isNil:
-              request.failed = true
-            else:
-              let text = jsc_value_to_string(value)
-              if not text.isNil:
-                request.text = $text
-                g_free(cast[pointer](text))
-              g_object_unref(value)
+              let abandoned = plasticFinishJsRequest(
+                request,
+                true,
+                error = "WebKitGTK não retornou resultado JavaScript"
+              )
+              plasticCleanupAbandonedJsRequest(request, abandoned)
+              return
 
-            request.completed = true
-            for index, pending in plasticPendingJsRequests:
-              if pending == request:
-                plasticPendingJsRequests.delete(index)
-                break
+            var output = ""
+            let textValue = jsc_value_to_string(value)
+            if not textValue.isNil:
+              output = $textValue
+              g_free(cast[pointer](textValue))
+            g_object_unref(value)
+
+            let abandoned = plasticFinishJsRequest(
+              request,
+              false,
+              output
+            )
+            plasticCleanupAbandonedJsRequest(request, abandoned)
+
+          proc onPlasticJsEvaluateDispatch(data: pointer): cint {.cdecl.} =
+            let request = cast[PlasticJsEvalRequest](data)
+            if request.isNil:
+              return 0
+
+            try:
+              if request.webView.isNil:
+                let abandoned = plasticFinishJsRequest(
+                  request,
+                  true,
+                  error = "WebContents foreign ainda não foi criado"
+                )
+                plasticCleanupAbandonedJsRequest(
+                  request,
+                  abandoned
+                )
+                return 0
+
+              webkit_web_view_evaluate_javascript(
+                request.webView,
+                request.script.cstring,
+                -1,
+                nil,
+                nil,
+                nil,
+                onPlasticJsEvaluated,
+                cast[pointer](request)
+              )
+            except CatchableError as dispatchError:
+              let abandoned = plasticFinishJsRequest(
+                request,
+                true,
+                error = dispatchError.msg
+              )
+              plasticCleanupAbandonedJsRequest(
+                request,
+                abandoned
+              )
+            return 0
 
           proc evaluateNativeJs(
             webView: pointer;
@@ -12233,37 +21822,85 @@ Mantenha a resposta objetiva e útil para inferência.
             if webView.isNil:
               return newJNull()
 
-            let request = PlasticJsEvalRequest()
-            plasticPendingJsRequests.add request
-            webkit_web_view_evaluate_javascript(
-              webView,
-              script.cstring,
-              -1,
-              nil,
-              nil,
-              nil,
-              onPlasticJsEvaluated,
-              cast[pointer](request)
+            let request = PlasticJsEvalRequest(
+              webView: webView,
+              script: script,
+              completed: false,
+              abandoned: false,
+              failed: false,
+              text: "",
+              error: ""
             )
+            initLock(request.lock)
+            plasticRetainJsRequest(request)
 
-            let deadline = epochTime() + timeoutMs.float / 1000.0
-            while not request.completed and epochTime() < deadline:
-              discard g_main_context_iteration(nil, 0)
-              sleep(1)
-
-            if not request.completed:
-              raise newException(
-                PlasticForeignBackendError,
-                "Tempo excedido ao executar JavaScript"
-              )
-
-            if request.failed:
-              return newJNull()
+            var cleanupLocally = false
 
             try:
-              result = parseJson(request.text)
-            except CatchableError:
-              result = %request.text
+              if plasticRunsOnGtkMainThread():
+                discard onPlasticJsEvaluateDispatch(
+                  cast[pointer](request)
+                )
+              else:
+                discard g_timeout_add(
+                  0,
+                  onPlasticJsEvaluateDispatch,
+                  cast[pointer](request)
+                )
+
+              let deadline =
+                epochTime() +
+                timeoutMs.float / 1000.0
+
+              while not plasticJsRequestCompleted(request) and
+                  epochTime() < deadline:
+                if plasticRunsOnGtkMainThread():
+                  discard g_main_context_iteration(nil, 0)
+                sleep(1)
+
+              var completed = false
+              var failed = false
+              var output = ""
+              var requestError = ""
+
+              acquire(request.lock)
+              try:
+                completed = request.completed
+                if completed:
+                  failed = request.failed
+                  output = request.text
+                  requestError = request.error
+                  cleanupLocally = true
+                else:
+                  # O callback ainda possui a requisição. Ele fará
+                  # a limpeza quando finalmente for chamado.
+                  request.abandoned = true
+              finally:
+                release(request.lock)
+
+              if not completed:
+                raise newException(
+                  PlasticForeignBackendError,
+                  "Tempo excedido ao executar JavaScript"
+                )
+
+              if failed:
+                if requestError.len > 0:
+                  raise newException(
+                    PlasticForeignBackendError,
+                    requestError
+                  )
+                return newJNull()
+
+              try:
+                result = parseJson(output)
+              except CatchableError:
+                result = %output
+
+            finally:
+              if cleanupLocally:
+                plasticReleaseJsRequest(request)
+                deinitLock(request.lock)
 
           proc executeNativeJsAsync(webView: pointer; script: string) =
             if webView.isNil:
@@ -12303,22 +21940,81 @@ Mantenha a resposta objetiva e útil para inferência.
             desktop: PlasticLinuxDesktopRuntime;
             path, status: string
           ) =
-            if desktop.isNil or desktop.mainWebView.isNil:
+            if desktop.isNil or desktop.shellWebView.isNil:
               return
             let script = """
               (() => {
                 const path = """ & $(%path) & """;
                 const status = """ & $(%status) & """;
+                const root =
+                  window.__glaucoplasticShellRoot ||
+                  document;
                 const element = Array.from(
-                  document.querySelectorAll('[data-glauco-foreign]')
+                  root.querySelectorAll('[data-glauco-foreign]')
                 ).find(item => item.dataset.glaucoForeign === path);
                 if (element) element.dataset.status = status;
                 return true;
               })()
             """
-            executeNativeJsAsync(desktop.mainWebView, script)
+            executeNativeJsAsync(desktop.shellWebView, script)
 
-          proc reloadLinuxDesktop(desktop: PlasticLinuxDesktopRuntime)
+          proc plasticDualWebViewShellHtml(
+            html: string
+          ): string =
+            let normalizedHtml =
+              html.replace(
+                ":host",
+                "#glaucoplastic-application"
+              )
+            let transparentStyle = """
+              <style id="glaucoplastic-dual-webview-shell">
+                html, body, #app, #root,
+                #glaucoplastic-application,
+                .application-root, .rpa-application,
+                .rpa-shell, .rpa-main, .rpa-stage, .rpa-workspace,
+                #rpa-page-workspace, .rpa-workspace-page,
+                .foreign-viewport, .glauco-foreign,
+                [data-glauco-foreign] {
+                  background: transparent !important;
+                  background-color: transparent !important;
+                }
+                html, body {
+                  margin: 0 !important;
+                  width: 100% !important;
+                  height: 100% !important;
+                }
+                #rpa-page-workspace, .rpa-workspace-page {
+                  box-shadow: none !important;
+                  border-color: transparent !important;
+                }
+                .glauco-foreign, [data-glauco-foreign] {
+                  color: transparent !important;
+                  border-color: transparent !important;
+                  box-shadow: none !important;
+                  opacity: 0 !important;
+                  visibility: hidden !important;
+                  pointer-events: none !important;
+                }
+              </style>
+            """
+            if normalizedHtml.contains("</head>"):
+              result = normalizedHtml.replace(
+                "</head>", transparentStyle & "</head>")
+            else:
+              result = transparentStyle & normalizedHtml
+
+          proc reloadLinuxDesktop(
+            desktop: PlasticLinuxDesktopRuntime
+          )
+
+          proc syncPlasticCompositedApplicationShell(
+            desktop: PlasticLinuxDesktopRuntime
+          )
+
+          proc schedulePlasticCompositedShellVerification(
+            desktop: PlasticLinuxDesktopRuntime;
+            reason: string
+          )
 
           proc onPlasticForeignWebProcessTerminated(
             webView: pointer;
@@ -12361,6 +22057,27 @@ Mantenha a resposta objetiva e útil para inferência.
               $reason
             )
 
+          proc onPlasticMainPermissionRequest(
+            webView, request, userData: pointer
+          ): cint {.cdecl.} =
+            if request.isNil:
+              return 0
+
+            let userMediaType =
+              webkit_user_media_permission_request_get_type()
+
+            if g_type_check_instance_is_a(
+                request,
+                userMediaType
+              ) == 0:
+              return 0
+
+            webkit_permission_request_allow(request)
+            plasticUiTrace(
+              "WebKit main permission-request: user media allowed"
+            )
+            result = 1
+
           proc onPlasticMainWebProcessTerminated(
             webView: pointer;
             reason: cint;
@@ -12375,10 +22092,156 @@ Mantenha a resposta objetiva e útil para inferência.
               $reason
             )
 
-            if not desktop.isNil and desktop.running:
-              # A interface principal é HTML local e pode ser reconstruída sem perder
-              # o perfil dos WebContents foreign.
-              desktop.reloadLinuxDesktop()
+            if desktop.isNil or not desktop.running:
+              return
+
+            let path = desktop.compositedForeignPath
+            if path.len > 0 and
+                desktop.application.foreignValue.elements.hasKey(path):
+              let element =
+                desktop.application.foreignValue.elements[path]
+              let targetUrl =
+                if element.currentUrl.len > 0:
+                  element.currentUrl
+                else:
+                  element.url
+              if targetUrl.len > 0:
+                webkit_web_view_load_uri(
+                  desktop.mainWebView,
+                  targetUrl.cstring
+                )
+                return
+
+            desktop.reloadLinuxDesktop()
+
+          proc onPlasticShellWebProcessTerminated(
+            webView: pointer;
+            reason: cint;
+            userData: pointer
+          ) {.cdecl.} =
+            plasticUiTrace(
+              "shell-web-process-terminated reason=" & $reason
+            )
+            let desktop =
+              cast[PlasticLinuxDesktopRuntime](userData)
+
+            if desktop.isNil or not desktop.running:
+              return
+
+            # A falha do renderer do shell não toca na página foreign.
+            desktop.reloadLinuxDesktop()
+
+
+          proc raisePlasticApplicationShell(
+            desktop: PlasticLinuxDesktopRuntime;
+            reason: string
+          ) =
+            if desktop.isNil or
+                not desktop.running or
+                desktop.shellWebView.isNil:
+              return
+
+            if not desktop.overlay.isNil:
+              gtk_overlay_reorder_overlay(
+                desktop.overlay,
+                desktop.shellWebView,
+                -1
+              )
+
+            gtk_widget_show(
+              desktop.shellWebView
+            )
+            gtk_widget_realize(
+              desktop.shellWebView
+            )
+
+            executeNativeJsAsync(
+              desktop.shellWebView,
+              """
+                (() => {
+                  const collect =
+                    window.__glaucoplasticCollectForeignLayouts;
+                  const bridge =
+                    window.webkit &&
+                    window.webkit.messageHandlers &&
+                    window.webkit.messageHandlers.glaucoplasticLayout;
+                  if (typeof collect !== 'function' || !bridge ||
+                      typeof bridge.postMessage !== 'function') return false;
+                  const snapshot = collect();
+                  window.__glaucoplasticForeignLayoutSnapshot = snapshot;
+                  bridge.postMessage(JSON.stringify(snapshot));
+                  return true;
+                })()
+              """
+            )
+
+            if plasticEnvEnabled(
+                "GLAUCOPLASTIC_UI_DEBUG"
+              ):
+              let shellNativeWindow =
+                gtk_widget_get_window(
+                  desktop.shellWebView
+                )
+              plasticUiTrace(
+                "composition.shell.overlay.raise reason=" &
+                reason &
+                " mapped=" &
+                $gtk_widget_get_mapped(desktop.shellWebView) &
+                " gdkWindowNil=" &
+                $shellNativeWindow.isNil
+              )
+
+          proc restorePlasticApplicationShellAfterForeignLoad(
+            data: pointer
+          ): cint {.cdecl.} =
+            let desktop =
+              cast[PlasticLinuxDesktopRuntime](data)
+
+            if desktop.isNil or not desktop.running:
+              return 0
+
+            desktop.raisePlasticApplicationShell(
+              "foreign-load-watchdog"
+            )
+
+            return 0
+
+          proc schedulePlasticApplicationShellAfterForeignLoad(
+            desktop: PlasticLinuxDesktopRuntime;
+            reason: string
+          ) =
+            if desktop.isNil or
+                not desktop.running or
+                desktop.shellWebView.isNil:
+              return
+
+            if plasticEnvEnabled(
+                "GLAUCOPLASTIC_UI_DEBUG"
+              ):
+              plasticUiTrace(
+                "shell.raise.schedule reason=" &
+                reason
+              )
+
+            for delay in [
+                0'u32,
+                1'u32,
+                20'u32,
+                60'u32,
+                140'u32,
+                320'u32,
+                700'u32
+              ]:
+              discard g_timeout_add(
+                delay,
+                restorePlasticApplicationShellAfterForeignLoad,
+                cast[pointer](desktop)
+              )
+
+          proc schedulePlasticAssistantOverlayAfterForeignLoad(
+            desktop: PlasticLinuxDesktopRuntime;
+            reason: string
+          )
 
           proc onPlasticForeignUriChanged(
             webView, parameterSpec, userData: pointer
@@ -12392,11 +22255,117 @@ Mantenha a resposta objetiva e útil para inferência.
               return
 
             let desktop = cast[PlasticLinuxDesktopRuntime](element.desktopOwner)
+            # A URL pertence ao mesmo documento que hospeda o shell.
             if not desktop.isNil:
               desktop.application.foreignValue.notifyUrlChanged(
                 element.path,
                 $currentUri
               )
+
+          proc syncPlasticForeignGeometry(
+            data: pointer
+          ): cint {.cdecl.}
+
+          proc restorePlasticAssistantOverlayAfterForeignLoad(
+            data: pointer
+          ): cint {.cdecl.} =
+            let desktop =
+              cast[PlasticLinuxDesktopRuntime](data)
+
+            if desktop.isNil or not desktop.running:
+              return 0
+
+            discard syncPlasticForeignGeometry(data)
+
+            if plasticEnvEnabled(
+              "GLAUCOPLASTIC_UI_DEBUG"
+            ):
+              plasticUiTrace(
+                "foreign geometry resynced after navigation"
+              )
+
+            if not desktop.assistantOverlayWindow.isNil:
+              gtk_window_set_transient_for(
+                desktop.assistantOverlayWindow,
+                desktop.window
+              )
+              gtk_window_set_keep_above(
+                desktop.assistantOverlayWindow,
+                1
+              )
+              gtk_widget_show_all(
+                desktop.assistantOverlayWindow
+              )
+              gtk_window_present(
+                desktop.assistantOverlayWindow
+              )
+              gtk_widget_realize(
+                desktop.assistantOverlayWindow
+              )
+
+              let nativeWindow =
+                gtk_widget_get_window(
+                  desktop.assistantOverlayWindow
+                )
+
+              if not nativeWindow.isNil:
+                gdk_window_raise(nativeWindow)
+
+            elif not desktop.assistantOverlayWebView.isNil:
+              gtk_widget_show(
+                desktop.assistantOverlayWebView
+              )
+              gtk_widget_realize(
+                desktop.assistantOverlayWebView
+              )
+
+              let nativeWindow =
+                gtk_widget_get_window(
+                  desktop.assistantOverlayWebView
+                )
+
+              if not nativeWindow.isNil:
+                gdk_window_raise(nativeWindow)
+
+            if plasticEnvEnabled(
+              "GLAUCOPLASTIC_UI_DEBUG"
+            ):
+              plasticUiTrace(
+                "assistant.overlay restored after foreign load"
+              )
+
+            return 0
+
+          proc schedulePlasticAssistantOverlayAfterForeignLoad(
+            desktop: PlasticLinuxDesktopRuntime;
+            reason: string
+          ) =
+            if desktop.isNil or not desktop.running:
+              return
+
+            if desktop.assistantOverlayWindow.isNil and
+                desktop.assistantOverlayWebView.isNil:
+              return
+
+            if plasticEnvEnabled(
+              "GLAUCOPLASTIC_UI_DEBUG"
+            ):
+              plasticUiTrace(
+                "assistant.overlay schedule reason=" &
+                reason
+              )
+
+            for delay in [1'u32, 40'u32, 120'u32, 300'u32, 700'u32]:
+              discard g_timeout_add(
+                delay,
+                restorePlasticAssistantOverlayAfterForeignLoad,
+                cast[pointer](desktop)
+              )
+
+          proc placePlasticForeignBelowApplication(
+            desktop: PlasticLinuxDesktopRuntime;
+            element: PlasticForeignElementRuntime
+          )
 
           proc onPlasticForeignLoadChanged(
             webView: pointer;
@@ -12407,41 +22376,86 @@ Mantenha a resposta objetiva e útil para inferência.
             if element.isNil:
               return
 
-            let desktop = cast[PlasticLinuxDesktopRuntime](element.desktopOwner)
+            let desktop =
+              cast[PlasticLinuxDesktopRuntime](element.desktopOwner)
+
             case loadEvent
             of 0:
               element.status = pfsLoading
+              if not desktop.isNil:
+                desktop.compositedShellInstalled = false
+                desktop.uiEventDrainSuspendedUntil =
+                  epochTime() + 0.75
               plasticDebugTrace(
                 "foreign.loadChanged loading path=" & element.path &
                 " uri=" & $webkit_web_view_get_uri(webView)
               )
-              gtk_widget_set_opacity(webView, 0.55)
-              gtk_widget_set_sensitive(webView, 0)
               if not desktop.isNil:
-                desktop.updateForeignHostStatus(element.path, "loading")
+                desktop.schedulePlasticApplicationShellAfterForeignLoad(
+                  "foreign-load-started"
+                )
               if not element.eventHandler.isNil:
                 element.eventHandler(element.path, "loading")
+            of 2:
+              # O documento foreign pode ser substituído livremente. O shell
+              # vive em outra WebView e, portanto, não é reinjetado aqui.
+              plasticDebugTrace(
+                "foreign.loadChanged committed path=" &
+                element.path &
+                " uri=" &
+                $webkit_web_view_get_uri(webView)
+              )
+              if not desktop.isNil:
+                desktop.updateForeignHostStatus(
+                  element.path,
+                  "loading"
+                )
+                desktop.uiEventDrainSuspendedUntil =
+                  epochTime() + 0.10
+                desktop.schedulePlasticApplicationShellAfterForeignLoad(
+                  "foreign-load-committed-raise"
+                )
             of 3:
               element.status = pfsReady
               plasticDebugTrace(
                 "foreign.loadChanged ready path=" & element.path &
                 " uri=" & $webkit_web_view_get_uri(webView)
               )
-              gtk_widget_set_opacity(webView, 1.0)
-              gtk_widget_set_sensitive(webView, 1)
               if not desktop.isNil:
+                desktop.uiEventDrainSuspendedUntil =
+                  epochTime() + 0.25
                 desktop.updateForeignHostStatus(element.path, "ready")
+                desktop.schedulePlasticApplicationShellAfterForeignLoad(
+                  "foreign-load-finished-raise"
+                )
               if not element.eventHandler.isNil:
                 element.eventHandler(element.path, "loaded")
             else:
               discard
 
+          proc applyPlasticForeignVisualShape(
+            desktop: PlasticLinuxDesktopRuntime;
+            element: PlasticForeignElementRuntime;
+            rectangle: JsonNode
+          )
+
           proc applyPlasticForeignLayoutSnapshot(
             desktop: PlasticLinuxDesktopRuntime;
             payload: string
           )
+          proc applyPlasticApplicationInputHoles(
+            desktop: PlasticLinuxDesktopRuntime;
+            rectangles: JsonNode
+          )
 
           proc drainPlasticUiEvents(desktop: PlasticLinuxDesktopRuntime)
+          proc drainPlasticUiEventsFrom(
+            desktop: PlasticLinuxDesktopRuntime;
+            webView: pointer
+          )
+          proc inspectPlasticCompositedShell(
+            desktop: PlasticLinuxDesktopRuntime
+          ): JsonNode
 
           proc onPlasticForeignLayoutMessageReceived(
             manager, jsResult, userData: pointer
@@ -12464,8 +22478,182 @@ Mantenha a resposta objetiva e útil para inferência.
             if payload.len == 0:
               return
 
+            if plasticEnvEnabled(
+                "GLAUCOPLASTIC_UI_DEBUG"
+              ):
+              plasticUiTrace(
+                "foreign.layout.message chars=" &
+                $payload.len
+              )
+
             desktop.applyPlasticForeignLayoutSnapshot(payload)
-            desktop.drainPlasticUiEvents()
+
+          proc dispatchPlasticUiEventNode(
+            desktop: PlasticLinuxDesktopRuntime;
+            event: JsonNode
+          ) =
+            if desktop.isNil or event.isNil or
+                event.kind != JObject:
+              return
+
+            let eventValue =
+              if event.hasKey("value") and
+                  event["value"].kind != JNull:
+                event["value"].copy
+              elif event.hasKey("checked") and
+                  event["checked"].kind != JNull:
+                event["checked"].copy
+              else:
+                newJNull()
+
+            let bindState =
+              `jsonStringFieldSym`(event, "bindState")
+
+            if bindState.len > 0 and
+                desktop.application.statesValue.exists(bindState):
+              `stateSetInternalSym`(
+                desktop.application.statesValue,
+                bindState,
+                eventValue
+              )
+
+            let identity =
+              `jsonStringFieldSym`(event, "identity")
+
+            if identity == "ui:chat-state":
+              desktop.compositedChatOpen =
+                eventValue.kind == JString and
+                eventValue.getStr == "open"
+
+              if plasticEnvEnabled(
+                  "GLAUCOPLASTIC_UI_MUTATION_DEBUG"
+                ):
+                plasticUiTrace(
+                  "ui.chat.native-state open=" &
+                  $desktop.compositedChatOpen
+                )
+              return
+
+            if identity == "ui:debug":
+              if plasticEnvEnabled(
+                  "GLAUCOPLASTIC_UI_MUTATION_DEBUG"
+                ):
+                plasticUiTrace(
+                  "ui.dom " &
+                  (
+                    if eventValue.kind == JString:
+                      eventValue.getStr
+                    else:
+                      $eventValue
+                  )
+                )
+              return
+
+            if identity == "assistant:overlay-open":
+              executeNativeJsAsync(
+                desktop.shellWebView,
+                "(() => { const root = " &
+                  "window.__glaucoplasticShellRoot || document; " &
+                  "const toggle = root.querySelector(" &
+                  "'#rpa-chat-toggle'); " &
+                  "if (toggle) { toggle.checked = true; " &
+                  "toggle.dispatchEvent(new Event('change', " &
+                  "{bubbles:true})); } return true; })()"
+              )
+              return
+
+            if plasticEnvEnabled(
+                "GLAUCOPLASTIC_UI_DEBUG"
+              ):
+              plasticUiTrace(
+                "ui.event.message handlerId=" &
+                `jsonStringFieldSym`(
+                  event,
+                  "handlerId"
+                ) &
+                " event=" &
+                `jsonStringFieldSym`(
+                  event,
+                  "event"
+                ) &
+                " identity=" &
+                identity
+              )
+
+            desktop.application.dispatchUiEvent(event)
+
+            if identity == "assistant:send":
+              plasticUiTrace(
+                "ui.event.assistant.accepted"
+              )
+              executeNativeJsAsync(
+                desktop.shellWebView,
+                """
+                  (() => {
+                    if (typeof window
+                        .__glaucoplasticAssistantDispatchAccepted ===
+                        'function') {
+                      window
+                        .__glaucoplasticAssistantDispatchAccepted();
+                    }
+
+                    if (typeof window
+                        .__glaucoplasticAssistantOverlayDispatchAccepted ===
+                        'function') {
+                      window
+                        .__glaucoplasticAssistantOverlayDispatchAccepted();
+                    }
+
+                    return true;
+                  })()
+                """
+              )
+
+          proc onPlasticUiEventMessageReceived(
+            manager, jsResult, userData: pointer
+          ) {.cdecl.} =
+            let desktop =
+              cast[PlasticLinuxDesktopRuntime](userData)
+            if desktop.isNil or jsResult.isNil:
+              return
+
+            let jsValue =
+              webkit_javascript_result_get_js_value(jsResult)
+            if jsValue.isNil:
+              return
+
+            let textValue = jsc_value_to_string(jsValue)
+            if textValue.isNil:
+              return
+
+            let payload = $textValue
+            g_free(cast[pointer](textValue))
+            if payload.len == 0:
+              return
+
+            try:
+              desktop.dispatchPlasticUiEventNode(
+                parseJson(payload)
+              )
+            except CatchableError as error:
+              if plasticEnvEnabled("GLAUCOPLASTIC_UI_DEBUG"):
+                plasticUiTrace(
+                  "ui.event message invalid: " & error.msg
+                )
+
+          proc onPlasticMainDecidePolicy(
+            webView, decision: pointer;
+            decisionType: cint;
+            userData: pointer
+          ): cint {.cdecl.} =
+            # WEBKIT_POLICY_DECISION_TYPE_NEW_WINDOW_ACTION = 1.
+            if decision.isNil or decisionType != 1:
+              return 0
+
+            webkit_policy_decision_ignore(decision)
+            if plasticEnvEnabled("GLAUCOPLASTIC_UI_DEBUG"):
+              plasticUiTrace("popup.blocked new-window-action")
+            return 1
 
           proc newLinuxWebKitForeignBackend(
             desktop: PlasticLinuxDesktopRuntime
@@ -12476,55 +22664,41 @@ Mantenha a resposta objetiva e útil para inferência.
               if not element.nativeHandle.isNil:
                 return
 
-              # Todo foreign usa o mesmo WebContext criado com o
-              # WebsiteDataManager persistente. Assim cookies, localStorage,
-              # IndexedDB, service workers e cache ficam no perfil da aplicação.
-              let webView =
-                if desktop.webContext.isNil:
-                  webkit_web_view_new()
-                else:
-                  webkit_web_view_new_with_context(desktop.webContext)
-
-              if webView.isNil:
+              if desktop.mainWebView.isNil:
                 raise newException(
                   PlasticForeignBackendError,
-                  "WebKitGTK não conseguiu criar o WebContents foreign"
+                  "WebView principal ainda não foi criado"
                 )
 
-              let manager =
-                webkit_web_view_get_user_content_manager(webView)
-              if manager.isNil:
+              if desktop.compositedForeignPath.len > 0 and
+                  desktop.compositedForeignPath != element.path:
                 raise newException(
                   PlasticForeignBackendError,
-                  "WebKitGTK não forneceu o gerenciador de conteúdo do foreign"
+                  "A composição em uma única WebView aceita um foreign " &
+                  "principal por janela. Já está ativo: " &
+                  desktop.compositedForeignPath
                 )
 
-              discard g_signal_connect_data(
-                manager,
-                "script-message-received::glaucoplasticLayout",
-                cast[pointer](onPlasticForeignLayoutMessageReceived),
-                cast[pointer](desktop),
-                nil,
-                0
-              )
-              if webkit_user_content_manager_register_script_message_handler(
-                manager,
-                "glaucoplasticLayout"
-              ) == 0:
-                raise newException(
-                  PlasticForeignBackendError,
-                  "WebKitGTK não conseguiu registrar o canal de layout"
-                )
-              element.nativeHandle = webView
+              desktop.compositedForeignPath = element.path
+              desktop.compositedShellInstalled = false
+              element.nativeHandle = desktop.mainWebView
+              element.nativeContainer = nil
               element.desktopOwner = cast[pointer](desktop)
               element.status = pfsIdle
-              gtk_widget_set_size_request(webView, 1, 1)
-              gtk_widget_set_halign(webView, 1)
-              gtk_widget_set_valign(webView, 1)
-              gtk_overlay_add_overlay(desktop.overlay, webView)
-              gtk_widget_hide(webView)
+
+              if not desktop.popupPolicyInstalled:
+                discard g_signal_connect_data(
+                  desktop.mainWebView,
+                  "decide-policy",
+                  cast[pointer](onPlasticMainDecidePolicy),
+                  cast[pointer](desktop),
+                  nil,
+                  0
+                )
+                desktop.popupPolicyInstalled = true
+
               discard g_signal_connect_data(
-                webView,
+                desktop.mainWebView,
                 "load-changed",
                 cast[pointer](onPlasticForeignLoadChanged),
                 cast[pointer](element),
@@ -12532,28 +22706,129 @@ Mantenha a resposta objetiva e útil para inferência.
                 0
               )
               discard g_signal_connect_data(
-                webView,
+                desktop.mainWebView,
                 "notify::uri",
                 cast[pointer](onPlasticForeignUriChanged),
                 cast[pointer](element),
                 nil,
                 0
               )
-              discard g_signal_connect_data(
-                webView,
-                "web-process-terminated",
-                cast[pointer](onPlasticForeignWebProcessTerminated),
-                cast[pointer](element),
-                nil,
-                0
-              )
+
+              if plasticEnvEnabled("GLAUCOPLASTIC_UI_DEBUG"):
+                plasticUiTrace(
+                  "foreign.composition dual-webview path=" &
+                  element.path
+                )
+
+            proc plasticNavigateRequestCompleted(
+              request: PlasticForeignNavigateRequest
+            ): bool =
+              acquire(request.lock)
+              try:
+                result = request.completed
+              finally:
+                release(request.lock)
+
+            proc onPlasticForeignNavigateDispatch(
+              data: pointer
+            ): cint {.cdecl.} =
+              let request = cast[PlasticForeignNavigateRequest](data)
+              if request.isNil:
+                return 0
+
+              var failed = false
+              var error = ""
+              try:
+                if request.element.isNil or request.element.nativeHandle.isNil:
+                  raise newException(
+                    PlasticForeignBackendError,
+                    "WebContents foreign ainda não foi criado"
+                  )
+                request.element.currentUrl = request.url
+                request.element.status = pfsLoading
+
+                let requestDesktop =
+                  cast[PlasticLinuxDesktopRuntime](
+                    request.element.desktopOwner
+                  )
+
+                webkit_web_view_load_uri(
+                  request.element.nativeHandle,
+                  request.url.cstring
+                )
+              except CatchableError as dispatchError:
+                failed = true
+                error = dispatchError.msg
+
+              acquire(request.lock)
+              try:
+                request.failed = failed
+                request.error = error
+                request.completed = true
+              finally:
+                release(request.lock)
+              return 0
 
             result.navigate = proc(element: PlasticForeignElementRuntime; url: string) =
               if element.nativeHandle.isNil:
-                raise newException(PlasticForeignBackendError, "WebContents foreign ainda não foi criado")
-              element.currentUrl = url
-              element.status = pfsLoading
-              webkit_web_view_load_uri(element.nativeHandle, url.cstring)
+                raise newException(
+                  PlasticForeignBackendError,
+                  "WebContents foreign ainda não foi criado"
+                )
+
+              if plasticRunsOnGtkMainThread():
+                element.currentUrl = url
+                element.status = pfsLoading
+                webkit_web_view_load_uri(
+                  element.nativeHandle,
+                  url.cstring
+                )
+                return
+
+              let request = PlasticForeignNavigateRequest(
+                element: element,
+                url: url,
+                completed: false,
+                failed: false,
+                error: ""
+              )
+              initLock(request.lock)
+
+              try:
+                discard g_timeout_add(
+                  0,
+                  onPlasticForeignNavigateDispatch,
+                  cast[pointer](request)
+                )
+
+                let deadline = epochTime() + 10.0
+                while not plasticNavigateRequestCompleted(request) and
+                    epochTime() < deadline:
+                  sleep(1)
+
+                acquire(request.lock)
+                let completed = request.completed
+                let failed = request.failed
+                let requestError = request.error
+                release(request.lock)
+
+                if not completed:
+                  raise newException(
+                    PlasticForeignBackendError,
+                    "Tempo excedido ao encaminhar navegação para a thread GTK"
+                  )
+                if failed:
+                  let message =
+                    if requestError.len > 0:
+                      requestError
+                    else:
+                      "Falha ao navegar no WebContents foreign"
+                  raise newException(
+                    PlasticForeignBackendError,
+                    message
+                  )
+              finally:
+                deinitLock(request.lock)
 
             result.evalJs = proc(
               element: PlasticForeignElementRuntime;
@@ -12596,10 +22871,120 @@ Mantenha a resposta objetiva e útil para inferência.
               desktop.drainPlasticUiEvents()
 
             result.close = proc(element: PlasticForeignElementRuntime) =
-              if not element.nativeHandle.isNil:
-                gtk_widget_destroy(element.nativeHandle)
-                element.nativeHandle = nil
+              if element.isNil:
+                return
+              element.nativeHandle = nil
+              element.nativeContainer = nil
               element.status = pfsClosed
+              if desktop.compositedForeignPath == element.path:
+                desktop.compositedForeignPath = ""
+                desktop.compositedShellInstalled = false
+
+          proc placePlasticForeignBelowApplication(
+            desktop: PlasticLinuxDesktopRuntime;
+            element: PlasticForeignElementRuntime
+          ) =
+            # A página foreign fica na base do GtkOverlay e a shellWebView
+            # permanece acima. A ordem é estabelecida em openLinuxDesktop.
+            discard desktop
+            discard element
+
+          proc plasticForeignSurface(
+            element: PlasticForeignElementRuntime
+          ): pointer =
+            if element.isNil:
+              return nil
+            if not element.nativeContainer.isNil:
+              return element.nativeContainer
+            element.nativeHandle
+
+          proc syncPlasticForeignSurfaceGeometry(
+            desktop: PlasticLinuxDesktopRuntime;
+            element: PlasticForeignElementRuntime;
+            x, y, width, height: int
+          ) =
+            if desktop.isNil or
+                desktop.fixed.isNil or
+                element.isNil or
+                element.nativeHandle.isNil:
+              return
+
+            let safeWidth = max(1, width)
+            let safeHeight = max(1, height)
+
+            gtk_fixed_move(
+              desktop.fixed,
+              element.nativeHandle,
+              x.cint,
+              y.cint
+            )
+
+            gtk_widget_set_size_request(
+              element.nativeHandle,
+              safeWidth.cint,
+              safeHeight.cint
+            )
+
+            if plasticEnvEnabled(
+                "GLAUCOPLASTIC_UI_DEBUG"
+              ):
+              plasticUiTrace(
+                "foreign.geometry native path=" &
+                element.path &
+                " rect=" &
+                $x &
+                "," &
+                $y &
+                " " &
+                $safeWidth &
+                "x" &
+                $safeHeight
+              )
+
+          proc showPlasticForeignSurface(
+            element: PlasticForeignElementRuntime
+          ) =
+            if element.isNil or element.nativeHandle.isNil:
+              return
+
+            gtk_widget_show(
+              element.nativeHandle
+            )
+            gtk_widget_realize(
+              element.nativeHandle
+            )
+
+            let desktop =
+              cast[PlasticLinuxDesktopRuntime](
+                element.desktopOwner
+              )
+
+            if not desktop.isNil and
+                plasticEnvEnabled(
+                  "GLAUCOPLASTIC_UI_DEBUG"
+                ):
+              let nativeWindow =
+                gtk_widget_get_window(
+                  element.nativeHandle
+                )
+
+              plasticUiTrace(
+                "foreign.surface.show path=" &
+                element.path &
+                " mapped=" &
+                $gtk_widget_get_mapped(
+                  element.nativeHandle
+                ) &
+                " gdkWindowNil=" &
+                $nativeWindow.isNil
+              )
+
+          proc hidePlasticForeignSurface(
+            element: PlasticForeignElementRuntime
+          ) =
+            if element.isNil or element.nativeHandle.isNil:
+              return
+            gtk_widget_hide(element.nativeHandle)
 
           proc jsonCoordinate(node: JsonNode; key: string): int =
             if node.kind != JObject or not node.hasKey(key):
@@ -12612,6 +22997,31 @@ Mantenha a resposta objetiva e útil para inferência.
             else:
               result = 0
 
+          proc raisePlasticAssistantOverlay(
+            desktop: PlasticLinuxDesktopRuntime
+          ) =
+            if desktop.isNil or
+                desktop.assistantOverlayWindow.isNil:
+              return
+
+            gtk_widget_show_all(
+              desktop.assistantOverlayWindow
+            )
+            gtk_window_present(
+              desktop.assistantOverlayWindow
+            )
+            gtk_widget_realize(
+              desktop.assistantOverlayWindow
+            )
+
+            let nativeWindow =
+              gtk_widget_get_window(
+                desktop.assistantOverlayWindow
+              )
+
+            if not nativeWindow.isNil:
+              gdk_window_raise(nativeWindow)
+
           proc applyPlasticForeignLayoutSnapshot(
             desktop: PlasticLinuxDesktopRuntime;
             rectangles: JsonNode
@@ -12622,53 +23032,119 @@ Mantenha a resposta objetiva e útil para inferência.
             if rectangles.kind != JArray:
               return
 
-            var visiblePaths = initHashSet[string]()
+            var visiblePaths =
+              initHashSet[string]()
+
             for rectangle in rectangles.items:
               if rectangle.kind != JObject:
                 continue
 
-              let path = `jsonStringFieldSym`(rectangle, "path")
-              if path.len == 0 or
-                  not desktop.application.foreignValue.elements.hasKey(path):
+              let path =
+                `jsonStringFieldSym`(
+                  rectangle,
+                  "path"
+                )
+
+              let x =
+                jsonCoordinate(
+                  rectangle,
+                  "x"
+                )
+              let y =
+                jsonCoordinate(
+                  rectangle,
+                  "y"
+                )
+              let width = max(
+                0,
+                jsonCoordinate(
+                  rectangle,
+                  "width"
+                )
+              )
+              let height = max(
+                0,
+                jsonCoordinate(
+                  rectangle,
+                  "height"
+                )
+              )
+
+              let geometryVisible =
+                width > 1 and
+                height > 1
+
+              let registered =
+                path.len > 0 and
+                desktop.application.foreignValue.elements.hasKey(
+                  path
+                )
+
+              if plasticEnvEnabled(
+                  "GLAUCOPLASTIC_UI_DEBUG"
+                ):
+                plasticUiTrace(
+                  "foreign.layout geometry path=" &
+                  path &
+                  " registered=" &
+                  $registered &
+                  " geometryVisible=" &
+                  $geometryVisible &
+                  " rect=" &
+                  $x &
+                  "," &
+                  $y &
+                  " " &
+                  $width &
+                  "x" &
+                  $height
+                )
+
+              if not registered:
                 continue
 
-              let element = desktop.application.foreignValue.elements[path]
+              let element =
+                desktop.application.foreignValue.elements[
+                  path
+                ]
+
               if element.nativeHandle.isNil:
                 continue
 
-              visiblePaths.incl path
-              let x = jsonCoordinate(rectangle, "x")
-              let y = jsonCoordinate(rectangle, "y")
-              let width = max(1, jsonCoordinate(rectangle, "width"))
-              let height = max(1, jsonCoordinate(rectangle, "height"))
-              let geometryKey =
-                $x & ":" & $y & ":" & $width & ":" & $height & ":" &
-                (if rectangle.hasKey("visible") and
-                    rectangle["visible"].kind == JBool and
-                    rectangle["visible"].getBool:
-                  "1"
-                else:
-                  "0")
+              if geometryVisible:
+                visiblePaths.incl(path)
 
-              if geometryKey != element.lastGeometryKey:
-                element.lastGeometryKey = geometryKey
-                gtk_fixed_move(desktop.fixed, element.nativeHandle, x.cint, y.cint)
-                gtk_widget_set_size_request(
-                  element.nativeHandle,
-                  width.cint,
-                  height.cint
-                )
+                let geometryKey =
+                  $x &
+                  ":" &
+                  $y &
+                  ":" &
+                  $width &
+                  ":" &
+                  $height
 
-              if rectangle.hasKey("visible") and
-                  rectangle["visible"].kind == JBool and
-                  rectangle["visible"].getBool:
-                gtk_widget_show(element.nativeHandle)
+                if geometryKey != element.lastGeometryKey:
+                  element.lastGeometryKey =
+                    geometryKey
+
+                  desktop.syncPlasticForeignSurfaceGeometry(
+                    element,
+                    x,
+                    y,
+                    width,
+                    height
+                  )
+
+                element.showPlasticForeignSurface()
+                desktop.raisePlasticAssistantOverlay()
               else:
-                gtk_widget_hide(element.nativeHandle)
+                element.hidePlasticForeignSurface()
 
-            for path, element in desktop.application.foreignValue.elements:
-              if path notin visiblePaths and not element.nativeHandle.isNil:
-                gtk_widget_hide(element.nativeHandle)
+            for path, element in
+                desktop.application.foreignValue.elements:
+              if path notin visiblePaths and
+                  not element.nativeHandle.isNil:
+                element.hidePlasticForeignSurface()
 
           proc applyPlasticForeignLayoutSnapshot(
             desktop: PlasticLinuxDesktopRuntime;
@@ -12676,58 +23152,37 @@ Mantenha a resposta objetiva e útil para inferência.
           ) =
             if payload.len == 0:
               return
+
             try:
-              desktop.applyPlasticForeignLayoutSnapshot(parseJson(payload))
+              let rectangles =
+                parseJson(
+                  payload
+                )
+
+              desktop.applyPlasticForeignLayoutSnapshot(
+                rectangles
+              )
+
+              desktop.applyPlasticApplicationInputHoles(
+                rectangles
+              )
+
             except CatchableError as error:
-              if plasticEnvEnabled("GLAUCOPLASTIC_UI_DEBUG"):
-                echo "[GlaucoPlastic] layout snapshot inválido: ", error.msg
+              if plasticEnvEnabled(
+                  "GLAUCOPLASTIC_UI_DEBUG"
+                ):
+                echo(
+                  "[GlaucoPlastic] layout snapshot inválido: ",
+                  error.msg
+                )
 
           proc drainPlasticUiEvents(desktop: PlasticLinuxDesktopRuntime) =
-            if desktop.isNil or desktop.mainWebView.isNil:
+            if desktop.isNil:
               return
-
-            let script = """
-              (() => {
-                const queue = window.__glaucoplasticEvents ||
-                  (window.__glaucoplasticEvents = []);
-                const events = queue.splice(0, queue.length);
-                return JSON.stringify(events);
-              })()
-            """
-
-            try:
-              let events = evaluateNativeJs(desktop.mainWebView, script, 500)
-              if events.kind != JArray:
-                return
-
-              for event in events.items:
-                if event.kind != JObject:
-                  continue
-
-                let eventValue =
-                  if event.hasKey("value") and event["value"].kind != JNull:
-                    event["value"].copy
-                  elif event.hasKey("checked") and event["checked"].kind != JNull:
-                    event["checked"].copy
-                  else:
-                    newJNull()
-
-                let bindState = `jsonStringFieldSym`(event, "bindState")
-                if bindState.len > 0 and
-                    desktop.application.statesValue.exists(bindState):
-                  `stateSetInternalSym`(
-                    desktop.application.statesValue,
-                    bindState,
-                    eventValue
-                  )
-
-                # O navegador devolve somente dados do evento e um ID opaco.
-                # A ação correspondente é uma closure Nim registrada pelo macro.
-                desktop.application.dispatchUiEvent(event)
-            except CatchableError as error:
-              if plasticEnvEnabled("GLAUCOPLASTIC_UI_DEBUG"):
-                echo "[GlaucoPlastic] Falha ao processar evento da interface: ",
-                  error.msg
+            desktop.drainPlasticUiEventsFrom(desktop.shellWebView)
+            desktop.drainPlasticUiEventsFrom(
+              desktop.assistantOverlayWebView
+            )
 
           proc consoleNodeBaseName(node: NimNode): string =
             if node.isNil or node.kind notin {nnkCall, nnkCommand} or node.len == 0:
@@ -13337,83 +23792,642 @@ Mantenha a resposta objetiva e útil para inferência.
 
             return 1
 
-          proc syncPlasticForeignGeometry(data: pointer): cint {.cdecl.} =
-            let desktop = cast[PlasticLinuxDesktopRuntime](data)
-            if desktop.isNil or not desktop.running or desktop.mainWebView.isNil:
-              return 0
 
+          proc plasticAssistantNativeOverlayHtml(
+            application: PlasticApplication
+          ): string =
+            let title = htmlEscape(application.productValue.title)
+            result = """<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>""" & title & """ — conversas</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0d1219;
+      --panel: rgba(14,19,27,.985);
+      --panel2: #121923;
+      --line: #2a3443;
+      --text: #eef3f8;
+      --muted: #909bad;
+      --accent: #f0b84c;
+      --safe: #6dd3a0;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; width: 100%; height: 100%; overflow: hidden;
+      background: transparent; color: var(--text);
+      font-family: system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    }
+    button, textarea { font: inherit; }
+    .surface { width: 100%; height: 100%; position: relative; }
+    .panel {
+      display: none; width: 100%; height: 100%;
+      flex-direction: column; min-height: 0; overflow: hidden;
+      border-left: 1px solid var(--line);
+      background: var(--panel);
+      box-shadow: -18px 0 42px rgba(0,0,0,.32);
+    }
+    body.open .panel { display: flex; }
+    .head {
+      flex: 0 0 58px; padding: 11px 14px;
+      display: flex; align-items: center; justify-content: space-between;
+      border-bottom: 1px solid var(--line);
+    }
+    .head div { display: grid; gap: 2px; }
+    .head strong { font-size: 13px; }
+    .head small { color: var(--muted); font-size: 10px; }
+    .badge {
+      padding: 4px 7px; border: 1px solid #355344; border-radius: 999px;
+      color: var(--safe); font-size: 9px; font-weight: 800;
+      text-transform: uppercase; letter-spacing: .08em;
+    }
+    #messages {
+      flex: 1 1 auto; min-height: 0; overflow: auto;
+      display: flex; flex-direction: column; gap: 8px;
+      padding: 12px 11px 92px;
+    }
+    .empty {
+      margin: auto; max-width: 250px; color: var(--muted);
+      text-align: center; font-size: 12px; line-height: 1.45;
+    }
+    .message {
+      width: auto; max-width: 92%; padding: 9px 10px;
+      border: 1px solid var(--line); border-radius: 10px;
+      background: var(--panel2); white-space: pre-wrap;
+      overflow-wrap: anywhere; font-size: 12px; line-height: 1.45;
+    }
+    .message.user {
+      align-self: flex-end; background: #19150e; border-color: #514328;
+    }
+    .message.assistant { align-self: flex-start; }
+    .time {
+      display: block; margin-top: 5px; color: var(--muted);
+      font-size: 9px;
+    }
+    .feedback {
+      position: absolute; left: 10px; right: 10px; bottom: 78px;
+      color: #ff9b9b; font-size: 10px; pointer-events: none;
+    }
+    .composer-shell {
+      position: absolute; left: 0; right: 0; bottom: 0;
+      display: flex; justify-content: center; padding: 4px;
+      background: transparent;
+    }
+    body.open .composer-shell {
+      padding: 9px; border-top: 1px solid var(--line);
+      background: var(--panel);
+    }
+    .composer {
+      width: min(900px,100%); min-width: 0;
+      display: grid; grid-template-columns: auto minmax(0,1fr) auto;
+      align-items: center; gap: 8px; padding: 7px;
+      border: 1px solid #5b4b2c; border-radius: 13px;
+      background: rgba(10,14,20,.97);
+      box-shadow: 0 16px 42px rgba(0,0,0,.42);
+    }
+    body.open .composer {
+      width: 100%; border-radius: 10px; box-shadow: none;
+    }
+    .round, .send {
+      height: 44px; border: 1px solid #6f5d35; border-radius: 9px;
+      background: #241d10; color: var(--accent); cursor: pointer;
+    }
+    .round { width: 44px; padding: 0; }
+    .round.listening { color: #ff8c8c; border-color: #7b3838; }
+    .send { padding: 0 13px; font-weight: 750; }
+    textarea:disabled,
+    button:disabled {
+      cursor: wait;
+      opacity: .55;
+    }
+    .queue-state {
+      min-height: 14px;
+      margin: 5px 4px 0;
+      color: var(--muted);
+      font-size: 10px;
+      line-height: 1.3;
+      text-align: right;
+    }
+    .processing-status {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      z-index: 10;
+      display: none;
+      align-items: center;
+      gap: 7px;
+      padding: 7px 10px;
+      border: 1px solid #6f5d35;
+      border-radius: 999px;
+      background: rgba(16,20,27,.96);
+      color: var(--accent);
+      box-shadow: 0 12px 28px rgba(0,0,0,.34);
+      font-size: 10px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      pointer-events: none;
+    }
+    body.processing .processing-status {
+      display: flex;
+    }
+    .processing-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: currentColor;
+      animation: glauco-processing-pulse 1s ease-in-out infinite;
+    }
+    @keyframes glauco-processing-pulse {
+      0%, 100% {
+        opacity: .35;
+        transform: scale(.82);
+      }
+      50% {
+        opacity: 1;
+        transform: scale(1);
+      }
+    }
+    textarea {
+      width: 100%; height: 44px; min-height: 44px; max-height: 104px;
+      padding: 11px 12px; resize: none; overflow-y: auto;
+      border: 1px solid var(--line); border-radius: 9px; outline: none;
+      background: #0b1016; color: var(--text);
+    }
+    textarea:focus { border-color: #6f5d35; }
+    .toast-stack {
+      position: absolute; top: 8px; left: 8px; right: 8px;
+      display: grid; gap: 7px; pointer-events: none;
+    }
+    .toast {
+      padding: 10px 11px; border: 1px solid #6f5d35; border-radius: 10px;
+      background: rgba(18,24,33,.98); box-shadow: 0 16px 38px rgba(0,0,0,.42);
+      opacity: 0; transform: translateY(-7px); transition: .18s ease;
+      pointer-events: auto; cursor: pointer;
+    }
+    .toast.visible { opacity: 1; transform: translateY(0); }
+    .toast strong { display: block; color: var(--accent); font-size: 10px; }
+    .toast span {
+      display: -webkit-box; margin-top: 3px; color: var(--text);
+      font-size: 11px; line-height: 1.35;
+      -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+    }
+  </style>
+</head>
+<body>
+  <div class="surface">
+    <section class="panel">
+      <header class="head">
+        <div><strong>Conversas</strong><small>Mensagens da tarefa atual</small></div>
+        <span class="badge">Local</span>
+      </header>
+      <div id="messages"><div class="empty">A conversa atual aparecerá aqui.</div></div>
+      <div id="feedback" class="feedback"></div>
+    </section>
+    <div class="processing-status">
+      <span class="processing-dot"></span>
+      <span>Processando</span>
+    </div>
+    <div id="toasts" class="toast-stack"></div>
+    <footer class="composer-shell">
+      <div class="composer">
+        <button id="microphone" class="round" type="button" title="Falar">◉</button>
+        <textarea id="composer" placeholder="Descreva o que deseja realizar..."></textarea>
+        <button id="send" class="send" type="button">Executar</button>
+      </div>
+      <div id="queue-state" class="queue-state"></div>
+    </footer>
+  </div>
+  <script>
+    (() => {
+      const state = {
+        snapshot: null,
+        initialized: false,
+        lastResponseId: "",
+        open: false,
+        awaitingDispatch: false
+      };
+      const byId = id => document.getElementById(id);
+      const eventQueue = () => window.__glaucoplasticEvents ||
+        (window.__glaucoplasticEvents = []);
+      const emit = (identity, value = null, checked = false) => {
+        const payload = {
+          handlerId: "glaucoplastic-assistant",
+          event: "assistant",
+          identity,
+          bindState: "",
+          value,
+          checked,
+          key: ""
+        };
+
+        const bridge =
+          window.webkit &&
+          window.webkit.messageHandlers &&
+          window.webkit.messageHandlers.glaucoplasticEvent;
+
+        if (bridge && typeof bridge.postMessage === "function") {
+          try {
+            bridge.postMessage(JSON.stringify(payload));
+            return true;
+          } catch (error) {
+            console.error(
+              "[GlaucoPlastic] assistant overlay bridge failed",
+              error
+            );
+          }
+        }
+
+        eventQueue().push(payload);
+        return false;
+      };
+      const valueText = value => value == null ? "" : String(value);
+      const formatTime = value => {
+        if (!value) return "";
+        const date = new Date(value);
+        return Number.isNaN(date.getTime())
+          ? ""
+          : date.toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"});
+      };
+      function renderMessages(snapshot) {
+        const container = byId("messages");
+        const session = snapshot && snapshot.activeSession || {};
+        const messages = session.messages || [];
+        container.replaceChildren();
+        if (!messages.length) {
+          const empty = document.createElement("div");
+          empty.className = "empty";
+          empty.textContent = "A conversa atual aparecerá aqui.";
+          container.appendChild(empty);
+          return;
+        }
+        for (const message of messages) {
+          const bubble = document.createElement("article");
+          bubble.className = "message " +
+            (message.role === "user" ? "user" : "assistant");
+          const body = document.createElement("div");
+          body.textContent = valueText(message.content);
+          const time = document.createElement("span");
+          time.className = "time";
+          time.textContent = formatTime(message.createdAt);
+          bubble.append(body, time);
+          container.appendChild(bubble);
+        }
+        requestAnimationFrame(() => {
+          container.scrollTop = container.scrollHeight;
+        });
+      }
+      function showToast(message, responseId) {
+        const text = valueText(message).trim();
+        if (!text) return;
+        const toast = document.createElement("button");
+        toast.type = "button";
+        toast.className = "toast";
+        const title = document.createElement("strong");
+        title.textContent = "Glauco respondeu";
+        const preview = document.createElement("span");
+        preview.textContent = text.length > 240 ? text.slice(0,237) + "…" : text;
+        toast.append(title, preview);
+        toast.addEventListener("click", () => {
+          emit("assistant:overlay-open", true);
+          window.__glaucoplasticAssistantOverlaySetOpen(true);
+          toast.remove();
+        });
+        byId("toasts").appendChild(toast);
+        requestAnimationFrame(() => toast.classList.add("visible"));
+        setTimeout(() => {
+          toast.classList.remove("visible");
+          setTimeout(() => toast.remove(), 220);
+        }, 9000);
+        if ("Notification" in window &&
+            Notification.permission === "granted" &&
+            !document.hasFocus()) {
+          try {
+            new Notification("Glauco", {
+              body: preview.textContent,
+              tag: "glauco-response-" + valueText(responseId)
+            });
+          } catch (_) {}
+        }
+      }
+      function applySnapshot(snapshot) {
+        if (!snapshot || typeof snapshot !== "object") return false;
+        state.snapshot = snapshot;
+        renderMessages(snapshot);
+        const feedback = byId("feedback");
+        feedback.textContent = valueText(snapshot.lastError);
+        updateInteraction(snapshot);
+        const voice = valueText(snapshot.voiceState).toLowerCase();
+        byId("microphone").classList.toggle(
+          "listening",
+          voice === "recording" || voice === "starting"
+        );
+        if (snapshot.lastTranscriptId && snapshot.lastTranscript) {
+          const composer = byId("composer");
+          if (!composer.value.trim()) composer.value = valueText(snapshot.lastTranscript);
+        }
+        if (snapshot.lastResponseId &&
+            snapshot.lastResponseId !== state.lastResponseId) {
+          const notify = state.initialized;
+          state.lastResponseId = snapshot.lastResponseId;
+          if (notify) showToast(snapshot.lastResponse, snapshot.lastResponseId);
+        }
+        state.initialized = true;
+        return true;
+      }
+      function setOpen(open) {
+        state.open = !!open;
+        document.body.classList.toggle("open", state.open);
+        return true;
+      }
+      function send() {
+        const composer = byId("composer");
+        const text = composer.value.trim();
+        if (!text || state.awaitingDispatch) return;
+
+        state.awaitingDispatch = true;
+        updateInteraction(state.snapshot || {});
+
+        emit("assistant:send", text);
+        composer.value = "";
+        composer.style.height = "44px";
+      }
+      window.__glaucoplasticAssistantOverlayDispatchAccepted =
+        () => {
+          state.awaitingDispatch = false;
+          updateInteraction(state.snapshot || {});
+          return true;
+        };
+
+      byId("send").addEventListener("click", send);
+      byId("composer").addEventListener("keydown", event => {
+        if (event.key === "Enter" && !event.shiftKey) {
+          event.preventDefault();
+          send();
+        }
+      });
+      byId("composer").addEventListener("input", event => {
+        const composer = event.currentTarget;
+        composer.style.height = "44px";
+        composer.style.height = Math.min(composer.scrollHeight, 104) + "px";
+      });
+      byId("microphone").addEventListener("click", () => {
+        const voice = valueText(
+          state.snapshot && state.snapshot.voiceState
+        ).toLowerCase();
+        const recording = voice === "recording" || voice === "starting";
+        emit(recording ? "assistant:voice-stop" : "assistant:voice-start");
+      });
+      window.__glaucoplasticAssistantOverlayApply = applySnapshot;
+      window.__glaucoplasticAssistantOverlaySetOpen = setOpen;
+    })();
+  </script>
+</body>
+</html>"""
+
+          proc drainPlasticUiEventsFrom(
+            desktop: PlasticLinuxDesktopRuntime;
+            webView: pointer
+          ) =
+            if desktop.isNil or webView.isNil:
+              return
+
+            # O canal WebKit entrega os eventos diretamente.
+            # O polling é apenas fallback para backends antigos.
+            if desktop.eventBridgeInstalled:
+              return
+
+            if desktop.uiEventDrainBusy or
+                not desktop.compositedShellInstalled or
+                epochTime() < desktop.uiEventDrainSuspendedUntil:
+              return
+
+            desktop.uiEventDrainBusy = true
             let script = """
-              JSON.stringify(
-                window.__glaucoplasticForeignLayoutSnapshot || []
-              )
+              (() => {
+                const queue = window.__glaucoplasticEvents ||
+                  (window.__glaucoplasticEvents = []);
+                const events = queue.splice(0, queue.length);
+                return JSON.stringify(events);
+              })()
             """
 
             try:
-              let rectangles = evaluateNativeJs(desktop.mainWebView, script, 800)
-              if rectangles.kind != JArray:
-                return 1
+              let events = evaluateNativeJs(webView, script, 250)
+              if events.kind != JArray:
+                return
+              for event in events.items:
+                desktop.dispatchPlasticUiEventNode(event)
+            except CatchableError as error:
+              desktop.uiEventDrainSuspendedUntil =
+                epochTime() + 1.0
+              if plasticEnvEnabled("GLAUCOPLASTIC_UI_DEBUG"):
+                plasticUiTrace(
+                  "ui.event polling suspended: " & error.msg
+                )
+            finally:
+              desktop.uiEventDrainBusy = false
 
-              var visiblePaths = initHashSet[string]()
-              for rectangle in rectangles.items:
-                let path = `jsonStringFieldSym`(rectangle, "path")
-                if path.len == 0 or not desktop.application.foreignValue.elements.hasKey(path):
-                  continue
-                let element = desktop.application.foreignValue.elements[path]
-                if element.nativeHandle.isNil:
-                  continue
+          proc syncPlasticAssistantOverlay(
+            desktop: PlasticLinuxDesktopRuntime
+          ) =
+            # O compositor oficial vive no WebView principal.
+            # Superfícies experimentais permanecem desativadas.
+            if desktop.isNil:
+              return
 
-                visiblePaths.incl path
-                let x = jsonCoordinate(rectangle, "x")
-                let y = jsonCoordinate(rectangle, "y")
-                let width = max(1, jsonCoordinate(rectangle, "width"))
-                let height = max(1, jsonCoordinate(rectangle, "height"))
-                if plasticEnvEnabled("GLAUCOPLASTIC_UI_DEBUG"):
-                  plasticUiTrace(
-                    "foreign.geometry path=" & path &
-                    " x=" & $x &
-                    " y=" & $y &
-                    " width=" & $width &
-                    " height=" & $height &
-                    " visible=" & $(
-                      rectangle.hasKey("visible") and
-                      rectangle["visible"].kind == JBool and
-                      rectangle["visible"].getBool
-                    )
-                  )
-                let geometryKey =
-                  $x & ":" & $y & ":" & $width & ":" & $height & ":" &
-                  (if rectangle.hasKey("visible") and
-                      rectangle["visible"].kind == JBool and
-                      rectangle["visible"].getBool:
-                    "1"
+            if not desktop.assistantOverlayWindow.isNil:
+              gtk_widget_hide(
+                desktop.assistantOverlayWindow
+              )
+
+          proc syncPlasticAssistantForeignOverlay(
+            desktop: PlasticLinuxDesktopRuntime
+          ) =
+            # Nenhum elemento do assistente é injetado na página foreign.
+            discard desktop
+
+          proc publishPlasticAssistantSnapshot(
+            desktop: PlasticLinuxDesktopRuntime
+          ) =
+            if desktop.isNil or desktop.shellWebView.isNil or
+                desktop.application.assistantValue.isNil or
+                not desktop.application.assistantValue.config.enabled:
+              return
+            let runtime = desktop.application.assistantValue
+            acquire(runtime.dataLock)
+            let shouldPublish = runtime.revision != runtime.publishedRevision
+            release(runtime.dataLock)
+            if not shouldPublish:
+              return
+
+            let snapshot = plasticAssistantSnapshot(runtime)
+            let snapshotPublishStartedAt =
+              epochTime()
+
+            if plasticEnvEnabled(
+                "GLAUCOPLASTIC_UI_MUTATION_DEBUG"
+              ):
+              plasticUiTrace(
+                "ui.snapshot.publish.begin revision=" &
+                $(
+                  if snapshot.hasKey("revision"):
+                    snapshot["revision"]
                   else:
-                    "0")
+                    %(-1)
+                ) &
+                " status=" &
+                `jsonStringFieldSym`(
+                  snapshot,
+                  "status"
+                ) &
+                " shellInstalled=" &
+                $desktop.compositedShellInstalled
+              )
 
-                if geometryKey != element.lastGeometryKey:
-                  element.lastGeometryKey = geometryKey
-                  gtk_widget_set_margin_start(element.nativeHandle, x.cint)
-                  gtk_widget_set_margin_top(element.nativeHandle, y.cint)
-                  gtk_widget_set_size_request(
-                    element.nativeHandle,
-                    width.cint,
-                    height.cint
-                  )
+            var mainApplied = false
+            var overlayApplied = desktop.assistantOverlayWebView.isNil
 
-                if rectangle.hasKey("visible") and rectangle["visible"].kind == JBool and
-                    rectangle["visible"].getBool:
-                  gtk_widget_show(element.nativeHandle)
-                else:
-                  gtk_widget_hide(element.nativeHandle)
-
-              for path, element in desktop.application.foreignValue.elements:
-                if path notin visiblePaths and not element.nativeHandle.isNil:
-                  gtk_widget_hide(element.nativeHandle)
+            let mainScript = """
+              (() => {
+                if (window.__glaucoplasticAssistantApply) {
+                  window.__glaucoplasticAssistantApply(""" & $snapshot & """);
+                  return true;
+                }
+                return false;
+              })()
+            """
+            try:
+              let applied = evaluateNativeJs(
+                desktop.shellWebView,
+                mainScript,
+                500
+              )
+              mainApplied = applied.kind == JBool and applied.getBool
             except CatchableError:
               discard
 
-            desktop.drainPlasticUiEvents()
+            if not desktop.assistantOverlayWebView.isNil:
+              let overlayScript = """
+                (() => {
+                  if (window.__glaucoplasticAssistantOverlayApply) {
+                    window.__glaucoplasticAssistantOverlayApply(""" &
+                      $snapshot &
+                    """);
+                    return true;
+                  }
+                  return false;
+                })()
+              """
+              try:
+                let applied = evaluateNativeJs(
+                  desktop.assistantOverlayWebView,
+                  overlayScript,
+                  500
+                )
+                overlayApplied = applied.kind == JBool and applied.getBool
+              except CatchableError:
+                discard
 
-            return 1
+            if plasticEnvEnabled(
+                "GLAUCOPLASTIC_UI_MUTATION_DEBUG"
+              ):
+              plasticUiTrace(
+                "ui.snapshot.publish.end mainApplied=" &
+                $mainApplied &
+                " overlayApplied=" &
+                $overlayApplied &
+                " elapsedMs=" &
+                $(
+                  (epochTime() - snapshotPublishStartedAt) *
+                  1000.0
+                )
+              )
+
+            if overlayApplied or
+                (desktop.assistantOverlayWebView.isNil and mainApplied):
+              acquire(runtime.dataLock)
+              runtime.publishedRevision = runtime.revision
+              release(runtime.dataLock)
+
+          proc applyPlasticApplicationInputHoles(
+            desktop: PlasticLinuxDesktopRuntime;
+            rectangles: JsonNode
+          ) =
+            if desktop.isNil or desktop.shellWebView.isNil:
+              return
+            let shellNativeWindow =
+              gtk_widget_get_window(desktop.shellWebView)
+            if shellNativeWindow.isNil:
+              return
+            var fullRectangle = PlasticCairoRectangleInt(
+              x: 0, y: 0,
+              width: max(1, desktop.width).cint,
+              height: max(1, desktop.height).cint
+            )
+            let shellInputRegion =
+              cairo_region_create_rectangle(addr fullRectangle)
+            if shellInputRegion.isNil:
+              return
+            try:
+              if rectangles.kind == JArray:
+                for rectangle in rectangles.items:
+                  if rectangle.kind != JObject: continue
+                  let width = jsonCoordinate(rectangle, "width")
+                  let height = jsonCoordinate(rectangle, "height")
+                  if width <= 1 or height <= 1: continue
+                  var holes = newJArray()
+                  if rectangle.hasKey("inputHoles") and
+                      rectangle["inputHoles"].kind == JArray and
+                      rectangle["inputHoles"].len > 0:
+                    holes = rectangle["inputHoles"]
+                  else:
+                    holes.add(rectangle)
+                  for hole in holes.items:
+                    if hole.kind != JObject: continue
+                    let holeWidth = jsonCoordinate(hole, "width")
+                    let holeHeight = jsonCoordinate(hole, "height")
+                    if holeWidth <= 1 or holeHeight <= 1: continue
+                    var holeRectangle = PlasticCairoRectangleInt(
+                      x: max(0, jsonCoordinate(hole, "x")).cint,
+                      y: max(0, jsonCoordinate(hole, "y")).cint,
+                      width: holeWidth.cint,
+                      height: holeHeight.cint
+                    )
+                    discard cairo_region_subtract_rectangle(
+                      shellInputRegion, addr holeRectangle)
+              gdk_window_input_shape_combine_region(
+                shellNativeWindow, shellInputRegion, 0, 0)
+              if plasticEnvEnabled("GLAUCOPLASTIC_UI_DEBUG"):
+                plasticUiTrace(
+                  "composition.shell-overlay input-holes applied")
+            finally:
+              cairo_region_destroy(shellInputRegion)
+
+          proc applyPlasticForeignVisualShape(
+            desktop: PlasticLinuxDesktopRuntime;
+            element: PlasticForeignElementRuntime;
+            rectangle: JsonNode
+          ) =
+            # Não usar GdkWindow shape como composição visual no Wayland.
+            # A foreign recebe geometria real dentro do GtkFixed.
+            discard desktop
+            discard element
+            discard rectangle
+
+          proc syncPlasticForeignGeometry(data: pointer): cint {.cdecl.} =
+            let desktop = cast[PlasticLinuxDesktopRuntime](data)
+            if desktop.isNil or not desktop.running or
+                desktop.mainWebView.isNil:
+              return 0
+
+            # A shell está em uma WebView própria sobre a página foreign.
+            # O timer transporta eventos, snapshots e estado do assistente.
+            desktop.drainPlasticUiEvents()
+            desktop.publishPlasticAssistantSnapshot()
 
           proc onPlasticWindowDestroyed(widget, userData: pointer) {.cdecl.} =
             plasticUiTrace("window-destroyed")
@@ -13421,12 +24435,19 @@ Mantenha a resposta objetiva e útil para inferência.
             if not desktop.isNil:
               closeWebKitDeveloperTools(desktop.mainWebView)
               desktop.running = false
+              for _, element in desktop.application.foreignValue.elements:
+                element.nativeContainer = nil
+                element.nativeHandle = nil
+                element.status = pfsClosed
               if not desktop.consoleReplState.isNil:
                 desktop.consoleReplState.running = false
               desktop.application.uiPropertyWriterValue = nil
-              for _, element in desktop.application.foreignValue.elements:
-                element.nativeHandle = nil
-                element.status = pfsClosed
+              if not desktop.assistantOverlayWebView.isNil:
+                gtk_widget_hide(desktop.assistantOverlayWebView)
+              if not desktop.assistantOverlayWindow.isNil:
+                gtk_widget_destroy(desktop.assistantOverlayWindow)
+              desktop.assistantOverlayWindow = nil
+              desktop.assistantOverlayWebView = nil
             gtk_main_quit()
 
           proc onPlasticWindowDeleteEvent(
@@ -13439,6 +24460,14 @@ Mantenha a resposta objetiva e útil para inferência.
 
           proc onPlasticWindowUnmapped(widget, userData: pointer) {.cdecl.} =
             plasticUiTrace("window-unmapped")
+            # As duas WebViews são ocultadas/restauradas pelo GtkWindow.
+            let desktop =
+              cast[PlasticLinuxDesktopRuntime](userData)
+            if not desktop.isNil and
+                not desktop.assistantOverlayWindow.isNil:
+              gtk_widget_hide(
+                desktop.assistantOverlayWindow
+              )
 
           proc onPlasticInitialRender(data: pointer): cint {.cdecl.} =
             let desktop = cast[PlasticLinuxDesktopRuntime](data)
@@ -13450,6 +24479,11 @@ Mantenha a resposta objetiva e útil para inferência.
               gtk_widget_hide(desktop.bootWidget)
             if not desktop.mainWebView.isNil:
               gtk_widget_show(desktop.mainWebView)
+            if not desktop.shellWebView.isNil:
+              gtk_widget_show(desktop.shellWebView)
+              desktop.raisePlasticApplicationShell(
+                "initial-render-raise"
+              )
             return 0
 
           proc setDesktopIdentityProperty(
@@ -13470,11 +24504,14 @@ Mantenha a resposta objetiva e útil para inferência.
 
             desktop.reloadLinuxDesktop()
             executeNativeJsAsync(
-              desktop.mainWebView,
+              desktop.shellWebView,
               """
               (() => {
+                const shellRoot =
+                  window.__glaucoplasticShellRoot ||
+                  document;
                 const items = Array.from(
-                  document.querySelectorAll('[data-glauco-identity]')
+                  shellRoot.querySelectorAll('[data-glauco-identity]')
                 );
                 const bootOverlay = items.find(item => {
                   const value = item.dataset.glaucoIdentity || '';
@@ -13512,6 +24549,13 @@ Mantenha a resposta objetiva e útil para inferência.
 
             if not desktop.mainWebView.isNil:
               gtk_widget_show(desktop.mainWebView)
+            if not desktop.shellWebView.isNil:
+              gtk_widget_show(
+                desktop.shellWebView
+              )
+              desktop.raisePlasticApplicationShell(
+                "boot-finalize-shell-window"
+              )
 
             return 0
 
@@ -13521,31 +24565,34 @@ Mantenha a resposta objetiva e útil para inferência.
             userData: pointer
           ) {.cdecl.} =
             let desktop = cast[PlasticLinuxDesktopRuntime](userData)
-            if desktop.isNil or allocation.isNil:
+            if desktop.isNil or allocation.isNil or
+                not desktop.running or desktop.shellWebView.isNil or
+                desktop.fixed.isNil:
               return
             desktop.width = allocation.width.int
             desktop.height = allocation.height.int
             gtk_widget_set_size_request(
-              desktop.mainWebView,
-              allocation.width,
-              allocation.height
-            )
-
+              desktop.fixed, allocation.width, allocation.height)
+            gtk_widget_set_size_request(
+              desktop.shellWebView, allocation.width, allocation.height)
 
           proc setDesktopIdentityProperty(
             desktop: PlasticLinuxDesktopRuntime;
             path, propertyName: string;
             value: JsonNode
           ) =
-            if desktop.isNil or desktop.mainWebView.isNil:
+            if desktop.isNil or desktop.shellWebView.isNil:
               return
             let script = """
               (() => {
                 const path = """ & $(%path) & """;
                 const propertyName = """ & $(%propertyName) & """;
                 const value = """ & $value & """;
+                const root =
+                  window.__glaucoplasticShellRoot ||
+                  document;
                 const element = Array.from(
-                  document.querySelectorAll('[data-glauco-identity]')
+                  root.querySelectorAll('[data-glauco-identity]')
                 ).find(item => item.dataset.glaucoIdentity === path);
                 if (!element) return false;
                 if (propertyName === 'textContent' || propertyName === 'innerHTML') {
@@ -13558,25 +24605,290 @@ Mantenha a resposta objetiva e útil para inferência.
                 return true;
               })()
             """
-            executeNativeJsAsync(desktop.mainWebView, script)
+            executeNativeJsAsync(desktop.shellWebView, script)
 
-          proc reloadLinuxDesktop(desktop: PlasticLinuxDesktopRuntime) =
-            if desktop.isNil or desktop.mainWebView.isNil:
-              return
-            let html = desktop.application.renderApplicationHtml()
-            if plasticEnvEnabled("GLAUCOPLASTIC_UI_DEBUG"):
-              plasticUiTrace(
-                "reloadLinuxDesktop htmlLen=" & $html.len &
-                " hasBootCard=" & $(html.contains("GlaucoPlastic / boot")) &
-                " hasAppTitle=" & $(html.contains("Consumer YouTube Search")) &
-                " hasBootPhasePronto=" & $(html.contains("Pronto")) &
-                " hasBootPhaseLoading=" & $(html.contains("Carregando llama-server e modelo"))
+          proc plasticTransparentApplicationHtml(
+            html: string
+          ): string =
+            let transparentStyle = """
+              <style id="glaucoplastic-webview-composition">
+                html,
+                body,
+                #app,
+                #root,
+                #glaucoplastic-application,
+                .application-root,
+                .rpa-application,
+                .rpa-shell,
+                .rpa-main,
+                .rpa-stage,
+                .rpa-workspace,
+                .foreign-viewport,
+                .glauco-foreign,
+                [data-glauco-foreign] {
+                  background: transparent !important;
+                  background-color: transparent !important;
+                }
+              </style>
+            """
+
+            if html.contains("</head>"):
+              result = html.replace(
+                "</head>",
+                transparentStyle & "</head>"
               )
-            let baseUri = "file://" & getCurrentDir().replace(" ", "%20") & "/"
+            else:
+              result = transparentStyle & html
+
+          proc plasticExtractHtmlScripts(
+            html: string
+          ): seq[string] =
+            var cursor = 0
+            while cursor < html.len:
+              let openAt = html.find("<script", cursor)
+              if openAt < 0:
+                break
+              let sourceAt = html.find(">", openAt)
+              if sourceAt < 0:
+                break
+              let closeAt = html.find("</script>", sourceAt + 1)
+              if closeAt < 0:
+                break
+              if closeAt > sourceAt + 1:
+                result.add html[sourceAt + 1 ..< closeAt]
+              cursor = closeAt + "</script>".len
+
+          proc plasticCompositedShellJavaScript(
+            desktop: PlasticLinuxDesktopRuntime
+          ): string =
+            # Dual-WebView: shell nunca é serializada para o DOM foreign.
+            discard desktop
+            result = ""
+
+          proc syncPlasticCompositedApplicationShell(
+            desktop: PlasticLinuxDesktopRuntime
+          ) =
+            # Dual-WebView: compatibilidade de API sem injeção no foreign.
+            discard desktop
+
+          proc inspectPlasticCompositedShell(
+            desktop: PlasticLinuxDesktopRuntime
+          ): JsonNode =
+            if desktop.isNil or desktop.shellWebView.isNil:
+              return newJNull()
+
+            try:
+              result =
+                evaluateNativeJs(
+                  desktop.shellWebView,
+                  """
+                    (() => {
+                      const root =
+                        window.__glaucoplasticShellRoot ||
+                        document;
+                      return JSON.stringify({
+                        host: true,
+                        root: !!root,
+                        application:
+                          !!(
+                            root &&
+                            root.querySelector(
+                              '#glaucoplastic-application'
+                            )
+                          ),
+                        topbar:
+                          !!(
+                            root &&
+                            root.querySelector('.rpa-topbar')
+                          ),
+                        sidebar:
+                          !!(
+                            root &&
+                            root.querySelector('.rpa-sidebar')
+                          ),
+                        chatToggle:
+                          !!(
+                            root &&
+                            root.querySelector('#rpa-chat-toggle')
+                          ),
+                        chatPanel:
+                          !!(
+                            root &&
+                            root.querySelector('.rpa-chat-panel')
+                          ),
+                        composer:
+                          !!(
+                            root &&
+                            root.querySelector('.rpa-composer-shell')
+                          ),
+                        bridgeAvailable:
+                          !!(
+                            window.webkit &&
+                            window.webkit.messageHandlers &&
+                            window.webkit.messageHandlers
+                              .glaucoplasticEvent
+                          ),
+                        href: String(window.location.href),
+                        separateShellWebView: true
+                      });
+                    })()
+                  """,
+                  1_500
+                )
+            except Exception as error:
+              result = %*{
+                "error": error.msg
+              }
+
+          proc verifyPlasticCompositedShell(
+            data: pointer
+          ): cint {.cdecl.} =
+            let desktop =
+              cast[PlasticLinuxDesktopRuntime](data)
+
+            if desktop.isNil or
+                not desktop.running or
+                desktop.shellWebView.isNil:
+              return 0
+
+            let health =
+              desktop.inspectPlasticCompositedShell()
+
+            let healthy =
+              health.kind == JObject and
+              health.hasKey("application") and
+              health["application"].kind == JBool and
+              health["application"].getBool
+
+            desktop.compositedShellInstalled = healthy
+
+            plasticUiTrace(
+              "shell.health healthy=" &
+              $healthy &
+              " state=" & $health
+            )
+
+            if not healthy:
+              # A recuperação recarrega somente a shellWebView.
+              desktop.reloadLinuxDesktop()
+
+            return 0
+
+          proc schedulePlasticCompositedShellVerification(
+            desktop: PlasticLinuxDesktopRuntime;
+            reason: string
+          ) =
+            if desktop.isNil or desktop.shellWebView.isNil:
+              return
+
+            plasticUiTrace(
+              "shell.watchdog.schedule reason=" & reason
+            )
+
+            for delay in [
+                500'u32,
+                1_500'u32,
+                3_000'u32
+              ]:
+              discard g_timeout_add(
+                delay,
+                verifyPlasticCompositedShell,
+                cast[pointer](desktop)
+              )
+
+          proc reloadLinuxDesktop(
+            desktop: PlasticLinuxDesktopRuntime
+          ) =
+            if desktop.isNil or
+                desktop.shellWebView.isNil:
+              return
+
+            if not desktop.application.assistantValue.isNil:
+              acquire(
+                desktop.application.assistantValue.dataLock
+              )
+              desktop.application.assistantValue.publishedRevision = -1
+              release(
+                desktop.application.assistantValue.dataLock
+              )
+
+            # Normalização obrigatória da semântica de ShadowRoot.
+            #
+            # Componentes podem declarar CSS com :host. Em shellWebView
+            # dedicada não existe ShadowRoot; portanto o seletor precisa
+            # apontar para a raiz física da aplicação ANTES de qualquer
+            # outro tratamento do HTML.
+            let renderedHtml =
+              desktop.application.renderApplicationHtml()
+
+            let hostSelectorsBefore =
+              renderedHtml.count(
+                ":host"
+              )
+
+            let normalizedRenderedHtml =
+              renderedHtml.replace(
+                ":host",
+                "#glaucoplastic-application"
+              )
+
+            let hostSelectorsAfter =
+              normalizedRenderedHtml.count(
+                ":host"
+              )
+
+            let html =
+              plasticDualWebViewShellHtml(
+                normalizedRenderedHtml
+              )
+
+            if plasticEnvEnabled(
+                "GLAUCOPLASTIC_UI_DEBUG"
+              ):
+              plasticUiTrace(
+                "shell.css.host-normalize before=" &
+                $hostSelectorsBefore &
+                " after=" &
+                $hostSelectorsAfter &
+                " renderedLen=" &
+                $renderedHtml.len &
+                " normalizedLen=" &
+                $normalizedRenderedHtml.len &
+                " finalLen=" &
+                $html.len
+              )
+
+              plasticUiTrace(
+                "reloadLinuxDesktop htmlLen=" &
+                $html.len &
+                " composition=dual-webview-shell"
+              )
+
+            let baseUri =
+              "file://" &
+              getCurrentDir().replace(
+                " ",
+                "%20"
+              ) &
+              "/"
+
+            desktop.compositedShellInstalled =
+              false
+
             webkit_web_view_load_html(
-              desktop.mainWebView,
+              desktop.shellWebView,
               html.cstring,
               baseUri.cstring
+            )
+
+            desktop.compositedShellInstalled =
+              true
+
+            # O HTML acabou de ser trocado; uma publicação imediata pode
+            # observar a árvore antiga. As chamadas de raise/watchdog
+            # posteriores republicam a geometria já calculada pelo novo CSS.
+            desktop.raisePlasticApplicationShell(
+              "reload-shell-complete"
             )
 
           proc openLinuxDesktop(
@@ -13653,17 +24965,21 @@ Mantenha a resposta objetiva e útil para inferência.
             if not desktop.websiteDataManager.isNil:
               # Mantém ITP desativado para o perfil de aplicação. O bloqueio de
               # terceiros é controlado explicitamente pelo CookieManager.
+              plasticUiTrace("diag.widgets.01 before itp")
               webkit_website_data_manager_set_itp_enabled(
                 desktop.websiteDataManager,
                 0
               )
 
+            plasticUiTrace("diag.widgets.02 after itp before cookie-manager")
             let cookieManager =
               webkit_web_context_get_cookie_manager(
                 desktop.webContext
               )
 
+            plasticUiTrace("diag.widgets.03 after cookie-manager")
             if not cookieManager.isNil:
+              plasticUiTrace("diag.widgets.04 before cookie-policy")
               webkit_cookie_manager_set_accept_policy(
                 cookieManager,
                 if application.webViewValue.acceptThirdPartyCookies:
@@ -13672,31 +24988,155 @@ Mantenha a resposta objetiva e útil para inferência.
                   2  # WEBKIT_COOKIE_POLICY_ACCEPT_NO_THIRD_PARTY
               )
 
+              plasticUiTrace("diag.widgets.05 after cookie-policy")
               if application.webViewValue.persistent and
                   application.webViewValue.persistentCookies:
+                plasticUiTrace("diag.widgets.06 before persistent-cookie-storage")
                 webkit_cookie_manager_set_persistent_storage(
                   cookieManager,
                   application.webViewValue.cookiesPath.cstring,
                   1  # WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE
                 )
 
+            plasticUiTrace("diag.widgets.07 before main-window")
             desktop.window = gtk_window_new(0)
+            plasticUiTrace("diag.widgets.08 before overlay")
             desktop.overlay = gtk_overlay_new()
+            plasticUiTrace("diag.widgets.09 before fixed")
             desktop.fixed = gtk_fixed_new()
+            plasticUiTrace("diag.widgets.10 before foreign-webview")
             desktop.mainWebView =
               webkit_web_view_new_with_context(
                 desktop.webContext
               )
 
-            if desktop.window.isNil or desktop.overlay.isNil or
-                desktop.fixed.isNil or desktop.mainWebView.isNil:
+            if desktop.mainWebView.isNil:
+              plasticUiTrace(
+                "foreign-webview with-context nil; tentando fallback"
+              )
+              desktop.mainWebView =
+                webkit_web_view_new()
+
+            plasticUiTrace("diag.widgets.10b before shell-webview")
+            desktop.shellWebView =
+              webkit_web_view_new_with_context(
+                desktop.webContext
+              )
+
+            if desktop.shellWebView.isNil:
+              plasticUiTrace(
+                "shell-webview with-context nil; tentando fallback"
+              )
+              desktop.shellWebView =
+                webkit_web_view_new()
+
+            if desktop.shellWebView.isNil:
+              raise newException(
+                PlasticRuntimeError,
+                "Falha ao criar a WebView persistente do shell"
+              )
+
+            let shellManager =
+              webkit_web_view_get_user_content_manager(
+                desktop.shellWebView
+              )
+
+            if shellManager.isNil:
+              raise newException(
+                PlasticRuntimeError,
+                "WebKitGTK não forneceu o user-content-manager do shell"
+              )
+
+            if webkit_user_content_manager_register_script_message_handler(
+                shellManager,
+                "glaucoplasticEvent"
+              ) == 0:
+              raise newException(
+                PlasticRuntimeError,
+                "Falha ao registrar glaucoplasticEvent no shell"
+              )
+
+            discard g_signal_connect_data(
+              shellManager,
+              "script-message-received::glaucoplasticEvent",
+              cast[pointer](onPlasticUiEventMessageReceived),
+              cast[pointer](desktop),
+              nil,
+              0
+            )
+
+            if webkit_user_content_manager_register_script_message_handler(
+                shellManager,
+                "glaucoplasticLayout"
+              ) == 0:
+              raise newException(
+                PlasticRuntimeError,
+                "Falha ao registrar glaucoplasticLayout no shell"
+              )
+
+            discard g_signal_connect_data(
+              shellManager,
+              "script-message-received::glaucoplasticLayout",
+              cast[pointer](onPlasticForeignLayoutMessageReceived),
+              cast[pointer](desktop),
+              nil,
+              0
+            )
+
+            desktop.eventBridgeInstalled = true
+
+            if plasticEnvEnabled(
+                "GLAUCOPLASTIC_NATIVE_ASSISTANT_OVERLAY_REMOVED_BY_COMPOSITION"
+              ) and
+                not application.assistantValue.isNil and
+                application.assistantValue.config.enabled:
+              plasticUiTrace("diag.widgets.11 before assistant-webview")
+              desktop.assistantOverlayWebView =
+                webkit_web_view_new_with_context(
+                  desktop.webContext
+                )
+              plasticUiTrace("diag.widgets.13 before assistant-window")
+              desktop.assistantOverlayWindow =
+                gtk_window_new(0)
+
+            plasticUiTrace("diag.widgets.14 after widget constructors before validation")
+            plasticUiTrace(
+              "widgets nil-state: window=" &
+              $desktop.window.isNil &
+              ", overlay=" &
+              $desktop.overlay.isNil &
+              ", fixed=" &
+              $desktop.fixed.isNil &
+              ", foreignWebView=" &
+              $desktop.mainWebView.isNil &
+              ", shellWebView=" &
+              $desktop.shellWebView.isNil
+            )
+            if desktop.window.isNil or
+                desktop.overlay.isNil or
+                desktop.fixed.isNil or
+                desktop.mainWebView.isNil or
+                desktop.shellWebView.isNil or
+                (
+                  plasticEnvEnabled(
+                    "GLAUCOPLASTIC_NATIVE_ASSISTANT_OVERLAY_REMOVED_BY_COMPOSITION"
+                  ) and
+                  not application.assistantValue.isNil and
+                  application.assistantValue.config.enabled and
+                  (
+                    desktop.assistantOverlayWebView.isNil or
+                    desktop.assistantOverlayWindow.isNil
+                  )
+                ):
               raise newException(
                 PlasticRuntimeError,
                 "Falha ao criar a janela GTK/WebKitGTK"
               )
+            plasticUiTrace("diag.widgets.15 validation passed")
             application.webViewValue.initialized = true
             plasticUiTrace("widgets GTK/WebKit criados")
 
+            plasticUiTrace("diag.widgets.16 before splash widgets")
             desktop.bootWidget = gtk_box_new(1, 12)
             desktop.bootTitle = gtk_label_new(nil)
             desktop.bootSpinner = gtk_spinner_new()
@@ -13731,17 +25171,317 @@ Mantenha a resposta objetiva e útil para inferência.
             gtk_box_pack_start(desktop.bootWidget, desktop.bootProgress, 0, 0, 0)
             gtk_box_pack_start(desktop.bootWidget, desktop.bootStatus, 0, 0, 0)
 
-            gtk_window_set_title(desktop.window, application.productValue.title.cstring)
-            gtk_window_set_default_size(desktop.window, desktop.width.cint, desktop.height.cint)
-            gtk_container_add(desktop.window, desktop.overlay)
-            gtk_container_add(desktop.overlay, desktop.fixed)
-            gtk_fixed_put(desktop.fixed, desktop.mainWebView, 0, 0)
-            gtk_widget_set_size_request(desktop.mainWebView, desktop.width.cint, desktop.height.cint)
+            let applicationScreen =
+              gtk_window_get_screen(
+                desktop.window
+              )
+
+            if not applicationScreen.isNil:
+              let applicationRgbaVisual =
+                gdk_screen_get_rgba_visual(
+                  applicationScreen
+                )
+
+              if not applicationRgbaVisual.isNil:
+                gtk_widget_set_visual(
+                  desktop.window,
+                  applicationRgbaVisual
+                )
+                gtk_widget_set_app_paintable(
+                  desktop.window,
+                  1
+                )
+                gtk_widget_set_visual(
+                  desktop.shellWebView,
+                  applicationRgbaVisual
+                )
+                gtk_widget_set_app_paintable(
+                  desktop.shellWebView,
+                  1
+                )
+
+                if plasticEnvEnabled(
+                    "GLAUCOPLASTIC_UI_DEBUG"
+                  ):
+                  plasticUiTrace(
+                    "composition.shell.rgba-visual applied=true"
+                  )
+
+                if plasticEnvEnabled(
+                  "GLAUCOPLASTIC_UI_DEBUG"
+                ):
+                  plasticUiTrace(
+                    "composition.rgba enabled=true"
+                  )
+              elif plasticEnvEnabled(
+                "GLAUCOPLASTIC_UI_DEBUG"
+              ):
+                plasticUiTrace(
+                  "composition.rgba enabled=false reason=no-visual"
+                )
+
+            var foreignBackground =
+              PlasticGdkRgba(
+                red: 1.0,
+                green: 1.0,
+                blue: 1.0,
+                alpha: 1.0
+              )
+
+            var shellBackground =
+              PlasticGdkRgba(
+                red: 0.0,
+                green: 0.0,
+                blue: 0.0,
+                alpha: 0.0
+              )
+
+            webkit_web_view_set_background_color(
+              desktop.mainWebView,
+              addr foreignBackground
+            )
+            webkit_web_view_set_background_color(
+              desktop.shellWebView,
+              addr shellBackground
+            )
+
+            let foreignSettings =
+              webkit_web_view_get_settings(
+                desktop.mainWebView
+              )
+            if not foreignSettings.isNil:
+              webkit_settings_set_hardware_acceleration_policy(
+                foreignSettings,
+                1
+              )
+
+            let shellSettings =
+              webkit_web_view_get_settings(
+                desktop.shellWebView
+              )
+            if not shellSettings.isNil:
+              webkit_settings_set_hardware_acceleration_policy(
+                shellSettings,
+                2
+              )
+
+            gtk_widget_set_app_paintable(
+              desktop.shellWebView,
+              1
+            )
+
+            if plasticEnvEnabled(
+                "GLAUCOPLASTIC_UI_DEBUG"
+              ):
+              plasticUiTrace(
+                "composition.shell.software-alpha enabled=true"
+              )
+
+            gtk_window_set_title(
+              desktop.window,
+              application.productValue.title.cstring
+            )
+            gtk_window_set_default_size(
+              desktop.window,
+              desktop.width.cint,
+              desktop.height.cint
+            )
+            gtk_container_add(
+              desktop.window,
+              desktop.overlay
+            )
+
+            # Composição nativa em UMA janela:
+            #
+            # GtkWindow
+            # └── GtkOverlay
+            #     ├── base: GtkFixed -> mainWebView (foreign)
+            #     └── overlay: shellWebView (aplicação)
+            gtk_container_add(
+              desktop.overlay,
+              desktop.fixed
+            )
+
+            gtk_widget_set_size_request(
+              desktop.fixed,
+              desktop.width.cint,
+              desktop.height.cint
+            )
+
+            gtk_fixed_put(
+              desktop.fixed,
+              desktop.mainWebView,
+              0,
+              0
+            )
+
+            gtk_widget_set_size_request(
+              desktop.mainWebView,
+              1,
+              1
+            )
+
+            gtk_widget_hide(
+              desktop.mainWebView
+            )
+
+            gtk_widget_set_halign(
+              desktop.shellWebView,
+              0
+            )
+            gtk_widget_set_valign(
+              desktop.shellWebView,
+              0
+            )
+            gtk_widget_set_size_request(
+              desktop.shellWebView,
+              desktop.width.cint,
+              desktop.height.cint
+            )
+            gtk_overlay_add_overlay(
+              desktop.overlay,
+              desktop.shellWebView
+            )
+            gtk_overlay_set_overlay_pass_through(
+              desktop.overlay,
+              desktop.shellWebView,
+              0
+            )
+            gtk_overlay_reorder_overlay(
+              desktop.overlay,
+              desktop.shellWebView,
+              -1
+            )
+
+            if plasticEnvEnabled(
+                "GLAUCOPLASTIC_UI_DEBUG"
+              ):
+              plasticUiTrace(
+                "composition.layers single-window foreign-base+shell-overlay"
+              )
+
+            if not desktop.assistantOverlayWebView.isNil:
+              var transparent = PlasticGdkRgba(
+                red: 0.0,
+                green: 0.0,
+                blue: 0.0,
+                alpha: 0.0
+              )
+              webkit_web_view_set_background_color(
+                desktop.assistantOverlayWebView,
+                addr transparent
+              )
+              gtk_widget_set_halign(
+                desktop.assistantOverlayWebView,
+                1
+              )
+              gtk_widget_set_valign(
+                desktop.assistantOverlayWebView,
+                1
+              )
+              gtk_widget_set_size_request(
+                desktop.assistantOverlayWebView,
+                1,
+                1
+              )
+              gtk_window_set_title(
+                desktop.assistantOverlayWindow,
+                "Glauco Assistant".cstring
+              )
+              gtk_window_set_decorated(
+                desktop.assistantOverlayWindow,
+                0
+              )
+              gtk_window_set_transient_for(
+                desktop.assistantOverlayWindow,
+                desktop.window
+              )
+              gtk_window_set_destroy_with_parent(
+                desktop.assistantOverlayWindow,
+                1
+              )
+              gtk_window_set_keep_above(
+                desktop.assistantOverlayWindow,
+                1
+              )
+              gtk_window_set_skip_taskbar_hint(
+                desktop.assistantOverlayWindow,
+                1
+              )
+              gtk_window_set_skip_pager_hint(
+                desktop.assistantOverlayWindow,
+                1
+              )
+              gtk_window_set_resizable(
+                desktop.assistantOverlayWindow,
+                0
+              )
+              gtk_window_set_accept_focus(
+                desktop.assistantOverlayWindow,
+                1
+              )
+              gtk_window_set_focus_on_map(
+                desktop.assistantOverlayWindow,
+                0
+              )
+              gtk_window_set_position(
+                desktop.assistantOverlayWindow,
+                4
+              )
+              gtk_window_set_type_hint(
+                desktop.assistantOverlayWindow,
+                5
+              )
+              gtk_window_set_default_size(
+                desktop.assistantOverlayWindow,
+                900,
+                96
+              )
+              gtk_container_add(
+                desktop.assistantOverlayWindow,
+                desktop.assistantOverlayWebView
+              )
+              gtk_overlay_set_overlay_pass_through(
+                desktop.overlay,
+                desktop.assistantOverlayWebView,
+                0
+              )
+              gtk_overlay_reorder_overlay(
+                desktop.overlay,
+                desktop.assistantOverlayWebView,
+                -1
+              )
+              plasticUiTrace(
+                "assistant.overlay attached topmost=true"
+              )
+              let overlayBaseUri =
+                "file://" &
+                getCurrentDir().replace(" ", "%20") &
+                "/"
+              let overlayHtml =
+                plasticAssistantNativeOverlayHtml(application)
+              webkit_web_view_load_html(
+                desktop.assistantOverlayWebView,
+                overlayHtml.cstring,
+                overlayBaseUri.cstring
+              )
+              gtk_widget_show(desktop.assistantOverlayWebView)
+              gtk_widget_hide(desktop.assistantOverlayWindow)
+              discard g_signal_connect_data(
+                desktop.assistantOverlayWebView,
+                "permission-request",
+                cast[pointer](onPlasticMainPermissionRequest),
+                cast[pointer](desktop),
+                nil,
+                0
+              )
+
             gtk_fixed_put(desktop.fixed, desktop.bootWidget, 24, 24)
             gtk_widget_show_all(desktop.bootWidget)
             gtk_widget_hide(desktop.mainWebView)
+            gtk_widget_hide(desktop.shellWebView)
             desktop.geometryTimer = g_timeout_add(
-              50,
+              100,
               syncPlasticForeignGeometry,
               cast[pointer](desktop)
             )
@@ -13782,6 +25522,22 @@ Mantenha a resposta objetiva e útil para inferência.
               desktop.mainWebView,
               "web-process-terminated",
               cast[pointer](onPlasticMainWebProcessTerminated),
+              cast[pointer](desktop),
+              nil,
+              0
+            )
+            discard g_signal_connect_data(
+              desktop.shellWebView,
+              "web-process-terminated",
+              cast[pointer](onPlasticShellWebProcessTerminated),
+              cast[pointer](desktop),
+              nil,
+              0
+            )
+            discard g_signal_connect_data(
+              desktop.mainWebView,
+              "permission-request",
+              cast[pointer](onPlasticMainPermissionRequest),
               cast[pointer](desktop),
               nil,
               0
@@ -14037,7 +25793,11 @@ Mantenha a resposta objetiva e útil para inferência.
                   " agents=" & $app.agentsValue.len &
                   " bootStateNil=" & $(desktop.llamaBootState.isNil)
                 )
-                if desktop.autoStartModel and app.agentsValue.len > 0 and
+                let assistantRequired =
+                  not app.assistantValue.isNil and
+                  app.assistantValue.config.enabled
+                if desktop.autoStartModel and
+                    (app.agentsValue.len > 0 or assistantRequired) and
                     desktop.llamaBootState.isNil:
                   desktop.llamaBootState = newLlamaBootState(
                     "Carregando runtimes locais..."
@@ -14077,10 +25837,17 @@ Mantenha a resposta objetiva e útil para inferência.
                   )
                   discard onPlasticDesktopModelBootPoll(cast[pointer](desktop))
                 elif not desktop.mainWebView.isNil:
-                  plasticUiTrace("startup: boot gate skipped, showing mainWebView")
+                  plasticUiTrace(
+                    "startup: boot gate skipped, showing foreign+shell"
+                  )
                   if not desktop.bootWidget.isNil:
                     gtk_widget_hide(desktop.bootWidget)
                   gtk_widget_show(desktop.mainWebView)
+                  if not desktop.shellWebView.isNil:
+                    gtk_widget_show(desktop.shellWebView)
+                    desktop.raisePlasticApplicationShell(
+                      "startup-no-model"
+                    )
 
               if plasticEnvEnabled("GLAUCOPLASTIC_DISABLE_STARTUP_PROGRAM"):
                 plasticUiTrace("startup program desativado")
@@ -14105,12 +25872,13 @@ Mantenha a resposta objetiva e útil para inferência.
                 finally:
                   app.uiPropertyWriterValue = previousUiWriter
                 plasticUiTrace("startup: after executeProgram")
-                desktop.reloadLinuxDesktop()
-                plasticUiTrace("startup: after reload")
 
                 for path in app.foreignValue.elements.keys.toSeq.sorted:
                   app.foreignValue.create(path)
                 plasticUiTrace("startup: after foreign create")
+
+                desktop.reloadLinuxDesktop()
+                plasticUiTrace("startup: after reload")
                 startDesktopLlamaBoot(desktop)
                 plasticUiTrace("startup: after start boot")
               plasticUiTrace("startup callback concluido")
@@ -14193,11 +25961,25 @@ Mantenha a resposta objetiva e útil para inferência.
           }
 
           result["metisMemory"] = application.metisMemoryValue.statusJson()
+          result["assistant"] =
+            if application.assistantValue.isNil:
+              newJNull()
+            else:
+              plasticAssistantSnapshot(application.assistantValue)
 
           result["foreign"] = application.foreignValue.list()
           result["webview"] = application.webViewValue.describe()
 
+          result["inference"] = %*{
+            "provider": "metis",
+            "mode": "embedded",
+            "model": application.metisMemoryValue.config.modelId,
+            "ready": application.metisMemoryValue.initialized,
+            "error": application.metisMemoryValue.lastError
+          }
+
           result["llama"] = %*{
+            "legacyFacade": true,
             "endpoint": application.llamaValue.endpoint,
             "executablePath": application.llamaValue.executablePath,
             "modelPath": application.llamaValue.modelPath,
@@ -14254,56 +26036,70 @@ Mantenha a resposta objetiva e útil para inferência.
           application.okfValue.saveSpaces()
 
         proc prepareExecutionEnvironment(application: PlasticApplication) =
-          let hasWayland = getEnv("WAYLAND_DISPLAY").len > 0
-          let hasX11 = getEnv("DISPLAY").len > 0
-          let explicitBackend =
-            getEnv("GLAUCOPLASTIC_GDK_BACKEND").strip
-          let inheritedBackend =
-            getEnv("GDK_BACKEND").strip
-          let problematicWaylandEnvironment =
-            isWlrootsDesktop() or hasNvidiaDriver()
+          when defined(linux):
+            let hasWayland = getEnv("WAYLAND_DISPLAY").len > 0
+            let hasX11 = getEnv("DISPLAY").len > 0
+            let explicitBackend =
+              getEnv("GLAUCOPLASTIC_GDK_BACKEND").strip
+            let inheritedBackend =
+              getEnv("GDK_BACKEND").strip
+            let problematicWaylandEnvironment =
+              isWlrootsDesktop() or hasNvidiaDriver()
 
-          proc applySafeLinuxGraphicsEnvironment(backend: string) =
-            if backend.len == 0:
-              return
+            proc applySafeLinuxGraphicsEnvironment(backend: string) =
+              if backend.len == 0:
+                return
 
-            putEnv("GLAUCOPLASTIC_GDK_BACKEND", backend)
-            putEnv("GDK_BACKEND", backend)
+              putEnv("GLAUCOPLASTIC_GDK_BACKEND", backend)
+              putEnv("GDK_BACKEND", backend)
 
-            if backend == "x11":
-              if getEnv("DISPLAY").len == 0:
-                putEnv("DISPLAY", ":0")
-              delEnv("WAYLAND_DISPLAY")
-              putEnv("XDG_SESSION_TYPE", "x11")
-            elif backend == "wayland":
-              putEnv("XDG_SESSION_TYPE", "wayland")
+              if backend == "x11":
+                if getEnv("DISPLAY").len == 0:
+                  putEnv("DISPLAY", ":0")
+                delEnv("WAYLAND_DISPLAY")
+                putEnv("XDG_SESSION_TYPE", "x11")
+              elif backend == "wayland":
+                putEnv("XDG_SESSION_TYPE", "wayland")
 
-            if application.webViewValue.safeGraphics or
-                backend == "x11" or problematicWaylandEnvironment:
+              if application.webViewValue.safeGraphics or
+                  backend == "x11":
+                putEnv("GLAUCOPLASTIC_DISABLE_DMABUF", "1")
+                putEnv("WEBKIT_DISABLE_DMABUF_RENDERER", "1")
+                putEnv("WEBKIT_DISABLE_COMPOSITING_MODE", "1")
+                putEnv("LIBGL_ALWAYS_SOFTWARE", "1")
+              elif problematicWaylandEnvironment:
+                # Em Wayland, a composição permanece ativa porque página e
+                # shell pertencem à mesma WebKitWebView. Desativa somente DMABUF.
+                putEnv("GLAUCOPLASTIC_DISABLE_DMABUF", "1")
+                putEnv("WEBKIT_DISABLE_DMABUF_RENDERER", "1")
+                delEnv("WEBKIT_DISABLE_COMPOSITING_MODE")
+                delEnv("LIBGL_ALWAYS_SOFTWARE")
+
+            if explicitBackend.len > 0:
+              applySafeLinuxGraphicsEnvironment(explicitBackend)
+            elif inheritedBackend.len > 0:
+              applySafeLinuxGraphicsEnvironment(inheritedBackend)
+            else:
+              var selectedBackend = ""
+              if hasWayland and
+                  getEnv("XDG_SESSION_TYPE").toLowerAscii == "wayland":
+                selectedBackend = "wayland"
+              elif hasX11:
+                selectedBackend = "x11"
+              elif hasWayland:
+                selectedBackend = "wayland"
+
+              if selectedBackend.len > 0:
+                applySafeLinuxGraphicsEnvironment(selectedBackend)
+
+            if application.webViewValue.safeGraphics:
               putEnv("GLAUCOPLASTIC_DISABLE_DMABUF", "1")
               putEnv("WEBKIT_DISABLE_DMABUF_RENDERER", "1")
               putEnv("WEBKIT_DISABLE_COMPOSITING_MODE", "1")
               putEnv("LIBGL_ALWAYS_SOFTWARE", "1")
 
-          if explicitBackend.len > 0:
-            applySafeLinuxGraphicsEnvironment(explicitBackend)
-          elif inheritedBackend.len > 0:
-            applySafeLinuxGraphicsEnvironment(inheritedBackend)
           else:
-            var selectedBackend = ""
-            if hasX11:
-              selectedBackend = "x11"
-            elif hasWayland:
-              selectedBackend = "wayland"
-
-            if selectedBackend.len > 0:
-              applySafeLinuxGraphicsEnvironment(selectedBackend)
-
-          if application.webViewValue.safeGraphics:
-            putEnv("GLAUCOPLASTIC_DISABLE_DMABUF", "1")
-            putEnv("WEBKIT_DISABLE_DMABUF_RENDERER", "1")
-            putEnv("WEBKIT_DISABLE_COMPOSITING_MODE", "1")
-            putEnv("LIBGL_ALWAYS_SOFTWARE", "1")
+            discard application
 
         proc prepareDevelopmentLayout*(application: PlasticApplication) =
           ## Compatibilidade com projetos antigos. O framework prepara o layout
@@ -14312,6 +26108,154 @@ Mantenha a resposta objetiva e útil para inferência.
 
         proc registerForeignBackend*(application: PlasticApplication; backend: PlasticForeignBackend) =
           application.foreignValue.registerBackend(backend)
+
+        proc preloadMetisAtStartup*(
+          application: PlasticApplication
+        ) =
+          if application.isNil or
+              application.metisMemoryValue.isNil:
+            return
+
+          let memory = application.metisMemoryValue
+
+          if not memory.config.enabled:
+            plasticDebugTrace(
+              "metis.startup.skipped reason=disabled"
+            )
+            return
+
+          if not memory.config.startup:
+            plasticDebugTrace(
+              "metis.startup.skipped reason=config-disabled"
+            )
+            return
+
+          if memory.initialized:
+            plasticDebugTrace(
+              "metis.startup.skipped reason=already-initialized"
+            )
+            return
+
+          let startedAt = epochTime()
+          memory.startupAttempted = true
+          memory.startupFailed = false
+
+          plasticDebugTrace(
+            "metis.startup.requested model=" &
+            memory.config.modelId &
+            " mode=blocking-before-ui" &
+            " required=" &
+            $memory.config.startupRequired
+          )
+
+          try:
+            memory.ensureInitialized(
+              application.llamaValue
+            )
+
+            let metisPrewarmEnabled =
+              getEnv(
+                "GLAUCOPLASTIC_METIS_PREWARM",
+                "1"
+              ).strip.toLowerAscii notin
+                ["0", "false", "no", "off", "disabled"]
+
+            if metisPrewarmEnabled:
+              let prewarmStartedAt = epochTime()
+
+              if memory.config.diagnoseMemory:
+                plasticDebugTrace(
+                  "metis.processes phase=before-prewarm"
+                )
+                discard plasticMetisLogNvidiaProcesses()
+
+              let prewarmTokens =
+                max(
+                  4,
+                  parseInt(
+                    getEnv(
+                      "GLAUCOPLASTIC_METIS_PREWARM_TOKENS",
+                      "16"
+                    )
+                  )
+                )
+
+              plasticDebugTrace(
+                "metis.prewarm.start model=" &
+                memory.config.modelId &
+                " maxTokens=" & $prewarmTokens
+              )
+
+              try:
+                let prewarmOutput =
+                  memory.generateText(
+                    %*[
+                      {
+                        "role": "system",
+                        "content":
+                          "Prewarm do runtime. Responda somente com um objeto JSON curto."
+                      },
+                      {
+                        "role": "user",
+                        "content": "{\"ok\":true}"
+                      }
+                    ],
+                    prewarmTokens,
+                    true,
+                    false,
+                    0.0
+                  )
+
+                plasticDebugTrace(
+                  "metis.prewarm.done model=" &
+                  memory.config.modelId &
+                  " elapsedSeconds=" &
+                  $(epochTime() - prewarmStartedAt) &
+                  " outputChars=" & $prewarmOutput.len
+                )
+
+                if memory.config.diagnoseMemory:
+                  plasticDebugTrace(
+                    "metis.processes phase=after-prewarm"
+                  )
+                  discard plasticMetisLogNvidiaProcesses()
+              except CatchableError as prewarmError:
+                plasticDebugTrace(
+                  "metis.prewarm.failed model=" &
+                  memory.config.modelId &
+                  " elapsedSeconds=" &
+                  $(epochTime() - prewarmStartedAt) &
+                  " error=" & prewarmError.msg
+                )
+
+            memory.startupFailed = false
+            plasticDebugTrace(
+              "metis.startup.ready model=" &
+              memory.config.modelId &
+              " elapsedSeconds=" &
+              $(epochTime() - startedAt)
+            )
+          except CatchableError as error:
+            memory.lastError = error.msg
+            memory.startupFailed = true
+            memory.releaseFailedLoad()
+            plasticDebugTrace(
+              "metis.startup.failed model=" &
+              memory.config.modelId &
+              " elapsedSeconds=" &
+              $(epochTime() - startedAt) &
+              " required=" &
+              $memory.config.startupRequired &
+              " error=" & error.msg
+            )
+
+            if memory.config.startupRequired:
+              raise
+
+            plasticDebugTrace(
+              "metis.startup.continue-without-memory " &
+              "reason=optional-preload-failed"
+            )
 
         proc initializeTechnologies*(
           application: PlasticApplication;
@@ -14329,7 +26273,10 @@ Mantenha a resposta objetiva e útil para inferência.
           discard application.componentsValue
           discard application.renderTreeValue
 
-          if startModel and application.agentsValue.len > 0:
+          if startModel and
+              (application.agentsValue.len > 0 or
+               (not application.assistantValue.isNil and
+                application.assistantValue.config.enabled)):
             application.llamaValue.start()
             if application.metisMemoryValue.config.enabled and
                 application.metisMemoryValue.config.startup:
@@ -14339,6 +26286,115 @@ Mantenha a resposta objetiva e útil para inferência.
 
           result = application.runtimeSummary()
 
+        proc serveNetworkWeb*(
+          application: PlasticApplication;
+          startModel: bool;
+          host: string;
+          port: int
+        ) =
+          application.webViewValue.prepareStorage()
+
+          if not plasticEnvEnabled("GLAUCOPLASTIC_DISABLE_STARTUP_PROGRAM"):
+            application.executeProgram()
+
+          application.preloadMetisAtStartup()
+
+          let assistantModelRequired =
+            not application.assistantValue.isNil and
+            application.assistantValue.config.enabled
+
+          if startModel and
+              (application.agentsValue.len > 0 or assistantModelRequired):
+            application.llamaValue.start()
+            if application.metisMemoryValue.config.enabled and
+                application.metisMemoryValue.config.startup:
+              application.metisMemoryValue.ensureInitialized(application.llamaValue)
+
+          if application.foreignValue.backend.isNil:
+            application.foreignValue.registerBackend(newMockForeignBackend())
+
+          for path in application.foreignValue.elements.keys:
+            application.foreignValue.create(path)
+
+          if not application.assistantValue.isNil and
+              application.assistantValue.config.enabled and
+              not application.assistantValue.started:
+            application.assistantValue.start()
+
+          var propertyLock: Lock
+          initLock(propertyLock)
+          var propertyUpdates: seq[JsonNode] = @[]
+          let webApplication = application
+
+          application.uiPropertyWriterValue =
+            proc(path, propertyName: string; value: JsonNode) =
+              let update = %*{
+                "path": path,
+                "property": propertyName,
+                "value": if value.isNil: newJNull() else: value.copy
+              }
+              acquire(propertyLock)
+              propertyUpdates.add update
+              release(propertyLock)
+
+          let renderHtml: PlasticNetworkWebRenderProc =
+            proc(): string =
+              webApplication.renderApplicationHtml()
+
+          let dispatchEvent: PlasticNetworkWebEventProc =
+            proc(event: JsonNode) =
+              if event.kind != JObject:
+                return
+
+              let eventValue =
+                if event.hasKey("value") and event["value"].kind != JNull:
+                  event["value"].copy
+                elif event.hasKey("checked") and event["checked"].kind != JNull:
+                  event["checked"].copy
+                else:
+                  newJNull()
+
+              let bindState = `jsonStringFieldSym`(event, "bindState")
+              if bindState.len > 0 and webApplication.statesValue.exists(bindState):
+                `stateSetInternalSym`(
+                  webApplication.statesValue,
+                  bindState,
+                  eventValue
+                )
+
+              webApplication.dispatchUiEvent(event)
+
+          let pollState: PlasticNetworkWebPollProc =
+            proc(): JsonNode =
+              result = %*{"ok": true, "properties": newJArray()}
+
+              acquire(propertyLock)
+              for update in propertyUpdates:
+                result["properties"].add update.copy
+              propertyUpdates.setLen(0)
+              release(propertyLock)
+
+              if not webApplication.assistantValue.isNil and
+                  webApplication.assistantValue.config.enabled:
+                result["assistant"] =
+                  plasticAssistantSnapshot(webApplication.assistantValue)
+
+          try:
+            runPlasticNetworkWebServer(
+              host,
+              port,
+              renderHtml,
+              dispatchEvent,
+              pollState
+            )
+          finally:
+            application.uiPropertyWriterValue = nil
+            deinitLock(propertyLock)
+            application.assistantValue.stop()
+            application.metisMemoryValue.stop()
+            application.llamaValue.stop()
+            application.runningValue = false
+
         proc run*(application: PlasticApplication; startModel = true) =
           plasticUiTrace("run: begin")
           application.validateInstallation()
@@ -14346,11 +26402,22 @@ Mantenha a resposta objetiva e útil para inferência.
           application.prepareExecutionEnvironment()
           var headlessFallback = plasticEnvEnabled("GLAUCOPLASTIC_DISABLE_UI_LAUNCHER")
           let useUiLauncher = plasticEnvEnabled("GLAUCOPLASTIC_USE_UI_LAUNCHER")
-          let modelStartupDisabled =
-            plasticEnvEnabled("GLAUCOPLASTIC_DISABLE_MODEL_STARTUP")
-          let autoStartModel =
-            (startModel or application.agentsValue.len > 0) and
-            not modelStartupDisabled
+          # O cliente usa o runtime Metis configurado externamente.
+          # Nenhum modelo GGUF é baixado ou iniciado pelo framework.
+          let assistantModelRequired =
+            not application.assistantValue.isNil and
+            application.assistantValue.config.enabled
+          let autoStartModel = false
+
+          let networkWeb = plasticNetworkWebOptions(commandLineParams())
+          if networkWeb.enabled:
+            application.runningValue = true
+            application.serveNetworkWeb(
+              autoStartModel,
+              networkWeb.host,
+              networkWeb.port
+            )
+            return
 
           when defined(linux) and not defined(glaucoplasticHeadless):
             if useUiLauncher and not isPlasticLinuxUiChild() and not headlessFallback:
@@ -14364,12 +26431,38 @@ Mantenha a resposta objetiva e útil para inferência.
 
           application.runningValue = true
 
-          when defined(linux) and not defined(glaucoplasticHeadless):
+          application.preloadMetisAtStartup()
+
+          when defined(windows) and not defined(glaucoplasticHeadless):
+            if headlessFallback:
+              plasticUiTrace("run: windows headlessFallback")
+              if not plasticEnvEnabled("GLAUCOPLASTIC_DISABLE_STARTUP_PROGRAM"):
+                application.executeProgram()
+              if application.foreignValue.backend.isNil:
+                application.foreignValue.registerBackend(
+                  newMockForeignBackend()
+                )
+              for path in application.foreignValue.elements.keys:
+                application.foreignValue.create(path)
+            else:
+              try:
+                plasticUiTrace("run: openWindowsDesktop")
+                application.openWindowsDesktop(
+                  autoStartModel
+                )
+              finally:
+                application.assistantValue.stop()
+                application.metisMemoryValue.stop()
+                application.llamaValue.stop()
+                application.runningValue = false
+
+          elif defined(linux) and not defined(glaucoplasticHeadless):
             if headlessFallback:
               plasticUiTrace("run: headlessFallback")
               if not plasticEnvEnabled("GLAUCOPLASTIC_DISABLE_STARTUP_PROGRAM"):
                 application.executeProgram()
-              if autoStartModel and application.agentsValue.len > 0:
+              if autoStartModel and
+                  (application.agentsValue.len > 0 or assistantModelRequired):
                 application.llamaValue.start()
                 if application.metisMemoryValue.config.enabled and
                     application.metisMemoryValue.config.startup:
@@ -14386,8 +26479,13 @@ Mantenha a resposta objetiva e útil para inferência.
               try:
                 plasticUiTrace("run: openLinuxDesktop")
                 application.openLinuxDesktop(autoStartModel)
-              except PlasticRuntimeError:
-                if autoStartModel and application.agentsValue.len > 0:
+              except PlasticRuntimeError as uiError:
+                plasticUiTrace(
+                  "run: openLinuxDesktop PlasticRuntimeError=" &
+                  uiError.msg
+                )
+                if autoStartModel and
+                  (application.agentsValue.len > 0 or assistantModelRequired):
                   application.llamaValue.start()
                   if application.metisMemoryValue.config.enabled and
                       application.metisMemoryValue.config.startup:
@@ -14398,7 +26496,15 @@ Mantenha a resposta objetiva e útil para inferência.
                   application.foreignValue.registerBackend(newMockForeignBackend())
                 for path in application.foreignValue.elements.keys:
                   application.foreignValue.create(path)
+              except CatchableError as uiCatchableError:
+                plasticUiTrace(
+                  "run: openLinuxDesktop CatchableError=" &
+                  $uiCatchableError.name &
+                  ": " &
+                  uiCatchableError.msg
+                )
               finally:
+                application.assistantValue.stop()
                 application.metisMemoryValue.stop()
                 application.llamaValue.stop()
                 application.runningValue = false
@@ -14406,7 +26512,8 @@ Mantenha a resposta objetiva e útil para inferência.
             plasticUiTrace("run: no linux UI branch")
             if not plasticEnvEnabled("GLAUCOPLASTIC_DISABLE_STARTUP_PROGRAM"):
               application.executeProgram()
-            if autoStartModel and application.agentsValue.len > 0:
+            if autoStartModel and
+                  (application.agentsValue.len > 0 or assistantModelRequired):
               application.llamaValue.start()
               if application.metisMemoryValue.config.enabled and
                   application.metisMemoryValue.config.startup:
@@ -14421,7 +26528,18 @@ Mantenha a resposta objetiva e útil para inferência.
         proc close*(application: PlasticApplication) =
           if application.isNil:
             return
-          when defined(linux):
+          when defined(windows) and not defined(glaucoplasticHeadless):
+            if not application.desktopValue.isNil and
+                application.desktopValue.running:
+              let desktop =
+                cast[PlasticWindowsDesktopRuntime](
+                  application.desktopValue
+                )
+              if not desktop.host.isNil:
+                gpwv2_close(desktop.host)
+              application.desktopValue.running = false
+
+          elif defined(linux):
             if not application.desktopValue.isNil and application.desktopValue.running:
               let desktop = cast[PlasticLinuxDesktopRuntime](application.desktopValue)
               closeWebKitDeveloperTools(desktop.mainWebView)
@@ -14432,6 +26550,7 @@ Mantenha a resposta objetiva e útil para inferência.
               application.foreignValue.close(path)
             except PlasticForeignBackendError:
               discard
+          application.assistantValue.stop()
           application.metisMemoryValue.stop()
           application.llamaValue.stop()
           application.runningValue = false

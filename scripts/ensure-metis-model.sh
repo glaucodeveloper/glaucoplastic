@@ -1,149 +1,201 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT="${GLAUCOPLASTIC_PROJECT:-$(cd -- "$SCRIPT_DIR/.." && pwd)}"
+MODEL_ID="${GLAUCOPLASTIC_METIS_MODEL:-IAAR-Shanghai/Metis-4B}"
+MODEL_SLUG="${MODEL_ID//\//_}"
+TARGET="${GLAUCOPLASTIC_METIS_DOWNLOAD_DIR:-$HOME/.local/share/glaucoplastic/models/metis/$MODEL_SLUG}"
 
-MODEL_ID="IAAR-Shanghai/Metis-4B"
-MODEL_SLUG="IAAR-Shanghai_Metis-4B"
-HF_REPO_DIR="$HOME/.cache/huggingface/hub/models--IAAR-Shanghai--Metis-4B"
-USER_MODEL_ROOT="${GLAUCOPLASTIC_METIS_MODEL_ROOT:-$HOME/.local/share/glaucoplastic/models/metis}"
-USER_MODEL="$USER_MODEL_ROOT/$MODEL_SLUG"
-PROJECT_MODEL="$PROJECT/models/metis/$MODEL_SLUG"
-STAMP="$(date +%Y%m%d-%H%M%S)"
-
-fail() {
-  printf 'ERRO: %s\n' "$*" >&2
-  exit 1
+log() {
+  printf '[GlaucoPlastic:Metis] %s\n' "$*" >&2
 }
 
-model_complete() {
+model_ready() {
   local root="$1"
 
-  [[ -s "$root/config.json" ]] &&
-  [[ -s "$root/configuration_metis.py" ]] &&
-  [[ -s "$root/modeling_metis.py" ]] &&
-  [[ -s "$root/tokenizer.json" ]] &&
-  [[ -s "$root/model.safetensors.index.json" ]] &&
-  [[ -s "$root/model-00001-of-00002.safetensors" ]] &&
-  [[ -s "$root/model-00002-of-00002.safetensors" ]]
+  [[ -d "$root" ]] || return 1
+  [[ -s "$root/config.json" ]] || return 1
+
+  local index="$root/model.safetensors.index.json"
+
+  if [[ -s "$index" ]]; then
+    python3 - "$root" "$index" <<'PY'
+import json
+import os
+import sys
+
+root = os.path.realpath(sys.argv[1])
+index_path = sys.argv[2]
+
+try:
+    with open(index_path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+except Exception:
+    raise SystemExit(1)
+
+weight_map = payload.get("weight_map") or {}
+shards = sorted(set(weight_map.values()))
+
+if not shards:
+    raise SystemExit(1)
+
+for shard in shards:
+    path = os.path.join(root, shard)
+    if not os.path.isfile(path) or os.path.getsize(path) <= 0:
+        raise SystemExit(1)
+
+raise SystemExit(0)
+PY
+    return $?
+  fi
+
+  [[ -s "$root/model.safetensors" ]]
 }
 
-find_hf_snapshot() {
-  local revision=""
+candidate_paths() {
+  local explicit="${GLAUCOPLASTIC_METIS_MODEL_PATH:-}"
+
+  [[ -z "$explicit" ]] || printf '%s\n' "$explicit"
+
+  printf '%s\n' \
+    "$TARGET" \
+    "$HOME/dev/glaucoplastic/models/Metis-4B" \
+    "$HOME/models/glaucoplastic-local/Metis-4B"
+
+  local hf_repo="$HOME/.cache/huggingface/hub/models--IAAR-Shanghai--Metis-4B"
+
+  if [[ -s "$hf_repo/refs/main" ]]; then
+    local revision
+    revision="$(tr -d '\r\n' < "$hf_repo/refs/main")"
+    [[ -z "$revision" ]] || printf '%s\n' "$hf_repo/snapshots/$revision"
+  fi
+
+  if [[ -d "$hf_repo/snapshots" ]]; then
+    find "$hf_repo/snapshots" \
+      -mindepth 1 \
+      -maxdepth 1 \
+      -type d \
+      -print 2>/dev/null || true
+  fi
+}
+
+resolve_existing() {
   local candidate=""
 
-  if [[ -s "$HF_REPO_DIR/refs/main" ]]; then
-    revision="$(tr -d '\r\n' < "$HF_REPO_DIR/refs/main")"
-    candidate="$HF_REPO_DIR/snapshots/$revision"
+  while IFS= read -r candidate; do
+    [[ -n "$candidate" ]] || continue
 
-    if model_complete "$candidate"; then
-      printf '%s\n' "$candidate"
+    if model_ready "$candidate"; then
+      (
+        cd "$candidate"
+        pwd -P
+      )
       return 0
     fi
-  fi
-
-  if [[ -d "$HF_REPO_DIR/snapshots" ]]; then
-    while IFS= read -r candidate; do
-      if model_complete "$candidate"; then
-        printf '%s\n' "$candidate"
-        return 0
-      fi
-    done < <(
-      find "$HF_REPO_DIR/snapshots" \
-        -mindepth 1 -maxdepth 1 -type d \
-        -printf '%T@ %p\n' 2>/dev/null |
-      sort -nr |
-      cut -d' ' -f2-
-    )
-  fi
+  done < <(candidate_paths)
 
   return 1
 }
 
-register_project_model() {
-  mkdir -p "$(dirname -- "$PROJECT_MODEL")"
+download_model() {
+  case "${GLAUCOPLASTIC_METIS_AUTO_DOWNLOAD:-1}" in
+    0|false|FALSE|no|NO|off|OFF)
+      log "download automático desabilitado"
+      return 1
+      ;;
+  esac
 
-  if [[ -e "$PROJECT_MODEL" || -L "$PROJECT_MODEL" ]]; then
-    rm -rf "$PROJECT_MODEL"
+  local python="${GLAUCOPLASTIC_METIS_PYTHON:-}"
+
+  if [[ -z "$python" && -x "$HOME/.venvs/metis-gemma/bin/python" ]]; then
+    python="$HOME/.venvs/metis-gemma/bin/python"
   fi
 
-  ln -s "$USER_MODEL" "$PROJECT_MODEL"
-}
+  if [[ -z "$python" ]]; then
+    python="$(command -v python3 || command -v python || true)"
+  fi
 
-mkdir -p "$USER_MODEL_ROOT"
+  [[ -n "$python" ]] || {
+    log "Python não encontrado"
+    return 1
+  }
 
-if model_complete "$USER_MODEL"; then
-  register_project_model
-  echo "[GlaucoPlastic] Metis disponível em $USER_MODEL"
-  exit 0
-fi
+  if ! "$python" -c 'import huggingface_hub' >/dev/null 2>&1; then
+    case "${GLAUCOPLASTIC_METIS_AUTO_INSTALL:-1}" in
+      0|false|FALSE|no|NO|off|OFF)
+        log "huggingface_hub ausente e auto-install desabilitado"
+        return 1
+        ;;
+    esac
 
-TEMP_MODEL="$USER_MODEL.installing-$STAMP"
-rm -rf "$TEMP_MODEL"
-mkdir -p "$TEMP_MODEL"
+    log "Instalando huggingface-hub"
+    "$python" -m pip install --upgrade huggingface-hub
+  fi
 
-if SNAPSHOT="$(find_hf_snapshot)"; then
-  echo "[GlaucoPlastic] Materializando o Metis do cache Hugging Face"
-  echo "  origem:  $SNAPSHOT"
-  echo "  destino: $USER_MODEL"
+  mkdir -p "$TARGET"
 
-  cp -aL --reflink=auto "$SNAPSHOT/." "$TEMP_MODEL/"
-else
-  echo "[GlaucoPlastic] Cache completo ausente; baixando $MODEL_ID"
+  log "Baixando $MODEL_ID"
+  log "Destino: $TARGET"
 
-  PYTHON="${GLAUCOPLASTIC_BUILD_PYTHON:-python3}"
-
-  "$PYTHON" - "$MODEL_ID" "$TEMP_MODEL" <<'PY'
-from pathlib import Path
-import subprocess
+  "$python" - "$MODEL_ID" "$TARGET" <<'PY'
+import os
 import sys
+from huggingface_hub import snapshot_download
 
 repo_id = sys.argv[1]
-destination = Path(sys.argv[2]).resolve()
+local_dir = sys.argv[2]
 
-try:
-    from huggingface_hub import snapshot_download
-except ImportError:
-    subprocess.check_call([
-        sys.executable,
-        "-m",
-        "pip",
-        "install",
-        "--user",
-        "--upgrade",
-        "huggingface_hub",
-    ])
-    from huggingface_hub import snapshot_download
+token = (
+    os.environ.get("HF_TOKEN")
+    or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    or None
+)
+
+cache_dir = os.environ.get("HUGGINGFACE_HUB_CACHE")
+
+if not cache_dir:
+    cache_dir = os.path.join(
+        os.path.expanduser("~"),
+        ".cache",
+        "huggingface",
+        "hub"
+    )
 
 snapshot_download(
     repo_id=repo_id,
-    local_dir=str(destination),
-    max_workers=4,
+    repo_type="model",
+    local_dir=local_dir,
+    cache_dir=cache_dir,
+    local_files_only=False,
+    token=token,
+    max_workers=int(
+        os.environ.get(
+            "GLAUCOPLASTIC_METIS_DOWNLOAD_WORKERS",
+            "4"
+        )
+    )
 )
 PY
-fi
 
-if ! model_complete "$TEMP_MODEL"; then
-  rm -rf "$TEMP_MODEL"
-  fail "o download/materialização terminou com o modelo incompleto"
-fi
+  model_ready "$TARGET" || {
+    log "checkpoint incompleto após download: $TARGET"
+    return 1
+  }
 
-if find "$TEMP_MODEL" -type l -print -quit | grep -q .; then
-  rm -rf "$TEMP_MODEL"
-  fail "a pasta materializada ainda contém links simbólicos"
-fi
-
-cat > "$TEMP_MODEL/.glaucoplastic-model.json" <<JSON
-{
-  "modelId": "$MODEL_ID",
-  "directoryName": "$MODEL_SLUG",
-  "source": "user-model-store"
+  (
+    cd "$TARGET"
+    pwd -P
+  )
 }
-JSON
 
-rm -rf "$USER_MODEL"
-mv "$TEMP_MODEL" "$USER_MODEL"
-register_project_model
+main() {
+  local resolved=""
 
-echo "[GlaucoPlastic] Metis preparado em $USER_MODEL"
+  if resolved="$(resolve_existing)"; then
+    printf '%s\n' "$resolved"
+    return 0
+  fi
+
+  download_model
+}
+
+main "$@"

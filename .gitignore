@@ -198,3 +198,58 @@ examples/*/main
 *.flac
 
 # END GLAUCOPLASTIC GENERATED IGNORES
+
+# >>> GlaucoPlastic local/generated >>>
+# Backups produzidos por patchers e correções locais.
+*.backup-*
+*.bak
+*.bak.*
+*.bak-*
+*.orig
+*.rej
+*~
+
+# Patchers baixados/aplicados na raiz local.
+/corrigir_*.py
+/reestruturar_*.py
+/instalar_*.py
+/patch_*.py
+
+# Binários/artefatos locais.
+/src/glaucoplastic
+/src/glaucoplastic.exe
+/.build/
+/dist/
+/bin/
+/nimcache/
+/versions/
+/.version/
+/.versions/
+/release/
+/releases/
+
+# Modelos, runtimes e caches grandes.
+/models/
+/runtime/
+/.glaucoplastic/
+/.webview2/
+/webview2-sdk/
+
+# Temporários Python/Nim.
+__pycache__/
+*.pyc
+*.pyo
+.nimblecache/
+*.nims.cache
+
+# Segredos/configuração local.
+.env
+.env.*
+!.env.example
+
+# Downloads parciais e pacotes temporários.
+*.partial
+*.part
+*.tmp
+*.nupkg
+# <<< GlaucoPlastic local/generated <<<
