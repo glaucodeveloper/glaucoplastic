@@ -16,6 +16,12 @@ task runtimeWindows, "Baixa o runtime llama.cpp no Windows":
 task runtimeWindowsCross, "Prepara o runtime Windows a partir do Linux":
   exec "bash scripts/install-llama-runtime-windows.sh"
 
+task buildWindows, "Cross-compila e empacota o local_assistant Windows x64 a partir do Linux":
+  exec "bash scripts/build-windows-cross.sh"
+
+task cleanWindows, "Remove somente artefatos de build Windows; preserva downloads/modelos em dist":
+  exec "rm -rf .build/windows-x64/nimcache .build/windows-x64/assistant_consumer_windows.nim dist/windows-x64/assistant_consumer.exe"
+
 task modelLinux, "Configura ou baixa Qwen3-4B GGUF":
   exec "bash scripts/configure-qwen3-model.sh"
 

@@ -1,0 +1,9 @@
+/home/icarogdo/.local/share/glaucoplastic/model-services/metis_memory_server.py	server/metis_memory_server.py
+/home/icarogdo/.config/systemd/user/glaucoplastic-metis4b.service	systemd/glaucoplastic-metis4b.service
+/home/icarogdo/.config/systemd/user/glaucoplastic-metis4b.service.d	systemd/glaucoplastic-metis4b.service.d
+/home/icarogdo/.config/glaucoplastic/local-models.env	config/local-models.env
+/home/icarogdo/dev/glaucoplastic/src/glaucoplastic.nim	source/glaucoplastic.nim
+/home/icarogdo/dev/glaucoplastic/examples/local_assistant/assistant_consumer.nim	source/assistant_consumer.nim
+/home/icarogdo/.local/bin/glaucoplastic-assistant	bin/glaucoplastic-assistant
+/home/icarogdo/.config/systemd/user/glaucoplastic-gemma3-4b.service	old-services/glaucoplastic-gemma3-4b.service
+/home/icarogdo/.local/share/glaucoplastic/model-services/start_gemma3_4b.sh	old-starters/start_gemma3_4b.sh

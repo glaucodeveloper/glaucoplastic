@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ENV_FILE="/home/icarogdo/.config/glaucoplastic/local-models.env"
+APP_DIR="/home/icarogdo/dev/glaucoplastic/examples/local_assistant"
+APP_BIN="/home/icarogdo/dev/glaucoplastic/examples/local_assistant/bin/assistant_consumer"
+METIS_SERVICE="glaucoplastic-metis4b.service"
+BACKBONE_SERVICE="glaucoplastic-gemma3-4b.service"
+METIS_HOST="127.0.0.1"
+METIS_PORT="19192"
+BACKBONE_HOST="127.0.0.1"
+BACKBONE_PORT="19191"
+
+systemctl --user start "$METIS_SERVICE"
+systemctl --user start "$BACKBONE_SERVICE"
+
+wait_health() {
+  local name="$1"
+  local url="$2"
+
+  for _ in $(seq 1 180); do
+    if curl -fsS --max-time 2 "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "Falha ao aguardar $name: $url" >&2
+  return 1
+}
+
+wait_health   "Metis"   "http://$METIS_HOST:$METIS_PORT/health"
+
+wait_health   "backbone"   "http://$BACKBONE_HOST:$BACKBONE_PORT/health"
+
+set -a
+source "$ENV_FILE"
+set +a
+
+export GLAUCOPLASTIC_METIS_ENABLED=1
+export GLAUCOPLASTIC_METIS_STARTUP=0
+export GLAUCOPLASTIC_DISABLE_MODEL_STARTUP=1
+
+cd "$APP_DIR"
+exec "$APP_BIN" "$@"

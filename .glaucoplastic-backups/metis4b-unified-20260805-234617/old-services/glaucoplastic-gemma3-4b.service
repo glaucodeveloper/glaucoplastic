@@ -1,0 +1,23 @@
+[Unit]
+Description=GlaucoPlastic Gemma 3 4B llama.cpp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=GEMMA_FALLBACK_GPU_LAYERS=12
+TimeoutStartSec=180
+Type=simple
+Environment=LLAMA_SERVER=/home/icarogdo/.local/src/llama.cpp/build-cuda/bin/llama-server
+Environment=GEMMA_MODEL=/home/icarogdo/models/Gemma-4-E4B/gemma-4-E4B-it-Q4_0.gguf
+Environment=GEMMA_ALIAS=gemma-4-e4b
+Environment=GEMMA_HOST=127.0.0.1
+Environment=GEMMA_PORT=19191
+Environment=GEMMA_CONTEXT=65536
+Environment=GEMMA_THREADS=16
+ExecStart=/home/icarogdo/.local/share/glaucoplastic/model-services/start_gemma3_4b.sh
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

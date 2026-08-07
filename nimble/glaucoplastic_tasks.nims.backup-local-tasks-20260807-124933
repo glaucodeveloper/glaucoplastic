@@ -1,0 +1,59 @@
+# Tarefas reutilizáveis pertencentes ao GlaucoPlastic.
+# O consumidor define antes do include:
+#   const glaucoplasticApplication = "nome_do_modulo"
+#   const glaucoplasticRoot = "../.."
+
+import std/[os, strutils]
+
+proc glaucoplasticPythonCommand(): string =
+  when defined(windows):
+    if findExe("py").len > 0:
+      return "py -3"
+    if findExe("python").len > 0:
+      return "python"
+    return "python3"
+  else:
+    if findExe("python3").len > 0:
+      return "python3"
+    return "python"
+
+proc glaucoplasticQuoted(value: string): string =
+  "\"" & value.replace("\"", "\\\"") & "\""
+
+proc runGlaucoplasticBuild(command: string; extra = "") =
+  let project = getCurrentDir()
+  let root = normalizedPath(project / glaucoplasticRoot)
+  let tool = root / "tools" / "glaucoplastic_build.py"
+  if not fileExists(tool):
+    raise newException(
+      OSError,
+      "Empacotador GlaucoPlastic não encontrado: " & tool
+    )
+  var invocation =
+    glaucoplasticPythonCommand() & " " &
+    glaucoplasticQuoted(tool) & " " &
+    command & " --project " &
+    glaucoplasticQuoted(project) &
+    " --application " &
+    glaucoplasticQuoted(glaucoplasticApplication)
+  if extra.strip.len > 0:
+    invocation.add " " & extra
+  exec invocation
+
+task dev, "Compila somente o executável, sem modelo ou runtime llama.cpp":
+  runGlaucoplasticBuild("dev")
+
+task build, "Compila em release e gera a distribuição completa":
+  runGlaucoplasticBuild("build")
+
+task package, "Empacota o binário existente com modelo e runtime":
+  runGlaucoplasticBuild("package")
+
+task buildLinux, "Gera a distribuição Linux x64":
+  runGlaucoplasticBuild("build", "--target linux-x64")
+
+task buildWindows, "Gera a distribuição Windows x64":
+  runGlaucoplasticBuild("build", "--target windows-x64")
+
+task verifyBundle, "Verifica tamanhos e hashes da distribuição":
+  runGlaucoplasticBuild("verify")

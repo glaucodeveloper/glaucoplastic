@@ -1,0 +1,7 @@
+interface:
+  display_name: "White Plastic for Glauco"
+  short_description: "Build bright, tool-driven GlaucoPlastic desktop WebUIs."
+  brand_color: "#F4F5F7"
+  default_prompt: "Apply the White Plastic for Glauco conventions to this GlaucoPlastic task."
+policy:
+  allow_implicit_invocation: true

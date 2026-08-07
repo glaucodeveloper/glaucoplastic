@@ -1,0 +1,20 @@
+[Unit]
+StartLimitIntervalSec=300
+StartLimitBurst=3
+Description=GlaucoPlastic Metis-4B external memory worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=CUDA_VISIBLE_DEVICES=0
+Environment=TOKENIZERS_PARALLELISM=false
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/icarogdo/.venvs/metis-gemma/bin/python /home/icarogdo/.local/share/glaucoplastic/model-services/metis_memory_server.py   --model /home/icarogdo/models/glaucoplastic-local/Metis-4B   --model-id IAAR-Shanghai/Metis-4B   --profile icaro   --host 127.0.0.1   --port 19192   --device cuda:0   --dtype float16   --gpu-max-mib 3300   --cpu-memory 48GiB   --cpu-threads 16   --query-tokens 96   --worker-max-tokens 128   --gemma-endpoint http://127.0.0.1:19191/v1   --gemma-model gemma-3-4b
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=infinity
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target

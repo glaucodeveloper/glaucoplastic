@@ -1,0 +1,292 @@
+# GlaucoPlastic — tarefas Nimble reutilizáveis.
+#
+# Uso no projeto consumidor:
+#
+#   requires "https://github.com/glaucodeveloper/glaucoplastic#head"
+#   const glaucoplasticApplication = "assistant_consumer"
+#   include glaucoplastic/tasks
+#
+# Para desenvolvimento por path:
+#
+#   nimble develop --add ../glaucoplastic
+#   nimble setup
+#
+# Ou use diretamente:
+#
+#   requires "file://../glaucoplastic"
+
+import std/[os, strutils]
+
+const glaucoplasticTasksFile = currentSourcePath()
+
+let glaucoplasticPackageRoot =
+  normalizedPath(
+    glaucoplasticTasksFile.parentDir.parentDir
+  )
+
+proc gpQuote(value: string): string =
+  when defined(windows):
+    "\"" & value.replace("\"", "\\\"") & "\""
+  else:
+    "'" & value.replace("'", "'\"'\"'") & "'"
+
+proc gpProject(): string =
+  getCurrentDir().absolutePath.normalizedPath
+
+proc gpSource(): string =
+  let project = gpProject()
+  let candidates = @[
+    project / (glaucoplasticApplication & ".nim"),
+    project / "src" / (glaucoplasticApplication & ".nim")
+  ]
+  for candidate in candidates:
+    if fileExists(candidate):
+      return candidate
+  raise newException(
+    OSError,
+    "Fonte da aplicação GlaucoPlastic não encontrada. Procurado em: " &
+      candidates.join(", ")
+  )
+
+proc gpModelSource(): string =
+  let explicit = getEnv("GLAUCOPLASTIC_METIS_MODEL_SOURCE", "").strip
+  if explicit.len > 0 and
+      fileExists(explicit / "config.json"):
+    return explicit.absolutePath.normalizedPath
+
+  let slug = "IAAR-Shanghai_Metis-4B"
+  let project = gpProject()
+  let candidates = @[
+    glaucoplasticPackageRoot / "models" / "metis" / slug,
+    glaucoplasticPackageRoot / "models" / "Metis-4B",
+    project / "models" / "metis" / slug,
+    project / "models" / "Metis-4B",
+    getHomeDir() / ".local" / "share" /
+      "glaucoplastic" / "models" / "metis" / slug
+  ]
+
+  for candidate in candidates:
+    if fileExists(candidate / "config.json") and
+        fileExists(candidate / "model.safetensors.index.json"):
+      return candidate.absolutePath.normalizedPath
+
+  raise newException(
+    OSError,
+    "Metis-4B não encontrado. Defina GLAUCOPLASTIC_METIS_MODEL_SOURCE."
+  )
+
+proc gpRequire(command: string) =
+  if findExe(command).len == 0:
+    raise newException(
+      OSError,
+      "Comando obrigatório não encontrado: " & command
+    )
+
+proc gpCompileLinux(release = false; headless = false; webOutput = false) =
+  gpRequire("nim")
+
+  let project = gpProject()
+  let source = gpSource()
+  let mode =
+    if webOutput:
+      "web"
+    elif release:
+      "release"
+    else:
+      "dev"
+
+  let output =
+    if webOutput:
+      project / "dist" / "web" / "linux-x64" /
+        glaucoplasticApplication
+    else:
+      project / "dist" / "dev" / "linux-x64" /
+        glaucoplasticApplication
+
+  createDir(output.parentDir)
+
+  var args = @[
+    "nim", "c",
+    "--threads:on",
+    "--mm:orc",
+    "--path:" & gpQuote(glaucoplasticPackageRoot / "src"),
+    "--nimcache:" & gpQuote(
+      project / ".build" / mode / "linux-x64" / "nimcache"
+    ),
+    "--out:" & gpQuote(output)
+  ]
+
+  if release:
+    args.add "-d:release"
+    args.add "--opt:speed"
+  else:
+    args.add "-d:debug"
+
+  if headless:
+    args.add "-d:glaucoplasticHeadless"
+
+  args.add gpQuote(source)
+  exec args.join(" ")
+
+proc gpCompileWindows(release = false) =
+  gpRequire("nim")
+  gpRequire("x86_64-w64-mingw32-gcc")
+
+  let project = gpProject()
+  let source = gpSource()
+  let mode = if release: "release" else: "dev"
+  let output =
+    project / "dist" / "dev" / "windows-x64" /
+      (glaucoplasticApplication & ".exe")
+
+  createDir(output.parentDir)
+
+  var args = @[
+    "nim", "c",
+    "--os:windows",
+    "--cpu:amd64",
+    "--cc:gcc",
+    "--gcc.exe:x86_64-w64-mingw32-gcc",
+    "--gcc.linkerexe:x86_64-w64-mingw32-gcc",
+    "--threads:on",
+    "--mm:orc",
+    "--path:" & gpQuote(glaucoplasticPackageRoot / "src"),
+    "--nimcache:" & gpQuote(
+      project / ".build" / mode / "windows-x64" / "nimcache"
+    ),
+    "--out:" & gpQuote(output)
+  ]
+
+  if release:
+    args.add "-d:release"
+    args.add "--opt:speed"
+  else:
+    args.add "-d:debug"
+
+  args.add gpQuote(source)
+  exec args.join(" ")
+
+proc gpBuildLinuxComplete() =
+  let script =
+    glaucoplasticPackageRoot / "scripts" /
+      "build-linux-complete.sh"
+
+  if not fileExists(script):
+    raise newException(
+      OSError,
+      "Build Linux completo ausente no GlaucoPlastic: " & script
+    )
+
+  putEnv("GLAUCOPLASTIC_PROJECT", gpProject())
+  putEnv("GLAUCOPLASTIC_APPLICATION", glaucoplasticApplication)
+  putEnv("GLAUCOPLASTIC_APP_SOURCE", gpSource())
+  putEnv("GLAUCOPLASTIC_METIS_MODEL_SOURCE", gpModelSource())
+  putEnv(
+    "GLAUCOPLASTIC_LINUX_DIST",
+    gpProject() / "dist" / "linux-x64"
+  )
+  putEnv(
+    "GLAUCOPLASTIC_LINUX_BUILD",
+    gpProject() / ".build" / "linux-x64"
+  )
+
+  exec "bash " & gpQuote(script)
+
+proc gpBuildWindowsComplete() =
+  let script =
+    glaucoplasticPackageRoot / "scripts" /
+      "build-windows-cross.sh"
+
+  if not fileExists(script):
+    raise newException(
+      OSError,
+      "Build Windows completo ausente no GlaucoPlastic: " & script
+    )
+
+  putEnv("GLAUCOPLASTIC_PROJECT", gpProject())
+  putEnv("GLAUCOPLASTIC_APPLICATION", glaucoplasticApplication)
+  putEnv("GLAUCOPLASTIC_WINDOWS_APP_SOURCE", gpSource())
+  putEnv("GLAUCOPLASTIC_METIS_MODEL_SOURCE", gpModelSource())
+  putEnv(
+    "GLAUCOPLASTIC_WINDOWS_DIST",
+    gpProject() / "dist" / "windows-x64"
+  )
+  putEnv(
+    "GLAUCOPLASTIC_WINDOWS_BUILD",
+    gpProject() / ".build" / "windows-x64"
+  )
+
+  exec "bash " & gpQuote(script)
+
+proc gpVerifyOne(target: string) =
+  let project = gpProject()
+  let root = project / "dist" / target
+  let slug = "IAAR-Shanghai_Metis-4B"
+
+  if not dirExists(root):
+    raise newException(OSError, "Bundle ausente: " & root)
+
+  let executable =
+    if target == "windows-x64":
+      root / (glaucoplasticApplication & ".exe")
+    else:
+      root / glaucoplasticApplication
+
+  if not fileExists(executable):
+    raise newException(OSError, "Executável ausente: " & executable)
+
+  let model = root / "models" / "metis" / slug
+  if not fileExists(model / "config.json") or
+      not fileExists(model / "model.safetensors.index.json"):
+    raise newException(OSError, "Metis incompleto: " & model)
+
+  let python =
+    if target == "windows-x64":
+      root / "runtime" / "metis" / "python" / "python.exe"
+    else:
+      root / "runtime" / "metis" / "python" / "bin" / "python"
+
+  if not fileExists(python):
+    raise newException(OSError, "Python empacotado ausente: " & python)
+
+  echo "[GlaucoPlastic] bundle válido: ", root
+
+task devLinux, "Compila o executável Linux de desenvolvimento":
+  gpCompileLinux()
+
+task devWindows, "Cross-compila o executável Windows de desenvolvimento":
+  gpCompileWindows()
+
+task dev, "Compila Linux e Windows de desenvolvimento":
+  gpCompileLinux()
+  gpCompileWindows()
+
+task buildLinux, "Gera o bundle Linux completo com Metis e runtime Python":
+  gpBuildLinuxComplete()
+
+task buildWindows, "Gera o bundle Windows completo com Metis e runtime Python":
+  gpBuildWindowsComplete()
+
+task build, "Gera os bundles completos Linux e Windows":
+  gpBuildLinuxComplete()
+  gpBuildWindowsComplete()
+
+task webBuild, "Compila servidor web headless Linux; foreign não possui WebView":
+  gpCompileLinux(release = true, headless = true, webOutput = true)
+
+task web, "Compila e executa o servidor web headless (--nw)":
+  gpCompileLinux(release = false, headless = true, webOutput = true)
+
+  let executable =
+    gpProject() / "dist" / "web" / "linux-x64" /
+      glaucoplasticApplication
+
+  var invocation = gpQuote(executable) & " --nw"
+  for argument in commandLineParams():
+    invocation.add " " & gpQuote(argument)
+
+  exec invocation
+
+task verifyBundle, "Valida os bundles completos Linux e Windows":
+  gpVerifyOne("linux-x64")
+  gpVerifyOne("windows-x64")
