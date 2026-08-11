@@ -953,7 +953,6 @@ type
     safeStorageValue*: PlasticSafeStorageRuntime
     foreignValue*: PlasticForeignRuntime
     llamaValue*: PlasticLlamaRuntime
-    rlmValue*: PlasticRlmRuntime
     agentsValue*: Table[string, PlasticAgent]
     componentsValue*: JsonNode
     renderTreeValue*: JsonNode
@@ -982,6 +981,7 @@ type
     rlmConditions*: string
     toolPlans*: JsonNode
     application*: PlasticApplication
+    rlmValue*: PlasticRlmRuntime
     sessionVariables*: Table[string, JsonNode]
     hookDispatching*: bool
     asyncExecution*: bool
@@ -993,13 +993,13 @@ type
     maxIterations*: int
     maxRecursionDepth*: int
 
-  PlasticCapability* = proc(
+  PlasticRlmToolProc* = proc(
     agent: PlasticAgent;
     arguments: JsonNode
   ): JsonNode {.closure.}
 
   PlasticRlmRuntime* = ref object
-    capabilities*: Table[string, PlasticCapability]
+    tools*: Table[string, PlasticRlmToolProc]
 
 
 const PlasticAssistantHandlerId* = "glaucoplastic-assistant"
@@ -3763,7 +3763,7 @@ proc plasticOfficeRuntimeBridge*(): string =
     return expandTilde(configured)
   getCurrentDir() / "tools" / "glaucoplastic_office.py"
 
-proc plasticOfficeInvoke*(capability: string; arguments: JsonNode): JsonNode =
+proc plasticOfficeInvoke*(operation: string; arguments: JsonNode): JsonNode =
   let python = plasticOfficeRuntimePython()
   let bridge = plasticOfficeRuntimeBridge()
   if not fileExists(bridge):
@@ -3780,7 +3780,7 @@ proc plasticOfficeInvoke*(capability: string; arguments: JsonNode): JsonNode =
   defer:
     if fileExists(inputPath):
       removeFile(inputPath)
-  let command = @[python, bridge, capability, inputPath]
+  let command = @[python, bridge, operation, inputPath]
     .mapIt(quoteShell(it))
     .join(" ")
   let execution = execCmdEx(
@@ -3791,14 +3791,14 @@ proc plasticOfficeInvoke*(capability: string; arguments: JsonNode): JsonNode =
   if payload.len == 0:
     raise newException(
       PlasticAgentError,
-      "Office tool returned empty output: " & capability
+      "Office tool returned empty output: " & operation
     )
   try:
     result = parseJson(payload)
   except CatchableError as error:
     raise newException(
       PlasticAgentError,
-      "Invalid Office tool JSON for " & capability & ": " &
+      "Invalid Office tool JSON for " & operation & ": " &
         error.msg & "\\n" & payload
     )
   if execution.exitCode != 0 or
@@ -3806,7 +3806,7 @@ proc plasticOfficeInvoke*(capability: string; arguments: JsonNode): JsonNode =
        result["ok"].kind == JBool and not result["ok"].getBool):
     raise newException(
       PlasticAgentError,
-      "Office tool failed: " & capability & "\\n" & payload
+      "Office tool failed: " & operation & "\\n" & payload
     )
 
 
@@ -3825,7 +3825,7 @@ proc plasticRpaRuntimeBridge*(): string =
     return expandTilde(configured)
   getCurrentDir() / "tools" / "glaucoplastic_rpa.py"
 
-proc plasticRpaInvoke*(capability: string; arguments: JsonNode): JsonNode =
+proc plasticRpaInvoke*(operation: string; arguments: JsonNode): JsonNode =
   let python = plasticRpaRuntimePython()
   let bridge = plasticRpaRuntimeBridge()
   if not fileExists(bridge):
@@ -3844,7 +3844,7 @@ proc plasticRpaInvoke*(capability: string; arguments: JsonNode): JsonNode =
     if fileExists(inputPath):
       removeFile(inputPath)
 
-  let command = @[python, bridge, capability, inputPath]
+  let command = @[python, bridge, operation, inputPath]
     .mapIt(quoteShell(it))
     .join(" ")
   let execution = execCmdEx(
@@ -3855,14 +3855,14 @@ proc plasticRpaInvoke*(capability: string; arguments: JsonNode): JsonNode =
   if payload.len == 0:
     raise newException(
       PlasticAgentError,
-      "RPA tool returned empty output: " & capability
+      "RPA tool returned empty output: " & operation
     )
   try:
     result = parseJson(payload)
   except CatchableError as error:
     raise newException(
       PlasticAgentError,
-      "Invalid RPA tool JSON for " & capability & ": " &
+      "Invalid RPA tool JSON for " & operation & ": " &
         error.msg & "\\n" & payload
     )
   if execution.exitCode != 0 or
@@ -3870,7 +3870,7 @@ proc plasticRpaInvoke*(capability: string; arguments: JsonNode): JsonNode =
        result["ok"].kind == JBool and not result["ok"].getBool):
     raise newException(
       PlasticAgentError,
-      "RPA tool failed: " & capability & "\\n" & payload
+      "RPA tool failed: " & operation & "\\n" & payload
     )
 
 proc plasticAssistantVoiceExtension(mimeType: string): string =
@@ -6757,9 +6757,6 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
           managedRuntime: false,
           endpoint: "http://" & llamaConfig.host & ":" & $llamaConfig.port & "/v1"
         ),
-        rlmValue: PlasticRlmRuntime(
-          capabilities: initTable[string, PlasticCapability]()
-        ),
         agentsValue: initTable[string, PlasticAgent](),
         componentsValue: newJArray(),
         renderTreeValue: newJArray(),
@@ -6882,7 +6879,7 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
     proc okf*(application: PlasticApplication): PlasticOkfRuntime = application.okfValue
     proc foreign*(application: PlasticApplication): PlasticForeignRuntime = application.foreignValue
     proc llama*(application: PlasticApplication): PlasticLlamaRuntime = application.llamaValue
-    proc rlm*(application: PlasticApplication): PlasticRlmRuntime = application.rlmValue
+    proc rlm*(agent: PlasticAgent): PlasticRlmRuntime = agent.rlmValue
     proc metisMemory*(application: PlasticApplication): PlasticMetisMemory = application.metisMemoryValue
     proc safeStorage*(application: PlasticApplication): PlasticSafeStorageRuntime = application.safeStorageValue
     proc desktop*(application: PlasticApplication): PlasticDesktopRuntime = application.desktopValue
@@ -8596,6 +8593,26 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
             return style.display !== 'none' && style.visibility !== 'hidden' &&
               style.opacity !== '0' && rect.width > 0 && rect.height > 0;
           };
+          const semanticRole = element => {
+            const explicit = String(element.getAttribute('role') || '').trim().toLowerCase();
+            if (explicit) return explicit;
+            const tag = element.tagName.toLowerCase();
+            const type = String(element.getAttribute('type') || '').toLowerCase();
+            if (tag === 'button') return 'button';
+            if (tag === 'a' && element.hasAttribute('href')) return 'link';
+            if (tag === 'textarea') return 'textbox';
+            if (tag === 'select') return element.multiple ? 'listbox' : 'combobox';
+            if (tag === 'option') return 'option';
+            if (tag === 'input') {
+              if (type === 'checkbox') return 'checkbox';
+              if (type === 'radio') return 'radio';
+              if (type === 'button' || type === 'submit' || type === 'reset') return 'button';
+              if (type === 'range') return 'slider';
+              if (type === 'number') return 'spinbutton';
+              if (type !== 'hidden') return 'textbox';
+            }
+            return '';
+          };
           const cssPath = element => {
             if (element.id) return '#' + escapeCss(element.id);
             const parts = [];
@@ -8628,7 +8645,7 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
               id: element.id || undefined,
               name: element.getAttribute('name') || undefined,
               type: element.getAttribute('type') || undefined,
-              role: element.getAttribute('role') || undefined,
+              role: semanticRole(element) || undefined,
               ariaLabel: element.getAttribute('aria-label') || undefined,
               placeholder: element.getAttribute('placeholder') || undefined,
               text: normalize(element.innerText || element.textContent).slice(0, 320),
@@ -8694,6 +8711,26 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
             return style.display !== 'none' && style.visibility !== 'hidden' &&
               style.opacity !== '0' && rect.width > 0 && rect.height > 0;
           };
+          const semanticRole = element => {
+            const explicit = String(element.getAttribute('role') || '').trim().toLowerCase();
+            if (explicit) return explicit;
+            const tag = element.tagName.toLowerCase();
+            const type = String(element.getAttribute('type') || '').toLowerCase();
+            if (tag === 'button') return 'button';
+            if (tag === 'a' && element.hasAttribute('href')) return 'link';
+            if (tag === 'textarea') return 'textbox';
+            if (tag === 'select') return element.multiple ? 'listbox' : 'combobox';
+            if (tag === 'option') return 'option';
+            if (tag === 'input') {
+              if (type === 'checkbox') return 'checkbox';
+              if (type === 'radio') return 'radio';
+              if (type === 'button' || type === 'submit' || type === 'reset') return 'button';
+              if (type === 'range') return 'slider';
+              if (type === 'number') return 'spinbutton';
+              if (type !== 'hidden') return 'textbox';
+            }
+            return '';
+          };
           const cssPath = element => {
             if (element.id) return '#' + escapeCss(element.id);
             const parts = [];
@@ -8729,7 +8766,7 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
               id: element.id || undefined,
               name: element.getAttribute('name') || undefined,
               type: element.getAttribute('type') || undefined,
-              role: element.getAttribute('role') || undefined,
+              role: semanticRole(element) || undefined,
               ariaLabel: element.getAttribute('aria-label') || undefined,
               placeholder: element.getAttribute('placeholder') || undefined,
               text: normalize(element.innerText || element.textContent).slice(0, 320),
@@ -8750,7 +8787,7 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
             if (visibleOnly) elements = elements.filter(visible);
             if (requestedRole) {
               const roleNeedle = requestedRole.toLowerCase();
-              elements = elements.filter(element => String(element.getAttribute('role') || '').toLowerCase() === roleNeedle);
+              elements = elements.filter(element => semanticRole(element) === roleNeedle);
             }
             if (requestedText) {
               const textNeedle = normalize(requestedText).toLowerCase();
@@ -8791,11 +8828,13 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
         ): JsonNode =
           let selector = plasticRpaJsonString(arguments, "selector")
           let text = plasticRpaJsonString(arguments, "text")
+          let role = plasticRpaJsonString(arguments, "role")
           let index = max(0, plasticRpaJsonInt(arguments, "index", 0))
           var script = """
         (() => {
           const selector = __SELECTOR__;
           const requestedText = __TEXT__;
+          const requestedRole = __ROLE__;
           const index = __INDEX__;
           const normalize = value => String(value ?? '').replace(/\s+/g, ' ').trim();
           const visible = element => {
@@ -8805,9 +8844,33 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
             return style.display !== 'none' && style.visibility !== 'hidden' &&
               style.opacity !== '0' && rect.width > 0 && rect.height > 0;
           };
+          const semanticRole = element => {
+            const explicit = String(element.getAttribute('role') || '').trim().toLowerCase();
+            if (explicit) return explicit;
+            const tag = element.tagName.toLowerCase();
+            const type = String(element.getAttribute('type') || '').toLowerCase();
+            if (tag === 'button') return 'button';
+            if (tag === 'a' && element.hasAttribute('href')) return 'link';
+            if (tag === 'textarea') return 'textbox';
+            if (tag === 'select') return element.multiple ? 'listbox' : 'combobox';
+            if (tag === 'option') return 'option';
+            if (tag === 'input') {
+              if (type === 'checkbox') return 'checkbox';
+              if (type === 'radio') return 'radio';
+              if (type === 'button' || type === 'submit' || type === 'reset') return 'button';
+              if (type === 'range') return 'slider';
+              if (type === 'number') return 'spinbutton';
+              if (type !== 'hidden') return 'textbox';
+            }
+            return '';
+          };
           try {
             const baseSelector = selector || 'a,button,input,textarea,select,[role="button"],[role="link"],[tabindex]';
             let elements = Array.from(document.querySelectorAll(baseSelector)).filter(visible);
+            if (requestedRole) {
+              const roleNeedle = requestedRole.toLowerCase();
+              elements = elements.filter(element => semanticRole(element) === roleNeedle);
+            }
             if (requestedText) {
               const needle = normalize(requestedText).toLowerCase();
               elements = elements.filter(element => normalize([
@@ -8827,6 +8890,7 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
               before,
               clicked: {
                 tag: element.tagName.toLowerCase(),
+                role: semanticRole(element) || undefined,
                 text: normalize(element.innerText || element.textContent).slice(0, 320),
                 ariaLabel: element.getAttribute('aria-label') || undefined,
                 rect: {x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height)}
@@ -8840,6 +8904,7 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
         """
           script = script.replace("__SELECTOR__", plasticRpaJsLiteral(selector))
           script = script.replace("__TEXT__", plasticRpaJsLiteral(text))
+          script = script.replace("__ROLE__", plasticRpaJsLiteral(role))
           script = script.replace("__INDEX__", $index)
           runtime.plasticRpaDomEval(arguments, script)
 
@@ -12439,7 +12504,7 @@ print(json.dumps({"total": total, "files": files}))
               memory.modelPath
             )
 
-          memory.plasticMetisTouchDownloadLock(
+          plasticMetisTouchDownloadLock(
             lockPath,
             memory.config.modelId
           )
@@ -14087,6 +14152,12 @@ finally:
         proc plasticMetisLogNvidiaProcesses(): JsonNode =
           result = newJArray()
           when defined(linux):
+            let deviceProbe = execCmdEx("ls -l /dev/nvidia* 2>&1")
+            plasticDebugTrace(
+              "metis.memory.diagnostic.nvidia-devices output=" &
+              deviceProbe.output.strip() &
+              " code=" & $deviceProbe.exitCode
+            )
             let executable = findExe("nvidia-smi")
             if executable.len == 0:
               return
@@ -14098,7 +14169,8 @@ finally:
             if execution.exitCode != 0:
               plasticDebugTrace(
                 "metis.memory.diagnostic.nvidia-smi.failed code=" &
-                $execution.exitCode
+                $execution.exitCode &
+                " output=" & execution.output.strip()
               )
               return
             for rawLine in execution.output.splitLines:
@@ -14237,6 +14309,114 @@ finally:
               $memory.config.minGpuFreeMiB & " MiB."
             )
 
+        proc plasticMetisCudaAvailabilityDiagnostic(
+          memory: PlasticMetisMemory;
+          torchModule: PyObject;
+          cudaModule: PyObject;
+          phase: string
+        ): JsonNode =
+          proc diagnosticText(node: JsonNode; key: string): string =
+            if node.hasKey(key) and node[key].kind == JString:
+              node[key].getStr
+            else:
+              ""
+
+          proc diagnosticBool(node: JsonNode; key: string): string =
+            if node.hasKey(key) and node[key].kind == JBool:
+              $node[key].getBool
+            else:
+              ""
+
+          proc diagnosticInt(node: JsonNode; key: string): string =
+            if node.hasKey(key) and node[key].kind == JInt:
+              $node[key].getInt
+            else:
+              ""
+
+          result = newJObject()
+          result["phase"] = %phase
+
+          try:
+            result["torchVersion"] =
+              %nimpy.getAttr(torchModule, "__version__").to(string)
+          except CatchableError as error:
+            result["torchVersionError"] = %error.msg
+
+          try:
+            let torchVersionModule = nimpy.getAttr(torchModule, "version")
+            result["torchCudaVersion"] =
+              %nimpy.getAttr(torchVersionModule, "cuda").to(string)
+          except CatchableError as error:
+            result["torchCudaVersionError"] = %error.msg
+
+          try:
+            let backends = nimpy.getAttr(torchModule, "backends")
+            let cudaBackends = nimpy.getAttr(backends, "cuda")
+            result["cudaBackendBuilt"] =
+              %nimpy.callMethod(cudaBackends, "is_built").to(bool)
+          except CatchableError as error:
+            result["cudaBackendBuiltError"] = %error.msg
+
+          try:
+            result["cudaIsAvailable"] =
+              %nimpy.callMethod(cudaModule, "is_available").to(bool)
+          except CatchableError as error:
+            result["cudaIsAvailableError"] = %error.msg
+
+          try:
+            result["cudaDeviceCount"] =
+              %nimpy.callMethod(cudaModule, "device_count").to(int)
+          except CatchableError as error:
+            result["cudaDeviceCountError"] = %error.msg
+
+          try:
+            result["cudaIsInitialized"] =
+              %nimpy.callMethod(cudaModule, "is_initialized").to(bool)
+          except CatchableError as error:
+            result["cudaIsInitializedError"] = %error.msg
+
+          let environment = newJObject()
+          for key in [
+            "CUDA_VISIBLE_DEVICES",
+            "NVIDIA_VISIBLE_DEVICES",
+            "CUDA_HOME",
+            "CUDA_PATH",
+            "LD_LIBRARY_PATH"
+          ]:
+            environment[key] = %getEnv(key, "")
+          result["environment"] = environment
+
+          if memory.lastDiagnostic.isNil or
+              memory.lastDiagnostic.kind != JObject:
+            memory.lastDiagnostic = newJObject()
+          memory.lastDiagnostic["cuda-availability-" & phase] = result
+
+          plasticDebugTrace(
+            "metis.memory.diagnostic.cuda-availability phase=" & phase &
+            " torchVersion=" &
+            diagnosticText(result, "torchVersion") &
+            " torchCudaVersion=" &
+            diagnosticText(result, "torchCudaVersion") &
+            " cudaBackendBuilt=" &
+            diagnosticBool(result, "cudaBackendBuilt") &
+            " cudaIsAvailable=" &
+            diagnosticBool(result, "cudaIsAvailable") &
+            " cudaDeviceCount=" &
+            diagnosticInt(result, "cudaDeviceCount") &
+            " cudaIsInitialized=" &
+            diagnosticBool(result, "cudaIsInitialized") &
+            " CUDA_VISIBLE_DEVICES=" &
+            diagnosticText(environment, "CUDA_VISIBLE_DEVICES") &
+            " NVIDIA_VISIBLE_DEVICES=" &
+            diagnosticText(environment, "NVIDIA_VISIBLE_DEVICES") &
+            " CUDA_HOME=" &
+            diagnosticText(environment, "CUDA_HOME") &
+            " CUDA_PATH=" &
+            diagnosticText(environment, "CUDA_PATH") &
+            " LD_LIBRARY_PATH=" &
+            diagnosticText(environment, "LD_LIBRARY_PATH")
+          )
+
         proc plasticMetisModelDiagnosticInvoker(): PyObject =
           if plasticMetisModelDiagnosticFunction.isNil:
             let py = pyBuiltinsModule()
@@ -14354,6 +14534,11 @@ finally:
               memory.torchModule = pyImport("torch")
               memory.transformersModule = pyImport("transformers")
               let cudaModule = nimpy.getAttr(memory.torchModule, "cuda")
+              discard memory.plasticMetisCudaAvailabilityDiagnostic(
+                memory.torchModule,
+                cudaModule,
+                "before-load"
+              )
               if not nimpy.callMethod(
                 cudaModule,
                 "is_available"
@@ -17009,15 +17194,42 @@ Mantenha a resposta objetiva e útil para inferência.
               result["context"] = context.copy
 
         proc newRlmRuntime*(): PlasticRlmRuntime =
-          PlasticRlmRuntime(capabilities: initTable[string, PlasticCapability]())
+          PlasticRlmRuntime(
+            tools: initTable[string, PlasticRlmToolProc]()
+          )
 
-        proc register*(runtime: PlasticRlmRuntime; name: string; capability: PlasticCapability) =
-          runtime.capabilities[name] = capability
+        proc register*(
+          runtime: PlasticRlmRuntime;
+          name: string;
+          tool: PlasticRlmToolProc
+        ) =
+          let toolName = name.strip
+          if toolName.len == 0:
+            raise newException(
+              PlasticAgentError,
+              "Nome de Tool RLM vazio."
+            )
+          runtime.tools[toolName] = tool
 
-        proc invoke(runtime: PlasticRlmRuntime; agent: PlasticAgent; name: string; arguments: JsonNode): JsonNode =
-          if not runtime.capabilities.hasKey(name):
-            raise newException(PlasticAgentError, "Capability RLM inexistente: " & name)
-          runtime.capabilities[name](agent, arguments)
+        proc get*(
+          runtime: PlasticRlmRuntime;
+          name: string
+        ): PlasticRlmToolProc =
+          let toolName = name.strip
+          if not runtime.tools.hasKey(toolName):
+            raise newException(
+              PlasticAgentError,
+              "Tool RLM inexistente: " & toolName
+            )
+          runtime.tools[toolName]
+
+        proc invoke(
+          runtime: PlasticRlmRuntime;
+          agent: PlasticAgent;
+          name: string;
+          arguments: JsonNode
+        ): JsonNode =
+          runtime.get(name)(agent, arguments)
 
         const PlasticRlmBasePrompt* = """
         Você é o planejador RLM do GlaucoPlastic. Você não responde diretamente
@@ -17032,7 +17244,7 @@ Mantenha a resposta objetiva e útil para inferência.
           {
             "instructions": [
               {
-                "capability": "capability.exata",
+                "tool": "tool.exata",
                 "arguments": {},
                 "assign": "variavel-opcional"
               }
@@ -17048,10 +17260,10 @@ Mantenha a resposta objetiva e útil para inferência.
            autoritativo para decidir se uma execução nova é obrigatória.
         2. rlm.variables.runtime.
         3. rlm.variables.environment.
-           Este é o ambiente atual: capabilities, states, WebContents,
+           Este é o ambiente atual: tools, states, WebContents,
            propósito, domínio, propriedades e conhecimento disponível.
         4. rlm.variables.observations.
-           Results de capabilities desta execução são a evidência primária.
+           Results de tools desta execução são a evidência primária.
         5. rlm.variables.workingVariables.
         6. rlm.variables.memory.
         7. rlm.variables.history por último.
@@ -17060,22 +17272,21 @@ Mantenha a resposta objetiva e útil para inferência.
 
         DECISÃO OPERACIONAL:
         - Se request.value.requiresAction=true e observations ainda não prova a
-          execução do pedido atual, instructions deve conter ao menos uma
-          capability.
+          execução do pedido atual, instructions deve conter ao menos uma tool.
         - Nunca diga que algo foi aberto, clicado, preenchido, enviado,
           executado ou observado apenas porque o histórico afirma isso.
-        - Para ação operacional, selecione a capability mais direta do catálogo
-          environment.value.capabilities.
-        - capability deve copiar literalmente o campo id desse catálogo.
-        - Não invente capabilities.
+        - Para ação operacional, selecione a tool mais direta do catálogo
+          environment.value.tools.
+        - tool deve copiar literalmente o campo id desse catálogo.
+        - Não invente tools.
         - Pedidos declarativos, conversacionais, explicativos, de redação,
           código, opinião ou conhecimento geral normalmente usam instructions=[].
 
         FEEDBACK APÓS EXECUÇÃO:
-        - observations.value contém resultados reais de capabilities.
+        - observations.value contém resultados reais de tools.
         - runtime.value.mustReturnAnswer=true significa que já há observation e
           a prioridade é concluir em answer sem repetir ação confirmada.
-        - Use nova capability somente se faltar uma observação diferente e
+        - Use nova tool somente se faltar uma observação diferente e
           indispensável para concluir ou verificar a tarefa.
         - answer produzido na mesma etapa que solicita instructions não é
           confirmação e deve ser null.
@@ -17164,36 +17375,37 @@ Mantenha a resposta objetiva e útil para inferência.
             result = result[0 ..< maxChars].strip & "..."
 
         proc compactAgentToolManifest(agent: PlasticAgent): JsonNode =
-          ## Catálogo único: uma capability aparece uma vez.
-          var declaredByCapability =
+          ## O catálogo é o escopo RLM efetivo desta instância.
+          ## Declarações Tool apenas enriquecem metadados das funções
+          ## realmente instaladas no runtime do agente.
+          var declaredByTool =
             initTable[string, JsonNode]()
 
           if agent.toolPlans.kind == JArray:
             for functionPlan in agent.toolPlans.items:
               if functionPlan.kind != JObject:
                 continue
-              let capabilityName =
-                `jsonStringFieldSym`(functionPlan, "capability")
-              if capabilityName.len > 0:
-                declaredByCapability[capabilityName] =
+              let toolName =
+                `jsonStringFieldSym`(functionPlan, "name")
+              if toolName.len > 0:
+                declaredByTool[toolName] =
                   functionPlan.copy
 
-          var capabilityNames = newSeq[string]()
-          if not agent.application.rlmValue.isNil:
-            for capabilityName, _ in
-                agent.application.rlmValue.capabilities:
-              capabilityNames.add capabilityName
-          capabilityNames.sort()
+          var toolNames = newSeq[string]()
+          if not agent.rlmValue.isNil:
+            for toolName in agent.rlmValue.tools.keys:
+              toolNames.add toolName
+          toolNames.sort()
 
           result = newJArray()
-          for capabilityName in capabilityNames:
+          for toolName in toolNames:
             var item = newJObject()
-            item["id"] = %capabilityName
+            item["id"] = %toolName
 
-            if declaredByCapability.hasKey(capabilityName):
-              let plan = declaredByCapability[capabilityName]
+            if declaredByTool.hasKey(toolName):
+              let plan = declaredByTool[toolName]
               let label = `jsonStringFieldSym`(plan, "name")
-              if label.len > 0 and label != capabilityName:
+              if label.len > 0:
                 item["label"] = %label
 
               let description =
@@ -17271,7 +17483,7 @@ Mantenha a resposta objetiva e útil para inferência.
             text.contains("https://") or
             text.contains("www.")
 
-        proc validateRlmProgramCapabilities(
+        proc validateRlmProgramTools(
           agent: PlasticAgent;
           program: JsonNode;
           input: JsonNode
@@ -17294,7 +17506,7 @@ Mantenha a resposta objetiva e útil para inferência.
               plasticRlmInputRequiresAction(input) and
               not hasCurrentObservation:
             return(
-              "O pedido atual é operacional e ainda exige uma capability. " &
+              "O pedido atual é operacional e ainda exige uma tool. " &
               "Mensagens anteriores, resumo da sessão e memória não provam " &
               "que a ação atual foi executada."
             )
@@ -17311,10 +17523,12 @@ Mantenha a resposta objetiva e útil para inferência.
             return "O campo answer deve ser uma string ou null."
 
           var allowedNames = newSeq[string]()
-          if not agent.application.rlmValue.isNil:
-            for registeredName, _ in
-                agent.application.rlmValue.capabilities:
-              allowedNames.add registeredName
+          let manifest = compactAgentToolManifest(agent)
+          if manifest.kind == JArray:
+            for entry in manifest.items:
+              if entry.kind == JObject and entry.hasKey("id") and
+                  entry["id"].kind == JString:
+                allowedNames.add entry["id"].getStr
           allowedNames.sort()
 
           var instructionIndex = 0
@@ -17327,28 +17541,25 @@ Mantenha a resposta objetiva e útil para inferência.
                 "] deve ser um objeto JSON."
               )
 
-            if not instruction.hasKey("capability") or
-                instruction["capability"].kind != JString:
+            if not instruction.hasKey("tool") or
+                instruction["tool"].kind != JString:
               return(
                 "instructions[" & $index &
-                "].capability deve ser uma string."
+                "].tool deve ser uma string."
               )
 
-            let capabilityName =
-              instruction["capability"].getStr.strip
+            let toolName =
+              instruction["tool"].getStr.strip
 
-            if capabilityName.len == 0:
+            if toolName.len == 0:
               return(
                 "instructions[" & $index &
-                "].capability não pode ser vazia."
+                "].tool não pode ser vazia."
               )
 
-            if agent.application.rlmValue.isNil or
-                not agent.application.rlmValue.capabilities.hasKey(
-                  capabilityName
-                ):
+            if toolName notin allowedNames:
               return(
-                "Capability não registrada: " & capabilityName &
+                "Tool não registrada: " & toolName &
                 ". Use exatamente uma destas: " &
                 allowedNames.join(", ")
               )
@@ -17356,14 +17567,14 @@ Mantenha a resposta objetiva e útil para inferência.
             if instruction.hasKey("arguments") and
                 instruction["arguments"].kind != JObject:
               return(
-                "arguments de " & capabilityName &
+                "arguments de " & toolName &
                 " deve ser um objeto JSON."
               )
 
             if instruction.hasKey("assign") and
                 instruction["assign"].kind notin {JNull, JString}:
               return(
-                "assign de " & capabilityName &
+                "assign de " & toolName &
                 " deve ser string ou null."
               )
 
@@ -17376,7 +17587,7 @@ Mantenha a resposta objetiva e útil para inferência.
                 )
               ):
             return(
-              "Sem capability a executar, answer deve conter uma mensagem " &
+              "Sem tool a executar, answer deve conter uma mensagem " &
               "textual não vazia ao usuário."
             )
 
@@ -17406,14 +17617,14 @@ Mantenha a resposta objetiva e útil para inferência.
             returnNode = arguments[1].copy
             result["return"] = returnNode.copy
             result["returnType"] = %planTextValue(arguments[1])
+          else:
+            result["returnType"] = %"JsonNode"
 
           result["children"] = newJArray()
 
           for child in planChildren(node):
             if planKind(child) == "call" and planName(child) == "systemPrompt":
               result["systemPrompt"] = %firstLiteralString(child)
-            elif planKind(child) == "call" and planName(child) == "capability":
-              result["capability"] = %firstLiteralString(child)
             elif planKind(child) == "call" and planName(child) == "render":
               var renderNodes = newJArray()
               for renderNode in planChildren(child):
@@ -17591,6 +17802,7 @@ Mantenha a resposta objetiva e útil para inferência.
             rlmConditions: "",
             toolPlans: newJArray(),
             application: application,
+            rlmValue: newRlmRuntime(),
             properties: properties,
             sessionVariables: initTable[string, JsonNode](),
             hookDispatching: false,
@@ -17732,7 +17944,7 @@ Mantenha a resposta objetiva e útil para inferência.
           # {"Search.selectedTitle": "...", "Search.selectedHref": "..."}
           # {"Search": {"selectedTitle": "..."}}
           #
-          # Dentro da capability state.set, cada chave não reservada é tratada
+          # Dentro da tool state.set, cada chave não reservada é tratada
           # como caminho de estado. Isso evita depender de uma única convenção
           # de serialização do modelo.
           for key, value in arguments.pairs:
@@ -17846,15 +18058,15 @@ Mantenha a resposta objetiva e útil para inferência.
           else:
             plasticAgentStateSet(agent, path, answer)
 
-        proc installDefaultCapabilities(application: PlasticApplication) =
-          application.rlmValue.register("state.get", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+        proc installDefaultTools(agent: PlasticAgent) =
+          agent.rlmValue.register("state.get", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             plasticAgentStateGet(
               agent,
               `jsonStringFieldSym`(arguments, "name")
             )
           )
 
-          application.rlmValue.register("state.set", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          agent.rlmValue.register("state.set", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             let writes =
               plasticAgentApplyStateSetArguments(agent, arguments)
 
@@ -17876,7 +18088,7 @@ Mantenha a resposta objetiva e útil para inferência.
             }
           )
 
-          application.rlmValue.register("orm.find", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          agent.rlmValue.register("orm.find", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             findAgentOrmById(
               agent.application.ormValue,
               `jsonStringFieldSym`(arguments, "entity"),
@@ -17884,7 +18096,7 @@ Mantenha a resposta objetiva e útil para inferência.
             )
           )
 
-          application.rlmValue.register("orm.insert", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          agent.rlmValue.register("orm.insert", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             insertAgentOrmRow(
               agent.application.ormValue,
               `jsonStringFieldSym`(arguments, "entity"),
@@ -17892,7 +18104,7 @@ Mantenha a resposta objetiva e útil para inferência.
             )
           )
 
-          application.rlmValue.register("okf.list", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          agent.rlmValue.register("okf.list", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             let space = `jsonStringFieldSym`(arguments, "space")
             interpretOkfAccess(
               agent,
@@ -17902,7 +18114,7 @@ Mantenha a resposta objetiva e útil para inferência.
             )
           )
 
-          application.rlmValue.register("okf.search", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          agent.rlmValue.register("okf.search", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             let query = `jsonStringFieldSym`(arguments, "query")
             let space = `jsonStringFieldSym`(arguments, "space")
             interpretOkfAccess(
@@ -17913,7 +18125,7 @@ Mantenha a resposta objetiva e útil para inferência.
             )
           )
 
-          application.rlmValue.register("okf.get", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          agent.rlmValue.register("okf.get", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             let id = `jsonStringFieldSym`(arguments, "id")
             interpretOkfAccess(
               agent,
@@ -17923,11 +18135,11 @@ Mantenha a resposta objetiva e útil para inferência.
             )
           )
 
-          application.rlmValue.register("okf.persist", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          agent.rlmValue.register("okf.persist", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             activeOkfRuntime(agent).persist(arguments{"document"})
           )
 
-          application.rlmValue.register("memory.query", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          agent.rlmValue.register("memory.query", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             %agent.application.metisMemoryValue.query(
               agent.application.llamaValue,
               agent.metisSession,
@@ -17935,37 +18147,37 @@ Mantenha a resposta objetiva e útil para inferência.
             )
           )
 
-          application.rlmValue.register("memory.status", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          agent.rlmValue.register("memory.status", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             result = agent.application.metisMemoryValue.statusJson()
             result["session"] = %agent.metisSession
           )
 
-          application.rlmValue.register("memory.save", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          agent.rlmValue.register("memory.save", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             agent.application.metisMemoryValue.flush()
             %*{"saved": true, "session": agent.metisSession}
           )
 
-          application.rlmValue.register("memory.newSession", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          agent.rlmValue.register("memory.newSession", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             let session = `jsonStringFieldSym`(arguments, "session", agent.metisSession)
             agent.application.metisMemoryValue.clearSession(session)
             %*{"cleared": true, "session": session}
           )
 
-          application.rlmValue.register("memory.rebuild", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          agent.rlmValue.register("memory.rebuild", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             let count = agent.application.metisMemoryValue.rebuild(
               agent.application.llamaValue
             )
             %*{"rebuilt": count}
           )
 
-          application.rlmValue.register("memory.reset", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          agent.rlmValue.register("memory.reset", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             agent.application.metisMemoryValue.reset(
               agent.application.llamaValue
             )
             %*{"reset": true}
           )
 
-          application.rlmValue.register("okf.tree", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          agent.rlmValue.register("okf.tree", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             interpretOkfAccess(
               agent,
               "okf.tree",
@@ -17974,15 +18186,15 @@ Mantenha a resposta objetiva e útil para inferência.
             )
           )
 
-          application.rlmValue.register("webcontents.list", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          agent.rlmValue.register("webcontents.list", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             agent.application.foreignValue.list()
           )
 
-          application.rlmValue.register("webcontents.describe", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          agent.rlmValue.register("webcontents.describe", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             agent.application.foreignValue.describe(`jsonStringFieldSym`(arguments, "path"))
           )
 
-          application.rlmValue.register("webcontents.eval_js", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          agent.rlmValue.register("webcontents.eval_js", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             agent.application.foreignValue.evalJs(
               `jsonStringFieldSym`(arguments, "path"),
               `jsonStringFieldSym`(arguments, "script"),
@@ -17990,7 +18202,7 @@ Mantenha a resposta objetiva e útil para inferência.
             )
           )
 
-          application.rlmValue.register("webcontents.navigate", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          agent.rlmValue.register("webcontents.navigate", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             agent.application.foreignValue.navigate(
               `jsonStringFieldSym`(arguments, "path"),
               `jsonStringFieldSym`(arguments, "url")
@@ -17998,110 +18210,164 @@ Mantenha a resposta objetiva e útil para inferência.
             %*{"ok": true}
           )
 
-          application.rlmValue.register("rpa.dom.snapshot", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-            agent.application.foreignValue.plasticRpaDomSnapshot(arguments)
-          )
-          application.rlmValue.register("rpa.dom.query", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-            agent.application.foreignValue.plasticRpaDomQuery(arguments)
-          )
-          application.rlmValue.register("rpa.dom.click", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-            agent.application.foreignValue.plasticRpaDomClick(arguments)
-          )
-          application.rlmValue.register("rpa.dom.fill", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-            agent.application.foreignValue.plasticRpaDomFill(arguments)
-          )
-          application.rlmValue.register("rpa.dom.select", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-            agent.application.foreignValue.plasticRpaDomSelect(arguments)
-          )
-          application.rlmValue.register("rpa.dom.read", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-            agent.application.foreignValue.plasticRpaDomRead(arguments)
-          )
-          application.rlmValue.register("rpa.dom.submit", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-            agent.application.foreignValue.plasticRpaDomSubmit(arguments)
-          )
-          application.rlmValue.register("rpa.dom.scroll", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-            agent.application.foreignValue.plasticRpaDomScroll(arguments)
-          )
-          application.rlmValue.register("rpa.dom.wait", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-            agent.application.foreignValue.plasticRpaDomWait(arguments)
-          )
-          application.rlmValue.register("rpa.dom.navigate", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-            agent.application.foreignValue.plasticRpaDomNavigate(arguments)
-          )
-
-          application.rlmValue.register("rpa.screen.observe", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-            plasticRpaInvoke("rpa.screen.observe", arguments)
-          )
-          application.rlmValue.register("rpa.screen.pixel", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-            plasticRpaInvoke("rpa.screen.pixel", arguments)
-          )
-          application.rlmValue.register("rpa.screen.locate", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-            plasticRpaInvoke("rpa.screen.locate", arguments)
-          )
-          application.rlmValue.register("rpa.pointer.move", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-            plasticRpaInvoke("rpa.pointer.move", arguments)
-          )
-          application.rlmValue.register("rpa.pointer.click", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-            plasticRpaInvoke("rpa.pointer.click", arguments)
-          )
-          application.rlmValue.register("rpa.pointer.drag", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-            plasticRpaInvoke("rpa.pointer.drag", arguments)
-          )
-          application.rlmValue.register("rpa.keyboard.write", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-            plasticRpaInvoke("rpa.keyboard.write", arguments)
-          )
-          application.rlmValue.register("rpa.keyboard.press", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-            plasticRpaInvoke("rpa.keyboard.press", arguments)
-          )
-          application.rlmValue.register("rpa.keyboard.hotkey", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-            plasticRpaInvoke("rpa.keyboard.hotkey", arguments)
-          )
-          application.rlmValue.register("rpa.scroll", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-            plasticRpaInvoke("rpa.scroll", arguments)
-          )
-          application.rlmValue.register("rpa.wait", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-            plasticRpaInvoke("rpa.wait", arguments)
-          )
-          application.rlmValue.register("rpa.trajectory.execute", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-            plasticRpaInvoke("rpa.trajectory.execute", arguments)
-          )
-          application.rlmValue.register("rpa.memory.remember", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-            plasticRpaInvoke("rpa.memory.remember", arguments)
-          )
-          application.rlmValue.register("rpa.memory.search", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-            plasticRpaInvoke("rpa.memory.search", arguments)
-          )
-          application.rlmValue.register("rpa.memory.get", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-            plasticRpaInvoke("rpa.memory.get", arguments)
-          )
-          application.rlmValue.register("rpa.memory.list", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-            plasticRpaInvoke("rpa.memory.list", arguments)
-          )
-          application.rlmValue.register("rpa.memory.correct", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-            plasticRpaInvoke("rpa.memory.correct", arguments)
-          )
-
-          application.rlmValue.register("office.document.create", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          agent.rlmValue.register("office.document.create", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             plasticOfficeInvoke("office.document.create", arguments)
           )
-          application.rlmValue.register("office.spreadsheet.create", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          agent.rlmValue.register("office.spreadsheet.create", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             plasticOfficeInvoke("office.spreadsheet.create", arguments)
           )
-          application.rlmValue.register("office.presentation.create", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          agent.rlmValue.register("office.presentation.create", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             plasticOfficeInvoke("office.presentation.create", arguments)
           )
-          application.rlmValue.register("office.pdf.create", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          agent.rlmValue.register("office.pdf.create", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             plasticOfficeInvoke("office.pdf.create", arguments)
           )
-          application.rlmValue.register("office.text.extract", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          agent.rlmValue.register("office.text.extract", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             plasticOfficeInvoke("office.text.extract", arguments)
           )
-          application.rlmValue.register("office.files.list", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          agent.rlmValue.register("office.files.list", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             plasticOfficeInvoke("office.files.list", arguments)
           )
-          application.rlmValue.register("office.workspace.summary", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          agent.rlmValue.register("office.workspace.summary", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             plasticOfficeInvoke("office.workspace.summary", arguments)
           )
+
+        proc installDeclaredTools(agent: PlasticAgent) =
+          if agent.isNil or agent.rlmValue.isNil:
+            return
+          if agent.toolPlans.kind != JArray:
+            return
+
+          for functionPlan in agent.toolPlans.items:
+            if functionPlan.kind != JObject:
+              continue
+
+            let toolName =
+              `jsonStringFieldSym`(functionPlan, "name").strip
+            if toolName.len == 0:
+              continue
+
+            # Uma função padrão pode ser redeclarada no RLM apenas para
+            # fornecer assinatura/descrição; a implementação já pertence
+            # ao escopo privado desta instância.
+            if agent.rlmValue.tools.hasKey(toolName):
+              continue
+
+            case toolName
+            of "ObservePage":
+              agent.rlmValue.register("ObservePage", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+                agent.application.foreignValue.plasticRpaDomSnapshot(arguments)
+              )
+            of "FindElement":
+              agent.rlmValue.register("FindElement", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+                agent.application.foreignValue.plasticRpaDomQuery(arguments)
+              )
+            of "ClickElement":
+              agent.rlmValue.register("ClickElement", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+                agent.application.foreignValue.plasticRpaDomClick(arguments)
+              )
+            of "FillElement":
+              agent.rlmValue.register("FillElement", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+                agent.application.foreignValue.plasticRpaDomFill(arguments)
+              )
+            of "SelectOption":
+              agent.rlmValue.register("SelectOption", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+                agent.application.foreignValue.plasticRpaDomSelect(arguments)
+              )
+            of "ReadElement":
+              agent.rlmValue.register("ReadElement", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+                agent.application.foreignValue.plasticRpaDomRead(arguments)
+              )
+            of "SubmitForm":
+              agent.rlmValue.register("SubmitForm", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+                agent.application.foreignValue.plasticRpaDomSubmit(arguments)
+              )
+            of "ScrollPage":
+              agent.rlmValue.register("ScrollPage", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+                agent.application.foreignValue.plasticRpaDomScroll(arguments)
+              )
+            of "WaitPage":
+              agent.rlmValue.register("WaitPage", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+                agent.application.foreignValue.plasticRpaDomWait(arguments)
+              )
+            of "NavigatePage":
+              agent.rlmValue.register("NavigatePage", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+                agent.application.foreignValue.plasticRpaDomNavigate(arguments)
+              )
+            of "ObserveScreen":
+              agent.rlmValue.register("ObserveScreen", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+                plasticRpaInvoke("rpa.screen.observe", arguments)
+              )
+            of "ReadPixel":
+              agent.rlmValue.register("ReadPixel", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+                plasticRpaInvoke("rpa.screen.pixel", arguments)
+              )
+            of "LocateImage":
+              agent.rlmValue.register("LocateImage", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+                plasticRpaInvoke("rpa.screen.locate", arguments)
+              )
+            of "MovePointer":
+              agent.rlmValue.register("MovePointer", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+                plasticRpaInvoke("rpa.pointer.move", arguments)
+              )
+            of "Click":
+              agent.rlmValue.register("Click", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+                plasticRpaInvoke("rpa.pointer.click", arguments)
+              )
+            of "DragPointer":
+              agent.rlmValue.register("DragPointer", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+                plasticRpaInvoke("rpa.pointer.drag", arguments)
+              )
+            of "WriteText":
+              agent.rlmValue.register("WriteText", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+                plasticRpaInvoke("rpa.keyboard.write", arguments)
+              )
+            of "PressKey":
+              agent.rlmValue.register("PressKey", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+                plasticRpaInvoke("rpa.keyboard.press", arguments)
+              )
+            of "Hotkey":
+              agent.rlmValue.register("Hotkey", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+                plasticRpaInvoke("rpa.keyboard.hotkey", arguments)
+              )
+            of "ScrollScreen":
+              agent.rlmValue.register("ScrollScreen", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+                plasticRpaInvoke("rpa.scroll", arguments)
+              )
+            of "Wait":
+              agent.rlmValue.register("Wait", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+                plasticRpaInvoke("rpa.wait", arguments)
+              )
+            of "ExecuteVisualTrajectory":
+              agent.rlmValue.register("ExecuteVisualTrajectory", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+                plasticRpaInvoke("rpa.trajectory.execute", arguments)
+              )
+            of "RememberTrajectory":
+              agent.rlmValue.register("RememberTrajectory", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+                plasticRpaInvoke("rpa.memory.remember", arguments)
+              )
+            of "RecallTrajectories":
+              agent.rlmValue.register("RecallTrajectories", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+                plasticRpaInvoke("rpa.memory.search", arguments)
+              )
+            of "GetTrajectory":
+              agent.rlmValue.register("GetTrajectory", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+                plasticRpaInvoke("rpa.memory.get", arguments)
+              )
+            of "rpa.memory.list":
+              agent.rlmValue.register("rpa.memory.list", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+                plasticRpaInvoke("rpa.memory.list", arguments)
+              )
+            of "CorrectTrajectory":
+              agent.rlmValue.register("CorrectTrajectory", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+                plasticRpaInvoke("rpa.memory.correct", arguments)
+              )
+            else:
+              raise newException(
+                PlasticAgentError,
+                "Tool declarada sem implementação no escopo RLM do agente " &
+                agent.instanceName & ": " & toolName
+              )
 
         proc normalizeAgentHookName(name: string): string =
           case name.strip.toLowerAscii
@@ -18674,6 +18940,8 @@ Mantenha a resposta objetiva e útil para inferência.
             agent.domainPlan = domainPlan
             agent.rlmConditions = rlmConditions
             agent.toolPlans = toolPlans
+            installDefaultTools(agent)
+            installDeclaredTools(agent)
             application.agentsValue[instanceName] = agent
             if getEnv("GLAUCOPLASTIC_UI_DEBUG").strip.len > 0:
               plasticDebugTrace(
@@ -18773,8 +19041,8 @@ Mantenha a resposta objetiva e útil para inferência.
 
           var rlmInferenceCalls = 0
           var rlmInferenceMs = 0.0
-          var rlmCapabilityCalls = 0
-          var rlmCapabilityMs = 0.0
+          var rlmToolCalls = 0
+          var rlmToolMs = 0.0
           var rlmInvocationCounts =
             initTable[string, int]()
 
@@ -19143,9 +19411,9 @@ Mantenha a resposta objetiva e útil para inferência.
                 "Identidade, propósito, domínio, condições e propriedades do agente.",
                 agentValue
               )
-            environmentValue["capabilities"] =
+            environmentValue["tools"] =
               plasticRlmDeclaredVariable(
-                "Catálogo único e fechado. Use id literalmente em instructions[].capability.",
+                "Catálogo único e fechado. Use id literalmente em instructions[].tool.",
                 compactAgentToolManifest(agent)
               )
             environmentValue["states"] =
@@ -19184,7 +19452,7 @@ Mantenha a resposta objetiva e útil para inferência.
               )
             rlmVariables["observations"] =
               plasticRlmDeclaredVariable(
-                "Resultados reais de capabilities nesta execução; são a evidência primária.",
+                "Resultados reais de tools nesta execução; são a evidência primária.",
                 toolResults
               )
             rlmVariables["workingVariables"] =
@@ -19284,8 +19552,8 @@ Mantenha a resposta objetiva e útil para inferência.
                     "rlm.variables.request, runtime e environment. Só depois " &
                     "consulte memory e history. Se request.value.requiresAction " &
                     "for true e ainda não houver observation suficiente, use " &
-                    "ao menos uma capability literal do catálogo " &
-                    "environment.value.capabilities.value e answer=null. " &
+                    "ao menos uma tool literal do catálogo " &
+                    "environment.value.tools.value e answer=null. " &
                     "Histórico nunca comprova execução atual."
                 }
 
@@ -19462,7 +19730,7 @@ Mantenha a resposta objetiva e útil para inferência.
 
                 let candidateProgram = parseJson(jsonPayload)
                 let validationError =
-                  validateRlmProgramCapabilities(
+                  validateRlmProgramTools(
                     agent,
                     candidateProgram,
                     promptInput
@@ -19561,8 +19829,8 @@ Mantenha a resposta objetiva e útil para inferência.
               for instruction in program["instructions"].items:
                 inc executedInstructions
 
-                let capabilityName =
-                  `jsonStringFieldSym`(instruction, "capability")
+                let toolName =
+                  `jsonStringFieldSym`(instruction, "tool")
                 let arguments =
                   if instruction.hasKey("arguments"):
                     instruction["arguments"]
@@ -19572,12 +19840,12 @@ Mantenha a resposta objetiva e útil para inferência.
                 if llmDebug:
                   plasticDebugTrace(
                     "rlm.invoke agent=" & agent.instanceName &
-                    " capability=" & capabilityName &
+                    " tool=" & toolName &
                     " arguments=" & $arguments
                   )
 
                 let invocationKey =
-                  capabilityName & "|" & $arguments
+                  toolName & "|" & $arguments
                 let invocationCount =
                   rlmInvocationCounts.getOrDefault(
                     invocationKey,
@@ -19593,27 +19861,27 @@ Mantenha a resposta objetiva e útil para inferência.
                     "rlm.guard.repeat-tool run=" &
                     rlmRunId &
                     " iteration=" & $iteration &
-                    " capability=" & capabilityName &
+                    " tool=" & toolName &
                     " count=" & $invocationCount &
                     " arguments=" & $arguments
                   )
                   raise newException(
                     PlasticAgentError,
-                    "RLM repetiu a mesma capability com os " &
+                    "RLM repetiu a mesma tool com os " &
                     "mesmos argumentos mais de " &
                     $rlmRepeatToolLimit & " vez(es): " &
-                    capabilityName
+                    toolName
                   )
 
-                let capabilityStartedAt =
+                let toolStartedAt =
                   epochTime()
 
                 rlmProfile(
-                  "capability.begin",
+                  "tool.begin",
                   %*{
                     "iteration": iteration,
-                    "capability":
-                      capabilityName,
+                    "tool":
+                      toolName,
                     "arguments":
                       if rlmProfilingBodies:
                         arguments.copy
@@ -19628,18 +19896,18 @@ Mantenha a resposta objetiva e útil para inferência.
 
                 try:
                   value =
-                    application.rlmValue.invoke(
+                    agent.rlmValue.invoke(
                       agent,
-                      capabilityName,
+                      toolName,
                       arguments
                     )
-                except CatchableError as capabilityError:
+                except CatchableError as toolError:
                   rlmProfile(
-                    "capability.error",
+                    "tool.error",
                     %*{
                       "iteration": iteration,
-                      "capability":
-                        capabilityName,
+                      "tool":
+                        toolName,
                       "arguments":
                         if rlmProfilingBodies:
                           arguments.copy
@@ -19650,39 +19918,39 @@ Mantenha a resposta objetiva e útil para inferência.
                       "elapsedMs":
                         (
                           epochTime() -
-                          capabilityStartedAt
+                          toolStartedAt
                         ) * 1000.0,
                       "error":
-                        capabilityError.msg
+                        toolError.msg
                     }
                   )
                   raise
 
-                let capabilityElapsedMs =
-                  (epochTime() - capabilityStartedAt) * 1000.0
-                inc rlmCapabilityCalls
-                rlmCapabilityMs +=
-                  capabilityElapsedMs
+                let toolElapsedMs =
+                  (epochTime() - toolStartedAt) * 1000.0
+                inc rlmToolCalls
+                rlmToolMs +=
+                  toolElapsedMs
 
                 if rlmTimingDebug:
                   plasticDebugTrace(
-                    "rlm.capability.done run=" &
+                    "rlm.tool.done run=" &
                     rlmRunId &
                     " iteration=" & $iteration &
-                    " capability=" & capabilityName &
+                    " tool=" & toolName &
                     " repeat=" & $invocationCount &
                     " elapsedMs=" &
-                    $capabilityElapsedMs &
-                    " totalCapabilityMs=" &
-                    $rlmCapabilityMs
+                    $toolElapsedMs &
+                    " totalToolMs=" &
+                    $rlmToolMs
                   )
 
                 rlmProfile(
-                  "capability.done",
+                  "tool.done",
                   %*{
                     "iteration": iteration,
-                    "capability":
-                      capabilityName,
+                    "tool":
+                      toolName,
                     "arguments":
                       if rlmProfilingBodies:
                         arguments.copy
@@ -19696,23 +19964,23 @@ Mantenha a resposta objetiva e útil para inferência.
                     "repeat":
                       invocationCount,
                     "elapsedMs":
-                      capabilityElapsedMs,
-                    "capabilityCall":
-                      rlmCapabilityCalls,
-                    "capabilityTotalMs":
-                      rlmCapabilityMs
+                      toolElapsedMs,
+                    "toolCall":
+                      rlmToolCalls,
+                    "toolTotalMs":
+                      rlmToolMs
                   }
                 )
 
                 if llmDebug:
                   plasticDebugTrace(
                     "rlm.invoke.result agent=" & agent.instanceName &
-                    " capability=" & capabilityName &
+                    " tool=" & toolName &
                     " value=" & $value
                   )
 
                 var observation = newJObject()
-                observation["capability"] = %capabilityName
+                observation["tool"] = %toolName
                 observation["arguments"] = arguments.copy
                 observation["result"] = value.copy
 
@@ -19729,7 +19997,7 @@ Mantenha a resposta objetiva e útil para inferência.
 
             if appliedWrites > 0:
               var writeSummary = newJObject()
-              writeSummary["capability"] = %"state.write.summary"
+              writeSummary["tool"] = %"state.write.summary"
               writeSummary["arguments"] = newJObject()
               writeSummary["result"] = %*{
                 "ok": true,
@@ -19753,8 +20021,8 @@ Mantenha a resposta objetiva e útil para inferência.
               if lastObservation.kind == JObject and
                   `jsonStringFieldSym`(
                     lastObservation,
-                    "capability"
-                  ) == "rpa.dom.navigate" and
+                    "tool"
+                  ) == "NavigatePage" and
                   lastObservation.hasKey("result") and
                   lastObservation["result"].kind == JObject:
                 let navigationResult =
@@ -19794,7 +20062,7 @@ Mantenha a resposta objetiva e útil para inferência.
                       "Página aberta."
 
                   plasticDebugTrace(
-                    "rlm.fast-complete capability=rpa.dom.navigate " &
+                    "rlm.fast-complete tool=NavigatePage " &
                     "run=" & rlmRunId &
                     " iteration=" & $iteration &
                     " totalMs=" & $rlmElapsedMs() &
@@ -19813,10 +20081,10 @@ Mantenha a resposta objetiva e útil para inferência.
                         rlmInferenceCalls,
                       "inferenceMs":
                         rlmInferenceMs,
-                      "capabilityCalls":
-                        rlmCapabilityCalls,
-                      "capabilityMs":
-                        rlmCapabilityMs,
+                      "toolCalls":
+                        rlmToolCalls,
+                      "toolMs":
+                        rlmToolMs,
                       "answer":
                         if rlmProfilingBodies:
                           answerText
@@ -19835,7 +20103,7 @@ Mantenha a resposta objetiva e útil para inferência.
                   )
                   return %answerText
 
-            # Para outras capabilities, a resposta final continua exigindo
+            # Para outras tools, a resposta final continua exigindo
             # feedback do resultado ao modelo.
             if executedInstructions > 0:
               if llmDebug:
@@ -19895,10 +20163,10 @@ Mantenha a resposta objetiva e útil para inferência.
                   $rlmInferenceCalls &
                   " inferenceMs=" &
                   $rlmInferenceMs &
-                  " capabilityCalls=" &
-                  $rlmCapabilityCalls &
-                  " capabilityMs=" &
-                  $rlmCapabilityMs &
+                  " toolCalls=" &
+                  $rlmToolCalls &
+                  " toolMs=" &
+                  $rlmToolMs &
                   " answerChars=" &
                   $answerText.len
                 )
@@ -19913,10 +20181,10 @@ Mantenha a resposta objetiva e útil para inferência.
                     rlmInferenceCalls,
                   "inferenceMs":
                     rlmInferenceMs,
-                  "capabilityCalls":
-                    rlmCapabilityCalls,
-                  "capabilityMs":
-                    rlmCapabilityMs,
+                  "toolCalls":
+                    rlmToolCalls,
+                  "toolMs":
+                    rlmToolMs,
                   "answer":
                     if rlmProfilingBodies:
                       answerText
@@ -19944,8 +20212,8 @@ Mantenha a resposta objetiva e útil para inferência.
               " totalMs=" & $rlmElapsedMs() &
               " inferenceCalls=" &
               $rlmInferenceCalls &
-              " capabilityCalls=" &
-              $rlmCapabilityCalls &
+              " toolCalls=" &
+              $rlmToolCalls &
               " toolResults=" & $toolResults.len
             )
 
@@ -19958,10 +20226,10 @@ Mantenha a resposta objetiva e útil para inferência.
                   rlmInferenceCalls,
                 "inferenceMs":
                   rlmInferenceMs,
-                "capabilityCalls":
-                  rlmCapabilityCalls,
-                "capabilityMs":
-                  rlmCapabilityMs,
+                "toolCalls":
+                  rlmToolCalls,
+                "toolMs":
+                  rlmToolMs,
                 "toolResultCount":
                   toolResults.len,
                 "toolResults":
@@ -19992,8 +20260,8 @@ Mantenha a resposta objetiva e útil para inferência.
             $rlmEffectiveMaxIterations &
             " inferenceCalls=" &
             $rlmInferenceCalls &
-            " capabilityCalls=" &
-            $rlmCapabilityCalls
+            " toolCalls=" &
+            $rlmToolCalls
           )
           rlmProfile(
             "run.limit",
@@ -20006,10 +20274,10 @@ Mantenha a resposta objetiva e útil para inferência.
                 rlmInferenceCalls,
               "inferenceMs":
                 rlmInferenceMs,
-              "capabilityCalls":
-                rlmCapabilityCalls,
-              "capabilityMs":
-                rlmCapabilityMs,
+              "toolCalls":
+                rlmToolCalls,
+              "toolMs":
+                rlmToolMs,
               "toolResultCount":
                 toolResults.len
             }
@@ -20024,9 +20292,6 @@ Mantenha a resposta objetiva e útil para inferência.
       result.add quote do:
         if `applicationVariable`.llamaValue.isNil:
           `applicationVariable`.llamaValue = newLlamaRuntime()
-        if `applicationVariable`.rlmValue.isNil:
-          `applicationVariable`.rlmValue = newRlmRuntime()
-        installDefaultCapabilities(`applicationVariable`)
         deriveAgents(`applicationVariable`)
       continue
 
@@ -25989,13 +26254,15 @@ Mantenha a resposta objetiva e útil para inferência.
             "running": application.llamaValue.running()
           }
 
-          result["rlmCapabilities"] = newJArray()
-          for capabilityName in application.rlmValue.capabilities.keys.toSeq.sorted:
-            result["rlmCapabilities"].add %capabilityName
-
+          result["rlmTools"] = newJObject()
           result["agents"] = newJArray()
           for agentName in application.agentsValue.keys.toSeq.sorted:
             let agent = application.agentsValue[agentName]
+            var agentTools = newJArray()
+            if not agent.rlmValue.isNil:
+              for toolName in agent.rlmValue.tools.keys.toSeq.sorted:
+                agentTools.add %toolName
+            result["rlmTools"][agentName] = agentTools
             result["agents"].add %*{
               "name": agentName,
               "constructor": agent.constructorName,
