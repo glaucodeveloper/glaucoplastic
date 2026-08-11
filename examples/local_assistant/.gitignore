@@ -1,0 +1,14 @@
+/bin/
+/nimcache/
+/.venv/
+/.runtime/
+/data/*
+!/data/.gitkeep
+/office-output/*
+!/office-output/.gitkeep
+/.glauco/
+*.log
+nimble.develop
+nimble.paths
+nimbledeps
+/dist/

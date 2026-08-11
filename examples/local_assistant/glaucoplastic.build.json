@@ -1,0 +1,33 @@
+{
+  "schema": "glaucoplastic.build.v1",
+  "application": "assistant_consumer",
+  "output": "dist",
+  "model": {
+    "source": "",
+    "destination": "models/gemma-4-E4B-it-Q4_K_M.gguf"
+  },
+  "llama": {
+    "linux-x64": {
+      "executable": "",
+      "runtimeRoot": ""
+    },
+    "windows-x64": {
+      "executable": "",
+      "runtimeRoot": ""
+    }
+  },
+  "assets": [
+    {
+      "source": "tools",
+      "destination": "tools"
+    },
+    {
+      "source": "okf",
+      "destination": "okf"
+    },
+    {
+      "source": ".runtime/whisper.cpp",
+      "destination": "runtime/whisper.cpp"
+    }
+  ]
+}

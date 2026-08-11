@@ -1,0 +1,20 @@
+param([string]$InputDevice = "CABLE Output")
+$ErrorActionPreference = "Stop"
+$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location $Root
+$env:GLAUCOPLASTIC_VOICE_RECOGNITION = "system-microphone"
+$env:GLAUCOPLASTIC_VOICE_INPUT_DEVICE = $InputDevice
+$env:GLAUCOPLASTIC_FFMPEG_BINARY = "ffmpeg"
+if (-not $env:GLAUCOPLASTIC_WHISPER_MODEL) {
+  $env:GLAUCOPLASTIC_WHISPER_MODEL = Join-Path $Root ".runtime\whisper.cpp\models\ggml-base.bin"
+}
+if (-not $env:GLAUCOPLASTIC_WHISPER_BINARY) {
+  foreach ($Candidate in @(
+    (Join-Path $Root ".runtime\whisper.cpp\build\bin\Release\whisper-cli.exe"),
+    (Join-Path $Root ".runtime\whisper.cpp\build\bin\whisper-cli.exe")
+  )) {
+    if (Test-Path $Candidate) { $env:GLAUCOPLASTIC_WHISPER_BINARY = $Candidate; break }
+  }
+}
+Remove-Item Env:GLAUCOPLASTIC_WEB_SERVER -ErrorAction SilentlyContinue
+nimble run

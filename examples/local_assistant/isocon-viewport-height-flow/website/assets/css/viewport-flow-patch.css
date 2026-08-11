@@ -1,0 +1,365 @@
+/*
+ * ISOCON — fluxo vertical responsivo
+ *
+ * Objetivos:
+ * - manter páginas curtas encaixadas na altura disponível;
+ * - permitir crescimento natural quando o conteúdo for maior;
+ * - usar scroll-y como fallback, sem recortar conteúdo;
+ * - limitar rolagem interna apenas em áreas que realmente precisam dela.
+ */
+
+:root {
+  --iso-viewport-height: 100vh;
+  --iso-public-header-height: 110px;
+}
+
+@supports (height: 100dvh) {
+  :root {
+    --iso-viewport-height: 100dvh;
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Base: nunca bloquear a rolagem vertical pública.                           */
+/* -------------------------------------------------------------------------- */
+
+html {
+  width: 100%;
+  min-height: 100%;
+  overflow-x: clip;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
+
+body {
+  width: 100%;
+  min-height: 100%;
+  margin: 0;
+  overflow-x: clip;
+  overflow-y: auto;
+}
+
+@supports not (overflow: clip) {
+  html,
+  body {
+    overflow-x: hidden;
+  }
+}
+
+isocon-app,
+site-header,
+site-footer,
+quote-bar,
+chat-widget,
+admin-app {
+  display: block;
+  min-width: 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Website público: shell flexível e rodapé no fim da tela.                   */
+/* -------------------------------------------------------------------------- */
+
+body:not(.admin-mode) > isocon-app {
+  display: flex;
+  min-height: var(--iso-viewport-height);
+  flex-direction: column;
+  overflow: visible;
+}
+
+body:not(.admin-mode) site-header,
+body:not(.admin-mode) site-footer,
+body:not(.admin-mode) quote-bar,
+body:not(.admin-mode) chat-widget {
+  flex: 0 0 auto;
+}
+
+body:not(.admin-mode) #publicPage {
+  flex: 1 0 auto;
+  min-width: 0;
+  min-height: 0;
+  overflow: visible;
+}
+
+body:not(.admin-mode) site-footer {
+  margin-top: auto;
+}
+
+body:not(.admin-mode) #publicPage > *,
+body:not(.admin-mode) #publicPage main,
+body:not(.admin-mode) #publicPage section,
+body:not(.admin-mode) #publicPage article,
+body:not(.admin-mode) #publicPage aside {
+  min-width: 0;
+  max-width: 100%;
+}
+
+/*
+ * Os heróis aproveitam a altura da janela, mas continuam com height:auto.
+ * Quando o conteúdo ultrapassar o valor calculado, a seção cresce e o body
+ * assume a rolagem vertical normal.
+ */
+
+.home-hero,
+.home-hero-grid {
+  height: auto;
+  min-height: clamp(
+    400px,
+    calc(var(--iso-viewport-height) - var(--iso-public-header-height)),
+    620px
+  );
+}
+
+.inner-hero {
+  height: auto;
+  min-height: clamp(270px, 38vh, 430px);
+}
+
+.line-intro,
+.logistics-hero,
+.about-hero,
+.contact-hero {
+  height: auto;
+  min-height: clamp(320px, 52vh, 600px);
+}
+
+@supports (height: 100dvh) {
+  .inner-hero {
+    min-height: clamp(270px, 38dvh, 430px);
+  }
+
+  .line-intro,
+  .logistics-hero,
+  .about-hero,
+  .contact-hero {
+    min-height: clamp(320px, 52dvh, 600px);
+  }
+}
+
+/* Impede grids de forçarem largura/altura além da área disponível. */
+
+.catalog-layout,
+.home-info-grid,
+.line-intro-grid,
+.line-catalog-grid,
+.item-detail-grid,
+.item-content-grid,
+.quote-page-grid,
+.contact-main-card,
+.logistics-overview {
+  min-width: 0;
+  min-height: 0;
+}
+
+.catalog-layout > *,
+.home-info-grid > *,
+.line-intro-grid > *,
+.line-catalog-grid > *,
+.item-detail-grid > *,
+.item-content-grid > *,
+.quote-page-grid > *,
+.contact-main-card > *,
+.logistics-overview > * {
+  min-width: 0;
+}
+
+/* Navegação lateral: encaixa na janela e usa scroll-y quando necessário. */
+
+@media (min-width: 992px) {
+  .catalog-sidebar {
+    position: sticky;
+    top: 18px;
+    max-height: calc(var(--iso-viewport-height) - 36px);
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior-y: contain;
+    scrollbar-width: thin;
+  }
+}
+
+/* Menu móvel e chat nunca podem ultrapassar a altura útil. */
+
+#siteMenu {
+  max-height: var(--iso-viewport-height);
+}
+
+#siteMenu .offcanvas-body {
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+}
+
+.chat-panel {
+  display: flex;
+  max-height: calc(var(--iso-viewport-height) - 24px);
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.chat-panel .chat-body,
+.chat-panel [data-chat-messages],
+.chat-panel .conversation-messages {
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Administração: cabeçalho/sidebar fixos e conteúdo central com scroll-y.    */
+/* -------------------------------------------------------------------------- */
+
+body.admin-mode {
+  height: var(--iso-viewport-height);
+  min-height: 0;
+  overflow: hidden;
+}
+
+body.admin-mode > isocon-app {
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+body.admin-mode admin-app {
+  display: block;
+  height: 100%;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+body.admin-mode .admin-shell {
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+body.admin-mode .admin-sidebar {
+  height: 100%;
+  max-height: 100%;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  scrollbar-gutter: stable;
+}
+
+body.admin-mode .admin-workspace {
+  display: grid;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+}
+
+body.admin-mode .admin-topbar {
+  flex: 0 0 auto;
+}
+
+body.admin-mode .admin-main {
+  min-width: 0;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  scrollbar-gutter: stable;
+  -webkit-overflow-scrolling: touch;
+}
+
+body.admin-mode .admin-main > *:last-child {
+  margin-bottom: max(24px, env(safe-area-inset-bottom));
+}
+
+body.admin-mode .admin-login {
+  min-height: 100%;
+  height: auto;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Janelas baixas: reduz o chrome vertical antes de recorrer ao scroll.        */
+/* -------------------------------------------------------------------------- */
+
+@media (max-height: 760px) and (min-width: 1200px) {
+  :root {
+    --iso-public-header-height: 94px;
+  }
+
+  .site-topbar {
+    padding-block: 5px;
+  }
+
+  .site-navbar {
+    min-height: 66px;
+  }
+
+  .site-navbar .nav-link {
+    padding-block: 18px !important;
+  }
+
+  .section-pad {
+    padding-block: 30px 44px;
+  }
+
+  .home-hero,
+  .home-hero-grid {
+    min-height: clamp(
+      380px,
+      calc(var(--iso-viewport-height) - var(--iso-public-header-height)),
+      560px
+    );
+  }
+
+  .quote-bar-grid {
+    min-height: 66px;
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Mobile: conteúdo natural; scroll da página é sempre o fallback principal.  */
+/* -------------------------------------------------------------------------- */
+
+@media (max-width: 767.98px) {
+  html {
+    scrollbar-gutter: auto;
+  }
+
+  .home-hero,
+  .home-hero-grid,
+  .inner-hero,
+  .line-intro,
+  .logistics-hero,
+  .about-hero,
+  .contact-hero {
+    min-height: auto;
+  }
+
+  .home-hero-grid {
+    padding-block: 32px;
+  }
+
+  .catalog-sidebar {
+    max-height: min(42vh, 320px);
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior-y: contain;
+  }
+
+  @supports (height: 100dvh) {
+    .catalog-sidebar {
+      max-height: min(42dvh, 320px);
+    }
+  }
+
+  .chat-panel {
+    top: 12px;
+    bottom: 12px;
+    max-height: none;
+  }
+
+  body.admin-mode .admin-main {
+    padding-bottom: max(28px, env(safe-area-inset-bottom));
+  }
+}
