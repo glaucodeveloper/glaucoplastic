@@ -1,88 +1,9 @@
-import std/os
 import glaucoplastic
-
-let LocalRpaRoot = currentSourcePath().parentDir
-
-putEnv("GLAUCOPLASTIC_LLAMA_HOST", "127.0.0.1")
-putEnv("GLAUCOPLASTIC_LLAMA_PORT", "19192")
-putEnv("GLAUCOPLASTIC_LLM_ENDPOINT", "http://127.0.0.1:19192/v1")
-putEnv("GLAUCOPLASTIC_METIS_MODE", getEnv("GLAUCOPLASTIC_METIS_MODE", "server"))
-putEnv(
-  "GLAUCOPLASTIC_METIS_ENDPOINT",
-  getEnv("GLAUCOPLASTIC_METIS_ENDPOINT", "http://127.0.0.1:19192/v1")
-)
-putEnv(
-  "GLAUCOPLASTIC_METIS_URL",
-  getEnv("GLAUCOPLASTIC_METIS_URL", "http://127.0.0.1:19192/v1")
-)
-putEnv("GLAUCOPLASTIC_MODEL_ALIAS", "IAAR-Shanghai/Metis-4B")
-putEnv("GLAUCOPLASTIC_METIS_ENABLED", "1")
-putEnv("GLAUCOPLASTIC_METIS_STARTUP", getEnv("GLAUCOPLASTIC_METIS_STARTUP", "1"))
-putEnv(
-  "GLAUCOPLASTIC_METIS_LOAD_SAFETENSORS_ON_STARTUP",
-  getEnv(
-    "GLAUCOPLASTIC_METIS_LOAD_SAFETENSORS_ON_STARTUP",
-    "1"
-  )
-)
-putEnv("GLAUCOPLASTIC_DISABLE_MODEL_STARTUP", getEnv("GLAUCOPLASTIC_DISABLE_MODEL_STARTUP", "0"))
-putEnv("GLAUCOPLASTIC_ASSISTANT_ENABLED", "1")
-putEnv("GLAUCOPLASTIC_ASSISTANT_BUILTIN_SHELL", "0")
-putEnv("GLAUCOPLASTIC_LLAMA_AUTO_DOWNLOAD_RUNTIME", "0")
-putEnv("GLAUCOPLASTIC_LLAMA_AUTO_UPDATE_RUNTIME", "0")
-putEnv("GLAUCOPLASTIC_AUTO_DOWNLOAD_MODEL", "0")
-putEnv("GLAUCOPLASTIC_VOICE_RECOGNITION", "phone-adb")
-putEnv("GLAUCOPLASTIC_RPA_MEMORY_ROOT", LocalRpaRoot / "rpa-memory")
-putEnv("GLAUCOPLASTIC_RPA_SCREENSHOT_ROOT", LocalRpaRoot / "rpa-memory" / "screenshots")
-putEnv("GLAUCOPLASTIC_RPA_BRIDGE", LocalRpaRoot / "tools" / "glaucoplastic_rpa.py")
-putEnv("GLAUCOPLASTIC_RPA_PAUSE", getEnv("GLAUCOPLASTIC_RPA_PAUSE", "0.08"))
-
-when defined(windows):
-  putEnv(
-    "GLAUCOPLASTIC_RPA_PYTHON",
-    getEnv(
-      "GLAUCOPLASTIC_RPA_PYTHON",
-      LocalRpaRoot / ".venv" / "Scripts" / "python.exe"
-    )
-  )
-  putEnv(
-    "GLAUCOPLASTIC_WHISPER_BINARY",
-    getEnv(
-      "GLAUCOPLASTIC_WHISPER_BINARY",
-      LocalRpaRoot / ".runtime" / "whisper.cpp" / "build" / "bin" /
-        "Release" / "whisper-cli.exe"
-    )
-  )
-else:
-  putEnv(
-    "GLAUCOPLASTIC_RPA_PYTHON",
-    getEnv(
-      "GLAUCOPLASTIC_RPA_PYTHON",
-      LocalRpaRoot / ".venv" / "bin" / "python"
-    )
-  )
-  putEnv(
-    "GLAUCOPLASTIC_WHISPER_BINARY",
-    getEnv(
-      "GLAUCOPLASTIC_WHISPER_BINARY",
-      LocalRpaRoot / ".runtime" / "whisper.cpp" / "build" / "bin" /
-        "whisper-cli"
-    )
-  )
-
-putEnv(
-  "GLAUCOPLASTIC_WHISPER_MODEL",
-  getEnv(
-    "GLAUCOPLASTIC_WHISPER_MODEL",
-    LocalRpaRoot / ".runtime" / "whisper.cpp" / "models" / "ggml-base.bin"
-  )
-)
-putEnv("GLAUCOPLASTIC_FFMPEG_BINARY", getEnv("GLAUCOPLASTIC_FFMPEG_BINARY", "ffmpeg"))
 
 glaucoplastic CognitiveRpaApplication, application:
   product:
-    title "Glauco"
-    description "Automação cognitiva local para executar e aprender rotinas no computador."
+    title "Mentis — Knowledge Hardening Studio"
+    description "Laboratório local para estruturar, relacionar e validar conhecimento."
     version "0.4.0"
 
   config:
@@ -881,7 +802,206 @@ glaucoplastic CognitiveRpaApplication, application:
             position: relative;
             z-index: 30;
           }
+
+          .rpa-shell { display: none !important; }
+          .metis-app {
+            position: fixed; inset: 0; z-index: 2147483646;
+            display: grid; grid-template-columns: 232px minmax(0, 1fr);
+            background: #0b0e0e; color: #e8eee9;
+            font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+          }
+          .metis-sidebar { border-right: 1px solid #29342e; padding: 30px 19px; display: flex; flex-direction: column; }
+          .metis-brand { display: flex; gap: 11px; align-items: center; margin: 0 10px 68px; }
+          .metis-orb { width: 30px; height: 30px; border: 1px solid #c8f36b; border-radius: 50%; box-shadow: inset 0 0 0 6px #172018, 0 0 20px #b9ef6940; }
+          .metis-orb::after { content: ''; display: block; width: 5px; height: 5px; background: #c8f36b; border-radius: 50%; margin: 12px; }
+          .metis-brand strong { font-size: 19px; letter-spacing: 3px; }
+          .metis-brand small { display: block; color: #899691; font: 10px ui-monospace, monospace; margin-top: 4px; letter-spacing: 1px; }
+          .metis-nav { display: grid; gap: 4px; }
+          .metis-nav button { border: 0; border-radius: 7px; padding: 13px 11px; background: transparent; color: #899691; text-align: left; font: 500 13px Inter, sans-serif; cursor: pointer; }
+          .metis-nav button[data-active="true"], .metis-nav button:hover { background: #202a25; color: #c8f36b; }
+          .metis-foot { margin-top: auto; color: #586660; font: 10px ui-monospace, monospace; line-height: 1.8; }
+          .metis-foot span { color: #c8f36b; }
+          .metis-main { padding: 31px 48px 70px; overflow: auto; min-width: 0; }
+          .metis-header { display: flex; justify-content: space-between; align-items: start; margin-bottom: 67px; }
+          .metis-eyebrow { color: #c8f36b; font: 10px ui-monospace, monospace; letter-spacing: 1.5px; }
+          .metis-header h1 { font: 600 23px ui-monospace, SFMono-Regular, Consolas, monospace; margin: 9px 0; letter-spacing: -.04em; }
+          .metis-status { display: flex; gap: 9px; align-items: center; color: #899691; font: 11px ui-monospace, monospace; }
+          .metis-status i { width: 7px; height: 7px; border-radius: 50%; background: #c8f36b; box-shadow: 0 0 14px #c8f36b; }
+          .metis-hero { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #29342e; padding-bottom: 55px; }
+          .metis-hero h2 { font: 600 42px ui-monospace, SFMono-Regular, Consolas, monospace; line-height: 1.03; margin: 15px 0 20px; letter-spacing: -2px; }
+          .metis-hero h2 em { color: #c8f36b; font-style: normal; }
+          .metis-hero p { max-width: 430px; color: #899691; line-height: 1.6; }
+          .metis-orbit { width: 265px; height: 265px; margin-right: 60px; border: 1px solid #536544; border-radius: 50%; display: grid; place-items: center; box-shadow: 0 0 55px #baf16819; }
+          .metis-orbit strong { font: 700 46px ui-monospace, monospace; letter-spacing: -7px; color: #263725; }
+          .metis-orbit strong span { color: #c8f36b; }
+          .metis-grid { display: grid; grid-template-columns: 1.35fr .8fr .8fr; gap: 14px; margin-top: 25px; }
+          .metis-card { background: linear-gradient(145deg,#171e1b,#111614); border: 1px solid #29342e; border-radius: 10px; padding: 21px; min-height: 180px; }
+          .metis-card h3 { font: 600 14px ui-monospace, SFMono-Regular, Consolas, monospace; margin: 0 0 20px; }
+          .metis-card strong { font-size: 27px; color: #c8f36b; font-family: ui-monospace, monospace; }
+          .metis-card p { color: #899691; font-size: 12px; line-height: 1.5; }
+          .metis-card.featured { background: linear-gradient(130deg,#223022,#151c18); }
+          .metis-view { display: none; }
+          .metis-view-active { display: block; }
+          .metis-chat-layout { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(280px, .85fr); gap: 14px; margin-top: 25px; }
+          .metis-chat, .metis-process-panel, .metis-memory-panel { background: linear-gradient(145deg,#171e1b,#111614); border: 1px solid #29342e; border-radius: 10px; }
+          .metis-chat { min-height: 330px; display: grid; grid-template-rows: minmax(0, 1fr) auto; gap: 14px; padding: 16px; }
+          .metis-messages { min-height: 220px; max-height: 330px; overflow: auto; display: grid; align-content: start; gap: 8px; }
+          .metis-messages .assistant-message, .metis-messages > div { border-radius: 8px; padding: 10px 12px; background: #101820; color: #aab9b0; }
+          .metis-chat-composer { display: flex; align-items: end; gap: 10px; }
+          .metis-process-panel { padding: 16px; min-height: 330px; }
+          .metis-panel-title { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+          .metis-panel-title strong { font-size: 14px; }
+          .metis-panel-title small { color: #7f9387; }
+          .metis-process-canvas, .metis-memory-canvas { position: relative; min-height: 260px; overflow: hidden; border-radius: 8px; background: linear-gradient(rgba(200,243,107,.06) 1px, transparent 1px), linear-gradient(90deg, rgba(200,243,107,.06) 1px, transparent 1px), #0d1310; background-size: 24px 24px; }
+          .metis-flow-list { display: grid; gap: 12px; align-content: start; padding: 18px; }
+          .metis-flow-node { position: relative; padding: 11px 14px; color: #e8eee9; background: #1b2920; border: 1px solid #536544; text-align: center; min-width: 120px; }
+          .metis-flow-node::after { content: '↓'; position: absolute; left: 50%; bottom: -20px; color: #c8f36b; }
+          .metis-flow-node:last-child::after { content: ''; }
+          .metis-flow-start, .metis-flow-end { border-radius: 999px; }
+          .metis-flow-step { border-radius: 6px; }
+          .metis-flow-decision { transform: rotate(45deg); margin: 14px auto 26px; width: 90px; min-width: 90px; padding: 25px 5px; }
+          .metis-flow-decision span { display: block; transform: rotate(-45deg); font-size: 11px; }
+          .metis-toolbar { display:flex; justify-content:space-between; align-items:center; gap:10px; margin: 24px 0 14px; }
+          .metis-toolbar h2 { margin:0; font-size:20px; }
+          .metis-toolbar p { margin:4px 0 0; color:#899691; font-size:12px; }
+          .metis-action { border:1px solid #536544; border-radius:6px; background:#172219; color:#c8f36b; padding:9px 12px; cursor:pointer; }
+          .metis-memory-canvas { min-height: 500px; padding: 20px; display:flex; flex-wrap:wrap; align-content:flex-start; gap:14px; }
+          .metis-memory-node { width: 210px; min-height: 135px; padding: 15px; border:1px solid #334838; border-radius:9px; background:linear-gradient(145deg,#1c2b20,#121b16); cursor:pointer; transition:.15s; }
+          .metis-memory-node:hover, .metis-memory-node[data-selected="true"] { border-color:#c8f36b; box-shadow:0 0 0 2px #c8f36b22; }
+          .metis-memory-node strong { display:block; margin-bottom:10px; }
+          .metis-memory-node small { color:#899691; line-height:1.5; }
+          .metis-relations { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
+          .metis-relation { color:#b5c6b7; font-size:11px; border:1px solid #334838; border-radius:999px; padding:6px 9px; }
+          .metis-model-details { display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin-top:25px; }
+          .metis-model-details .metis-card { min-height:140px; }
+          .metis-chat input, .metis-chat textarea { flex: 1; border: 1px solid #29342e; border-radius: 6px; background: #0b0f0d; color: #e8eee9; padding: 13px; font: 13px Inter, sans-serif; resize: vertical; min-height: 46px; }
+          .metis-chat button { border: 0; border-radius: 5px; background: #c8f36b; color: #172012; padding: 13px 18px; font-weight: 600; cursor: pointer; }
+          @media(max-width:1050px) { .metis-chat-layout { grid-template-columns: 1fr; } }
+          @media(max-width:850px) { .metis-app { grid-template-columns: 190px 1fr; } .metis-main { padding: 25px; } .metis-grid, .metis-model-details { grid-template-columns: 1fr; } .metis-orbit { display: none; } }
         """
+
+        divi class = "metis-app":
+          aside class = "metis-sidebar":
+            divi class = "metis-brand":
+              span class = "metis-orb"
+              divi:
+                strong "METIS"
+                small "KNOWLEDGE HARDENING LAB"
+            nav class = "metis-nav":
+              button MetisHome(
+                id = "metis-home",
+                type = "button"
+              ) "◈  Cockpit"
+              button MetisMemory(
+                id = "metis-memory",
+                type = "button"
+              ) "⌁  Memórias"
+              button MetisModel(
+                id = "metis-model",
+                type = "button"
+              ) "◌  Modelo"
+            divi class = "metis-foot":
+              text "RUNTIME / LOCAL"
+              br
+              span "GLAUCOPLASTIC · CUDA"
+          main class = "metis-main":
+            header class = "metis-header":
+              divi:
+                span class = "metis-eyebrow" "IAAR / SHANGHAI"
+                h1 "Mentis / Knowledge Hardening Studio"
+              divi class = "metis-status":
+                i
+                text "ONLINE"
+            section class = "metis-hero":
+              divi:
+                span class = "metis-eyebrow" "LAB / SESSION"
+                h2:
+                  text "Knowledge hardening"
+                p "Sessão, grafo de memória e processo de trabalho."
+              divi class = "metis-orbit":
+                strong:
+                  text "M"
+                  span "4"
+                  text "B"
+            section id = "metis-view-home", class = "metis-view metis-view-active":
+              divi class = "metis-grid":
+                article class = "metis-card featured":
+                  span class = "metis-eyebrow" "ENGINE"
+                  h3 "IAAR Shanghai Metis 4B"
+                  p "Local inference / safetensors / CUDA"
+                article class = "metis-card metis-model-card":
+                  h3 "Memórias"
+                  strong "3"
+                  p "cards conectados ao seu contexto"
+                article class = "metis-card":
+                  h3 "Modelo"
+                  strong "4B"
+                  p "Safetensors · CUDA ativo"
+              divi class = "metis-chat-layout":
+                article class = "metis-chat":
+                  divi id = "assistant-messages", class = "assistant-messages metis-messages"
+                  divi class = "metis-chat-composer":
+                    textarea MetisPrompt(id = "assistant-composer", rows = "2", placeholder = "prompt(::Mentis)", autocomplete = "off")
+                    button MetisSend(id = "assistant-send", type = "button") "Enviar →"
+                aside class = "metis-process-panel":
+                  divi class = "metis-panel-title":
+                    divi:
+                      strong "Processo de trabalho"
+                      small "contexto ativo"
+                    button MetisProcessAdd(id = "metis-process-add", type = "button", class = "metis-action") "+ etapa"
+                  divi id = "metis-process-canvas", class = "metis-process-canvas":
+                    divi class = "metis-flow-list":
+                      divi class = "metis-flow-node metis-flow-start":
+                        span "Início"
+                      divi class = "metis-flow-node metis-flow-step":
+                        span "Observar contexto"
+                      divi class = "metis-flow-node metis-flow-decision":
+                        span "Conhecimento novo?"
+                      divi class = "metis-flow-node metis-flow-end":
+                        span "Salvar OKF"
+
+            section id = "metis-view-memory", class = "metis-view":
+              divi class = "metis-toolbar":
+                divi:
+                  h2 "Canvas de memórias"
+                  p "Mova-se entre cards e crie relações para formar o contexto do Metis."
+                divi:
+                  button MetisRelationMode(id = "metis-relation-mode", type = "button", class = "metis-action") "Criar relação"
+                  button MetisNewCard(id = "metis-new-card", type = "button", class = "metis-action") "+ Novo card"
+              divi id = "metis-memory-canvas", class = "metis-memory-canvas":
+                article MetisMemoryIdea(id = "metis-card-ideia", class = "metis-memory-node"):
+                  strong "Ideia local"
+                  small "Notas e decisões que o Metis deve lembrar."
+                article MetisMemoryProcess(id = "metis-card-processo", class = "metis-memory-node"):
+                  strong "Processo"
+                  small "Sequência de trabalho observada na sessão."
+                article MetisMemoryOkf(id = "metis-card-okf", class = "metis-memory-node"):
+                  strong "Documento OKF"
+                  small "Conhecimento consolidado e pronto para revisão."
+              divi id = "metis-relations", class = "metis-relations":
+                span class = "metis-relation" "Selecione dois cards para relacionar"
+
+            section id = "metis-view-model", class = "metis-view":
+              divi class = "metis-toolbar":
+                divi:
+                  h2 "Modelo e runtime"
+                  p "IAAR Shanghai Metis 4B carregado pelo Glaucoplastic."
+              divi class = "metis-model-details":
+                article class = "metis-card":
+                  span class = "metis-eyebrow" "CHECKPOINT"
+                  h3 "Safetensors"
+                  strong "507"
+                  p "tensores em 2 shards"
+                article class = "metis-card":
+                  span class = "metis-eyebrow" "BACKEND"
+                  h3 "CUDA"
+                  strong "ON"
+                  p "llama.cpp GPU runtime"
+                article class = "metis-card":
+                  span class = "metis-eyebrow" "MEMÓRIA"
+                  h3 "Local"
+                  strong "OKF"
+                  p "sessões e documentos locais"
 
         divi class = "rpa-shell":
           header class = "rpa-topbar":
@@ -1213,7 +1333,7 @@ glaucoplastic CognitiveRpaApplication, application:
                 small "Mensagens da tarefa atual"
               span class = "rpa-chat-local-badge":
                 text "Local"
-            divi id = "assistant-messages", class = "rpa-chat-messages"
+            divi id = "legacy-assistant-messages", class = "rpa-chat-messages"
             divi class = "rpa-chat-feedback":
               divi id = "assistant-error"
               divi id = "assistant-voice-note"
@@ -1236,13 +1356,13 @@ glaucoplastic CognitiveRpaApplication, application:
                 title = "Falar"
               ) "◉"
               textarea Composer(
-                id = "assistant-composer",
+                id = "legacy-assistant-composer",
                 placeholder = "Ex.: abra o cadastro, encontre o cliente e atualize o telefone...",
                 autocomplete = "off",
                 spellcheck = "true"
               )
               button Send(
-                id = "assistant-send",
+                id = "legacy-assistant-send",
                 type = "button",
                 class = "rpa-action"
               ) "Executar"
@@ -1365,11 +1485,11 @@ apontar para o próprio form ou para um elemento dentro dele; index começa em 0
 Prefere requestSubmit() para preservar a semântica normal da página.
 """
 
-        Tool ScrollPage(path, selector, deltaX, deltaY, block):
+        Tool ScrollPage(path, selector, deltaX, deltaY, scrollBlock):
           systemPrompt """
 Rola a foreign Workspace via JavaScript. Com selector, leva o elemento à área
 visível antes da rolagem; sem selector, rola window. deltaX=0, deltaY=600 e
-block=center são os padrões.
+scrollBlock=center são os padrões.
 """
 
         Tool WaitPage(path, selector, text, expectedText, state, index, timeoutMs, pollMs):
@@ -1390,41 +1510,41 @@ informar ready. readyTimeoutMs=8000 por padrão. Não informe sucesso antes do
 resultado retornado pela tool.
 """
 
-        Tool ObserveScreen():
-          systemPrompt "Captura a tela ou uma região para operar interfaces fora do DOM."
+        Tool ObserveScreen(region, includePixel, x, y):
+          systemPrompt "Captura a tela via NimPy no runtime local e retorna PNG, caminho e dimensões. Faça isso antes de qualquer ação fora do DOM."
 
-        Tool LocateImage():
-          systemPrompt "Localiza uma referência visual na tela e retorna sua posição."
+        Tool LocateImage(image, path):
+          systemPrompt "Localiza uma referência PNG na tela via NimPy e retorna caixa e centro."
 
-        Tool ReadPixel():
-          systemPrompt "Lê a cor de um ponto quando ela for um sinal de estado suficiente."
+        Tool ReadPixel(x, y):
+          systemPrompt "Lê RGB via NimPy em um ponto da tela quando a cor for um sinal de estado suficiente."
 
-        Tool MovePointer():
-          systemPrompt "Move o ponteiro e pode verificar a região afetada."
+        Tool MovePointer(x, y, duration):
+          systemPrompt "Move o ponteiro via NimPy para uma coordenada observada."
 
-        Tool Click():
-          systemPrompt "Clica em uma posição da tela e compara o estado anterior e posterior."
+        Tool Click(x, y, clicks, button):
+          systemPrompt "Clica via NimPy em uma coordenada observada e confirme o efeito depois."
 
-        Tool DragPointer():
-          systemPrompt "Arrasta o ponteiro e verifica o efeito visual."
+        Tool DragPointer(fromX, fromY, toX, toY, duration, button):
+          systemPrompt "Arrasta via NimPy entre coordenadas observadas e verifica o efeito visual."
 
-        Tool WriteText():
-          systemPrompt "Digita no elemento atualmente focado e verifica o resultado."
+        Tool WriteText(text, interval):
+          systemPrompt "Digita via NimPy no elemento atualmente focado e verifica o resultado."
 
-        Tool PressKey():
-          systemPrompt "Pressiona uma tecla e verifica a alteração produzida."
+        Tool PressKey(key, presses):
+          systemPrompt "Pressiona uma tecla via NimPy e verifica a alteração produzida."
 
-        Tool Hotkey():
-          systemPrompt "Executa uma combinação de teclas e verifica seu efeito."
+        Tool Hotkey(keys):
+          systemPrompt "Executa uma combinação de teclas via NimPy e verifica seu efeito."
 
-        Tool ScrollScreen():
-          systemPrompt "Rola uma interface visual fora do DOM."
+        Tool ScrollScreen(clicks, x, y):
+          systemPrompt "Rola uma interface visual via NimPy; use x e y quando houver ponto observado."
 
-        Tool Wait():
-          systemPrompt "Aguarda a estabilização de uma interface visual."
+        Tool Wait(seconds):
+          systemPrompt "Aguarda a estabilização de uma interface visual sem bloquear a UI thread."
 
-        Tool ExecuteVisualTrajectory():
-          systemPrompt "Executa uma sequência PyAutoGUI já confirmada; trajetórias DOM devem ser chamadas passo a passo."
+        Tool ExecuteVisualTrajectory(actions):
+          systemPrompt "Executa uma sequência visual já confirmada dentro do worker NimPy; trajetórias DOM devem ser chamadas passo a passo."
 
         Tool RecallTrajectories():
           systemPrompt "Busca rotinas locais por objetivo, contexto, âncoras, ações e efeitos."

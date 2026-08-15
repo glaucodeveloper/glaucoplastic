@@ -1,6 +1,6 @@
 param(
-  [ValidateSet("cpu", "vulkan", "cuda12", "cuda13")]
-  [string]$Backend = "cpu",
+  [ValidateSet("auto", "cpu", "vulkan", "cuda12", "cuda13")]
+  [string]$Backend = "auto",
   [string]$RuntimeDirectory = $(
     if ($env:GLAUCOPLASTIC_WINDOWS_RUNTIME_DIR) {
       $env:GLAUCOPLASTIC_WINDOWS_RUNTIME_DIR
@@ -13,6 +13,13 @@ param(
 
 $ErrorActionPreference = "Stop"
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$CudaVersion = $null
+if ($Backend -eq "auto" -and (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) {
+  $Smi = nvidia-smi 2>$null | Out-String
+  if ($Smi -match "CUDA Version:\s*(\d+)") { $CudaVersion = [int]$Matches[1] }
+  $Backend = if ($CudaVersion -ge 13) { "cuda13" } elseif ($CudaVersion -ge 12) { "cuda12" } else { "cpu" }
+}
+if ($Backend -eq "auto") { $Backend = "cpu" }
 $RuntimeRoot = if ($RuntimeDirectory) {
   [System.IO.Path]::GetFullPath($RuntimeDirectory)
 }

@@ -56,6 +56,18 @@ def copy_declared_assets() -> None:
                 shutil.copy2(item, destination / item.name)
             continue
 
+        if kind == "tree":
+            if not source_pattern.is_dir():
+                raise SystemExit(f"Diretório de asset ausente: {source_pattern}")
+            for item in sorted(source_pattern.rglob("*")):
+                if not item.is_file():
+                    continue
+                relative = item.relative_to(source_pattern)
+                target = destination / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(item, target)
+            continue
+
         raise SystemExit(f"Tipo de asset desconhecido: {kind}")
 
 
@@ -306,6 +318,32 @@ if shortcuts.get("desktop", False):
         ]
     )
 
+download_page = manifest.get("installer_download", {})
+download_ui: list[str] = []
+if download_page.get("enabled", False):
+    page_title = quoteattr(str(download_page.get("title", "Preparar recursos locais")))
+    page_description = quoteattr(str(download_page.get("description", "Baixe os recursos necessários durante a instalação.")))
+    runtime_checked = "1" if download_page.get("runtime", True) else ""
+    model_checked = "1" if download_page.get("model", True) else ""
+    download_ui = [
+        '    <Property Id="GLAUCO_DOWNLOAD_RUNTIME" Value=' + quoteattr(runtime_checked) + ' />',
+        '    <Property Id="GLAUCO_DOWNLOAD_MODEL" Value=' + quoteattr(model_checked) + ' />',
+        '    <Property Id="GLAUCO_DOWNLOAD_BACKEND" Value=' + quoteattr(str(download_page.get("backend", "auto"))) + ' />',
+        '    <UIRef Id="WixUI_InstallDir" />',
+        '    <UI>',
+        '      <Dialog Id="GlaucoDownloadDlg" Width="370" Height="270" Title="[ProductName]">',
+        f'        <Control Id="Title" Type="Text" X="15" Y="15" Width="340" Height="25" Transparent="yes" NoPrefix="yes" Text={page_title} />',
+        f'        <Control Id="Description" Type="Text" X="20" Y="55" Width="330" Height="45" Transparent="yes" NoPrefix="yes" Text={page_description} />',
+        '        <Control Id="Runtime" Type="CheckBox" X="20" Y="120" Width="320" Height="18" Property="GLAUCO_DOWNLOAD_RUNTIME" CheckBoxValue="1" Text="Preparar runtime gráfico automaticamente" />',
+        '        <Control Id="Model" Type="CheckBox" X="20" Y="145" Width="320" Height="18" Property="GLAUCO_DOWNLOAD_MODEL" CheckBoxValue="1" Text="Preparar o modelo local automaticamente" />',
+        '        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="Voltar"><Publish Event="NewDialog" Value="InstallDirDlg">1</Publish></Control>',
+        '        <Control Id="Next" Type="PushButton" X="240" Y="243" Width="56" Height="17" Default="yes" Text="Continuar"><Publish Event="NewDialog" Value="VerifyReadyDlg">1</Publish></Control>',
+        '        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="Cancelar"><Publish Event="SpawnDialog" Value="CancelDlg">1</Publish></Control>',
+        '      </Dialog>',
+        '      <Publish Dialog="InstallDirDlg" Control="Next" Event="NewDialog" Value="GlaucoDownloadDlg">1</Publish>',
+        '    </UI>',
+    ]
+
 lines: list[str] = [
     '<?xml version="1.0" encoding="UTF-8"?>',
     '<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">',
@@ -318,6 +356,7 @@ lines: list[str] = [
     '    <Directory Id="TARGETDIR" Name="SourceDir">',
     f"      <Directory Id={quoteattr(install_root)}>",
 ]
+lines.extend(download_ui)
 lines.extend(install_path_xml)
 lines.extend(
     [

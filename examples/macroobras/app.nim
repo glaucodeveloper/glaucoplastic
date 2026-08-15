@@ -16,6 +16,15 @@ glaucoplastic MacroObras, macroObras:
       scope perUser
       executable "MacroObras.exe"
 
+      downloadPage:
+        enabled true
+        title "Preparar MacroObras"
+        description "O instalador pode preparar o runtime gráfico e os recursos locais para uso offline."
+        runtime true
+        model true
+        backend "auto"
+        autoStart true
+
       installDirectory:
         root localAppDataPrograms
         path "MacroObras"

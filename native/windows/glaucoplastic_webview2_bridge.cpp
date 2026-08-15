@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -113,8 +114,11 @@ std::string wide_to_utf8(const wchar_t* text) {
     out.pop_back();
   }
 
-  return out;
+return out;
 }
+
+template <typename Interface>
+const IID& webview2_interface_iid();
 
 template <typename Interface>
 class ComHandlerBase : public Interface {
@@ -141,7 +145,7 @@ public:
 
     if (
       iid == IID_IUnknown ||
-      iid == __uuidof(Interface)
+      iid == webview2_interface_iid<Interface>()
     ) {
       *object = static_cast<Interface*>(this);
       AddRef();
@@ -158,6 +162,44 @@ protected:
 private:
   std::atomic<ULONG> refs_{1};
 };
+
+template <typename Interface>
+const IID& webview2_interface_iid();
+
+template <>
+const IID& webview2_interface_iid<
+  ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler
+>() {
+  return IID_ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler;
+}
+
+template <>
+const IID& webview2_interface_iid<
+  ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler
+>() {
+  return IID_ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler;
+}
+
+template <>
+const IID& webview2_interface_iid<
+  ICoreWebView2ExecuteScriptCompletedHandler
+>() {
+  return IID_ICoreWebView2ExecuteScriptCompletedHandler;
+}
+
+template <>
+const IID& webview2_interface_iid<
+  ICoreWebView2WebMessageReceivedEventHandler
+>() {
+  return IID_ICoreWebView2WebMessageReceivedEventHandler;
+}
+
+template <>
+const IID& webview2_interface_iid<
+  ICoreWebView2SourceChangedEventHandler
+>() {
+  return IID_ICoreWebView2SourceChangedEventHandler;
+}
 
 class EnvironmentCompletedHandler final
   : public ComHandlerBase<
@@ -824,43 +866,41 @@ LRESULT CALLBACK host_window_proc(
 }
 
 bool register_window_class() {
-  static std::once_flag once;
   static bool registered = false;
 
-  std::call_once(
-    once,
-    []() {
-      WNDCLASSEXW windowClass{};
-      windowClass.cbSize =
-        sizeof(windowClass);
-      windowClass.style =
-        CS_HREDRAW |
-        CS_VREDRAW |
-        CS_DBLCLKS;
-      windowClass.lpfnWndProc =
-        host_window_proc;
-      windowClass.hInstance =
-        GetModuleHandleW(nullptr);
-      windowClass.hCursor =
-        LoadCursorW(
-          nullptr,
-          IDC_ARROW
-        );
-      windowClass.hbrBackground =
-        reinterpret_cast<HBRUSH>(
-          COLOR_WINDOW + 1
-        );
-      windowClass.lpszClassName =
-        kWindowClassName;
+  if (registered) {
+    return true;
+  }
 
-      registered =
-        RegisterClassExW(
-          &windowClass
-        ) != 0 ||
-        GetLastError() ==
-          ERROR_CLASS_ALREADY_EXISTS;
-    }
-  );
+  WNDCLASSEXW windowClass{};
+  windowClass.cbSize =
+    sizeof(windowClass);
+  windowClass.style =
+    CS_HREDRAW |
+    CS_VREDRAW |
+    CS_DBLCLKS;
+  windowClass.lpfnWndProc =
+    host_window_proc;
+  windowClass.hInstance =
+    GetModuleHandleW(nullptr);
+  windowClass.hCursor =
+    LoadCursorW(
+      nullptr,
+      IDC_ARROW
+    );
+  windowClass.hbrBackground =
+    reinterpret_cast<HBRUSH>(
+      COLOR_WINDOW + 1
+    );
+  windowClass.lpszClassName =
+    kWindowClassName;
+
+  registered =
+    RegisterClassExW(
+      &windowClass
+    ) != 0 ||
+    GetLastError() ==
+      ERROR_CLASS_ALREADY_EXISTS;
 
   return registered;
 }
@@ -914,7 +954,8 @@ bool initialize_direct_composition(
 
   hr =
     host->d3dDevice->QueryInterface(
-      IID_PPV_ARGS(
+      IID_IDXGIDevice,
+      reinterpret_cast<void**>(
         &host->dxgiDevice
       )
     );
@@ -1080,7 +1121,8 @@ HRESULT configure_surface(
 
   HRESULT hr =
     surface.composition->QueryInterface(
-      IID_PPV_ARGS(
+      IID_ICoreWebView2Controller,
+      reinterpret_cast<void**>(
         &surface.controller
       )
     );
@@ -1113,7 +1155,8 @@ HRESULT configure_surface(
   if (
     SUCCEEDED(
       surface.controller->QueryInterface(
-        IID_PPV_ARGS(
+        IID_ICoreWebView2Controller2,
+        reinterpret_cast<void**>(
           &controller2
         )
       )
@@ -1392,7 +1435,8 @@ bool initialize_webview_environment(
 
         HRESULT hr =
           environment->QueryInterface(
-            IID_PPV_ARGS(
+            IID_ICoreWebView2Environment3,
+            reinterpret_cast<void**>(
               &host->environment3
             )
           );
@@ -1530,6 +1574,11 @@ GPWV2Host* __cdecl gpwv2_create(
   auto* host =
     new GPWV2Host();
 
+  host_log(
+    host,
+    "bridge.gpwv2_create entry"
+  );
+
   host->messageCallback =
     messageCallback;
   host->sourceCallback =
@@ -1572,14 +1621,28 @@ GPWV2Host* __cdecl gpwv2_create(
       COINIT_APARTMENTTHREADED
     );
 
+  host_log(
+    host,
+    "bridge.gpwv2_create after CoInitializeEx"
+  );
+
   host->comInitialized =
     SUCCEEDED(comHr) ||
     comHr == RPC_E_CHANGED_MODE;
 
   if (!register_window_class()) {
+    host_log(
+      host,
+      "bridge.gpwv2_create register_window_class failed"
+    );
     delete host;
     return nullptr;
   }
+
+  host_log(
+    host,
+    "bridge.gpwv2_create register_window_class ok"
+  );
 
   host->hwnd =
     CreateWindowExW(
@@ -1598,28 +1661,55 @@ GPWV2Host* __cdecl gpwv2_create(
     );
 
   if (!host->hwnd) {
+    host_log(
+      host,
+      "bridge.gpwv2_create CreateWindowExW failed"
+    );
     delete host;
     return nullptr;
   }
+
+  host_log(
+    host,
+    "bridge.gpwv2_create window created"
+  );
 
   if (
     !initialize_direct_composition(
       host
     )
   ) {
+    host_log(
+      host,
+      "bridge.gpwv2_create initialize_direct_composition failed"
+    );
     host->failed = true;
     host->failureCode = E_FAIL;
     return host;
   }
+
+  host_log(
+    host,
+    "bridge.gpwv2_create direct composition ok"
+  );
 
   if (
     !initialize_webview_environment(
       host
     )
   ) {
+    host_log(
+      host,
+      "bridge.gpwv2_create initialize_webview_environment failed"
+    );
     host->failed = true;
     host->failureCode = E_FAIL;
   }
+
+  host_log(
+    host,
+    "bridge.gpwv2_create exit"
+  );
 
   return host;
 }
@@ -1831,6 +1921,117 @@ int32_t __cdecl gpwv2_shell_set_html(
         html.c_str()
       )
   ) ? 1 : 0;
+}
+
+char* __cdecl gpwv2_shell_execute_sync(
+  GPWV2Host* host,
+  const char* scriptUtf8,
+  int32_t timeoutMs
+) {
+  if (
+    !host ||
+    !host->shellSurface.webview ||
+    !scriptUtf8
+  ) {
+    return nullptr;
+  }
+
+  struct ResultState {
+    bool done = false;
+    HRESULT hr = E_FAIL;
+    std::string value;
+  } state;
+
+  const std::wstring script =
+    utf8_to_wide(
+      scriptUtf8
+    );
+
+  auto* handler =
+    new ExecuteScriptCompletedHandler(
+      [&state](
+        HRESULT errorCode,
+        LPCWSTR resultObjectAsJson
+      ) -> HRESULT {
+        state.hr =
+          errorCode;
+
+        state.value =
+          wide_to_utf8(
+            resultObjectAsJson
+          );
+
+        state.done =
+          true;
+
+        return S_OK;
+      }
+    );
+
+  const HRESULT executeHr =
+    host->shellSurface.webview->
+      ExecuteScript(
+        script.c_str(),
+        handler
+      );
+
+  handler->Release();
+
+  if (FAILED(executeHr)) {
+    return nullptr;
+  }
+
+  const auto started =
+    std::chrono::steady_clock::now();
+
+  const int32_t safeTimeout =
+    std::max<int32_t>(
+      100,
+      timeoutMs
+    );
+
+  while (!state.done) {
+    pump_pending_messages();
+
+    std::this_thread::sleep_for(
+      std::chrono::milliseconds(1)
+    );
+
+    const auto elapsed =
+      std::chrono::duration_cast<
+        std::chrono::milliseconds
+      >(
+        std::chrono::steady_clock::now() -
+        started
+      ).count();
+
+    if (elapsed >= safeTimeout) {
+      return nullptr;
+    }
+  }
+
+  if (FAILED(state.hr)) {
+    return nullptr;
+  }
+
+  char* output =
+    static_cast<char*>(
+      std::malloc(
+        state.value.size() + 1
+      )
+    );
+
+  if (!output) {
+    return nullptr;
+  }
+
+  std::memcpy(
+    output,
+    state.value.c_str(),
+    state.value.size() + 1
+  );
+
+  return output;
 }
 
 int32_t __cdecl gpwv2_foreign_navigate(

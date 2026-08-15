@@ -10,6 +10,7 @@
 ## O backend nativo de WebContentsView é registrado por callbacks para manter
 ## o framework monolítico e permitir WebView2, WebKitGTK ou WKWebView sem
 ## impor um toolkit visual específico ao projeto consumidor.
+## O modo hot reload usa o reloadToken do servidor web para renovar o WebView.
 
 import std/strtabs
 import std/dynlib
@@ -19,20 +20,460 @@ import nimpy
 import nimpy/py_lib
 
 
-# `--os:windows` muda a semântica de std/os durante cross-compilação.
-# `staticRead`, porém, é executado pelo compilador no host.
-const PlasticCompileSourcePath =
-  currentSourcePath().replace('\\', '/')
-const PlasticCompileSourceDir =
-  PlasticCompileSourcePath[
-    0 .. PlasticCompileSourcePath.rfind('/')
-  ]
+# Overlay do assistente embutido no runtime.
+const PlasticAssistantForeignOverlayScript* = r"""
+(() => {
+  if (window.top !== window) return false;
 
-const PlasticAssistantForeignOverlayScript* =
-  staticRead(
-    PlasticCompileSourceDir &
-    "glaucoplastic_assistant_foreign_overlay.js"
-  )
+  const VERSION = "foreign-overlay-v4";
+  const HOST_ID = "glaucoplastic-assistant-foreign-host";
+  const state =
+    window.__glaucoplasticAssistantForeignState || {
+      snapshot: null,
+      initialized: false,
+      lastResponseId: "",
+      open: false,
+      awaitingDispatch: false,
+      processing: false,
+      ensureTimer: 0,
+      observer: null
+    };
+
+  window.__glaucoplasticAssistantForeignState = state;
+
+  if (
+    window.__glaucoplasticAssistantForeignVersion === VERSION &&
+    typeof window.__glaucoplasticAssistantForeignEnsure === "function"
+  ) {
+    window.__glaucoplasticAssistantForeignEnsure();
+    return true;
+  }
+
+  window.__glaucoplasticAssistantForeignVersion = VERSION;
+
+  const text = value => value == null ? "" : String(value);
+  const queue = () =>
+    window.__glaucoplasticAssistantForeignEvents ||
+    (window.__glaucoplasticAssistantForeignEvents = []);
+  const parentNode = () => document.documentElement || document.body;
+
+  function emit(identity, value = null, checked = false) {
+    queue().push({
+      handlerId: "glaucoplastic-assistant",
+      event: "assistant",
+      identity,
+      value,
+      checked
+    });
+  }
+
+  function ensureHost() {
+    const parent = parentNode();
+    if (!parent) return null;
+
+    let host = document.getElementById(HOST_ID);
+    if (host && !host.shadowRoot) {
+      host.remove();
+      host = null;
+    }
+
+    if (!host) {
+      host = document.createElement("div");
+      host.id = HOST_ID;
+      host.style.cssText =
+        "all:initial;position:fixed;inset:0;z-index:2147483647;" +
+        "pointer-events:none;contain:layout style paint";
+
+      const shadow = host.attachShadow({ mode: "open" });
+      shadow.innerHTML = `
+        <style>
+          :host { all: initial; }
+          * { box-sizing: border-box; }
+          button, textarea { font: inherit; }
+          .root {
+            position: fixed; inset: 0; z-index: 2147483647;
+            pointer-events: none; color: #eef3f8;
+            font-family: system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+          }
+          .panel {
+            position: absolute; top: 0; right: 0; width: 336px; height: 100%;
+            display: none; flex-direction: column; overflow: hidden;
+            pointer-events: auto; border-left: 1px solid #2a3443;
+            background: rgba(13,18,25,.985); box-shadow: -18px 0 44px rgba(0,0,0,.38);
+          }
+          .root.open .panel { display: flex; }
+          .head {
+            flex: 0 0 58px; display: flex; align-items: center; justify-content: space-between;
+            gap: 10px; padding: 10px 13px; border-bottom: 1px solid #2a3443;
+          }
+          .head div { display: grid; gap: 2px; }
+          .head strong { font-size: 13px; }
+          .head small { color: #909bad; font-size: 10px; }
+          .badge {
+            padding: 4px 7px; border: 1px solid #355344; border-radius: 999px;
+            color: #6dd3a0; font-size: 9px; font-weight: 800;
+            text-transform: uppercase; letter-spacing: .08em;
+          }
+          .messages {
+            flex: 1 1 auto; min-height: 0; overflow: auto; display: flex;
+            flex-direction: column; gap: 8px; padding: 12px 11px 92px;
+          }
+          .empty {
+            margin: auto; max-width: 250px; color: #909bad; text-align: center;
+            font-size: 12px; line-height: 1.45;
+          }
+          .message {
+            width: auto; max-width: 92%; padding: 9px 10px; border: 1px solid #2a3443;
+            border-radius: 10px; background: #121923; white-space: pre-wrap;
+            overflow-wrap: anywhere; font-size: 12px; line-height: 1.45;
+          }
+          .message.user { align-self: flex-end; background: #19150e; border-color: #514328; }
+          .message.assistant { align-self: flex-start; }
+          .time { display: block; margin-top: 5px; color: #909bad; font-size: 9px; }
+          .feedback {
+            position: absolute; left: 10px; right: 10px; bottom: 78px;
+            color: #ff9b9b; font-size: 10px; pointer-events: none;
+          }
+          .composer-shell {
+            position: absolute; left: 50%; bottom: 14px;
+            width: min(900px, calc(100vw - 32px));
+            transform: translateX(-50%); pointer-events: auto;
+          }
+          .root.open .composer-shell {
+            left: auto; right: 0; bottom: 0; width: 336px; transform: none;
+            padding: 8px; border-top: 1px solid #2a3443; background: rgba(13,18,25,.985);
+          }
+          .composer {
+            min-width: 0; display: grid; grid-template-columns: auto minmax(0,1fr) auto;
+            align-items: center; gap: 8px; padding: 7px; border: 1px solid #6f5d35;
+            border-radius: 13px; background: rgba(10,14,20,.975);
+            box-shadow: 0 16px 42px rgba(0,0,0,.44);
+          }
+          .root.open .composer { border-radius: 10px; box-shadow: none; }
+          .round, .send {
+            height: 44px; border: 1px solid #6f5d35; border-radius: 9px;
+            background: #241d10; color: #f0b84c; cursor: pointer;
+          }
+          .round { width: 44px; padding: 0; }
+          .round.listening { color: #ff8c8c; border-color: #7b3838; }
+          .send { padding: 0 13px; font-weight: 750; }
+          textarea {
+            width: 100%; height: 44px; min-height: 44px; max-height: 104px; padding: 11px 12px;
+            resize: none; overflow-y: auto; border: 1px solid #2a3443; border-radius: 9px;
+            outline: none; background: #0b1016; color: #eef3f8;
+          }
+          textarea:focus { border-color: #6f5d35; }
+          textarea:disabled, button:disabled { cursor: wait; opacity: .55; }
+          .queue-state {
+            min-height: 14px; margin: 5px 4px 0; color: #909bad;
+            font-size: 10px; line-height: 1.3; text-align: right;
+          }
+          .processing-status {
+            position: absolute; top: 12px; right: 12px; display: none; align-items: center;
+            gap: 7px; padding: 7px 10px; border: 1px solid #6f5d35; border-radius: 999px;
+            background: rgba(16,20,27,.96); color: #f0b84c; box-shadow: 0 12px 28px rgba(0,0,0,.34);
+            font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: .08em;
+            pointer-events: none;
+          }
+          .root.processing .processing-status { display: flex; }
+          .root.open .processing-status { right: 348px; }
+          .processing-dot {
+            width: 7px; height: 7px; border-radius: 50%; background: currentColor;
+            animation: glauco-processing-pulse 1s ease-in-out infinite;
+          }
+          @keyframes glauco-processing-pulse {
+            0%, 100% { opacity: .35; transform: scale(.82); }
+            50% { opacity: 1; transform: scale(1); }
+          }
+          .toasts {
+            position: absolute; top: 52px; right: 12px; width: min(360px, calc(100vw - 24px));
+            display: grid; gap: 7px; pointer-events: none;
+          }
+          .root.open .toasts { right: 348px; }
+          .toast {
+            padding: 10px 11px; border: 1px solid #6f5d35; border-radius: 10px;
+            background: rgba(18,24,33,.985); color: #eef3f8; box-shadow: 0 16px 38px rgba(0,0,0,.44);
+            opacity: 0; transform: translateY(-7px); transition: .18s ease;
+            pointer-events: auto; cursor: pointer;
+          }
+          .toast.visible { opacity: 1; transform: translateY(0); }
+          .toast strong { display: block; color: #f0b84c; font-size: 10px; }
+          .toast span {
+            display: -webkit-box; margin-top: 3px; color: #eef3f8; font-size: 11px; line-height: 1.35;
+            -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+          }
+        </style>
+        <div class="root">
+          <section class="panel">
+            <header class="head">
+              <div>
+                <strong>Conversas</strong>
+                <small>Mensagens da tarefa atual</small>
+              </div>
+              <span class="badge">Local</span>
+            </header>
+            <div class="messages"><div class="empty">A conversa atual aparecerá aqui.</div></div>
+            <div class="feedback"></div>
+          </section>
+          <div class="processing-status"><span class="processing-dot"></span><span class="processing-text">Processando</span></div>
+          <div class="toasts"></div>
+          <footer class="composer-shell">
+            <div class="composer">
+              <button class="round microphone" type="button" title="Falar">◉</button>
+              <textarea class="input" placeholder="Descreva o que deseja realizar..."></textarea>
+              <button class="send" type="button">Executar</button>
+            </div>
+            <div class="queue-state"></div>
+          </footer>
+        </div>`;
+
+      parent.appendChild(host);
+      bind(shadow);
+    }
+
+    render(host);
+    installObserver();
+    return host;
+  }
+
+  function controls(host = null) {
+    const resolved = host || document.getElementById(HOST_ID);
+    if (!resolved || !resolved.shadowRoot) return null;
+
+    const shadow = resolved.shadowRoot;
+    return {
+      root: shadow.querySelector(".root"),
+      messages: shadow.querySelector(".messages"),
+      feedback: shadow.querySelector(".feedback"),
+      toasts: shadow.querySelector(".toasts"),
+      microphone: shadow.querySelector(".microphone"),
+      input: shadow.querySelector(".input"),
+      send: shadow.querySelector(".send"),
+      queueState: shadow.querySelector(".queue-state"),
+      processingText: shadow.querySelector(".processing-text")
+    };
+  }
+
+  function info(snapshot) {
+    const queue = (snapshot && snapshot.chatQueue) || {};
+    const queued = Number(queue.queued || 0);
+    const active = Boolean(queue.active);
+    return {
+      queued,
+      active,
+      totalPending: Number(queue.totalPending || queued + (active ? 1 : 0))
+    };
+  }
+
+  function processing(snapshot) {
+    const status = text(snapshot && snapshot.status).toLowerCase();
+    const queue = info(snapshot);
+    return status === "thinking" || status === "processing" ||
+      status === "running" || queue.totalPending > 0;
+  }
+
+  function update(controlsRef) {
+    if (!controlsRef) return;
+    const snapshot = state.snapshot || {};
+    const queue = info(snapshot);
+    const busy = processing(snapshot);
+    state.processing = busy;
+    if (busy || snapshot.lastError) state.awaitingDispatch = false;
+
+    controlsRef.root.classList.toggle("processing", busy);
+    controlsRef.input.disabled = state.awaitingDispatch;
+    controlsRef.send.disabled = state.awaitingDispatch;
+    controlsRef.microphone.disabled = state.awaitingDispatch;
+    controlsRef.send.textContent = busy ? "Enfileirar" : "Executar";
+    controlsRef.input.placeholder = state.awaitingDispatch
+      ? "Enviando mensagem..."
+      : busy
+        ? "Digite outra mensagem para acrescentar à fila..."
+        : "Descreva o que deseja realizar...";
+
+    if (controlsRef.queueState) {
+      controlsRef.queueState.textContent = state.awaitingDispatch
+        ? "Enviando para o processamento..."
+        : queue.totalPending === 1
+          ? "1 mensagem em processamento"
+          : queue.totalPending > 1
+            ? queue.totalPending + " mensagens em processamento ou na fila"
+            : "";
+    }
+  }
+
+  function fmtTime(value) {
+    if (!value) return "";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "";
+    return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }
+
+  function renderMessages(controlsRef, snapshot) {
+    if (!controlsRef) return;
+    const session = (snapshot && snapshot.activeSession) || {};
+    const messages = session.messages || [];
+    controlsRef.messages.replaceChildren();
+    if (!messages.length) {
+      const empty = document.createElement("div");
+      empty.className = "empty";
+      empty.textContent = "A conversa atual aparecerá aqui.";
+      controlsRef.messages.appendChild(empty);
+      return;
+    }
+    for (const message of messages) {
+      const bubble = document.createElement("article");
+      bubble.className = "message " + (message.role === "user" ? "user" : "assistant");
+      const body = document.createElement("div");
+      body.textContent = text(message.content);
+      const time = document.createElement("span");
+      time.className = "time";
+      time.textContent = fmtTime(message.createdAt);
+      bubble.append(body, time);
+      controlsRef.messages.appendChild(bubble);
+    }
+    requestAnimationFrame(() => {
+      controlsRef.messages.scrollTop = controlsRef.messages.scrollHeight;
+    });
+  }
+
+  function showToast(message, responseId) {
+    const content = text(message).trim();
+    if (!content) return;
+    const controlsRef = controls();
+    if (!controlsRef) return;
+
+    const toast = document.createElement("button");
+    toast.type = "button";
+    toast.className = "toast";
+
+    const title = document.createElement("strong");
+    title.textContent = "Glauco respondeu";
+
+    const preview = document.createElement("span");
+    preview.textContent = content.length > 240 ? content.slice(0, 237) + "..." : content;
+
+    toast.append(title, preview);
+    toast.addEventListener("click", () => { setOpen(true); toast.remove(); });
+    controlsRef.toasts.appendChild(toast);
+    requestAnimationFrame(() => toast.classList.add("visible"));
+    setTimeout(() => { toast.classList.remove("visible"); setTimeout(() => toast.remove(), 220); }, 9000);
+
+    if ("Notification" in window && Notification.permission === "granted" && !document.hasFocus()) {
+      try { new Notification("Glauco", { body: preview.textContent, tag: "glauco-response-" + text(responseId) }); } catch (_) {}
+    }
+  }
+
+  function render(host = null) {
+    const controlsRef = controls(host);
+    if (!controlsRef) return false;
+    controlsRef.root.classList.toggle("open", Boolean(state.open));
+    if (state.snapshot) {
+      renderMessages(controlsRef, state.snapshot);
+      controlsRef.feedback.textContent = text(state.snapshot.lastError);
+      controlsRef.microphone.classList.toggle("listening", ["recording", "starting"].includes(text(state.snapshot.voiceState).toLowerCase()));
+      if (state.snapshot.lastTranscriptId && state.snapshot.lastTranscript && !controlsRef.input.value.trim()) {
+        controlsRef.input.value = text(state.snapshot.lastTranscript);
+      }
+    }
+    update(controlsRef);
+    return true;
+  }
+
+  function applySnapshot(snapshot) {
+    if (!snapshot || typeof snapshot !== "object") return false;
+    state.snapshot = snapshot;
+    if (processing(snapshot) || snapshot.lastError) state.awaitingDispatch = false;
+    const host = ensureHost();
+    if (!host) { scheduleEnsure(16); return false; }
+    render(host);
+    if (snapshot.lastResponseId && snapshot.lastResponseId !== state.lastResponseId) {
+      const notify = state.initialized;
+      state.lastResponseId = snapshot.lastResponseId;
+      if (notify) showToast(snapshot.lastResponse, snapshot.lastResponseId);
+    }
+    state.initialized = true;
+    return true;
+  }
+
+  function setOpen(open) {
+    state.open = Boolean(open);
+    const host = ensureHost();
+    if (!host) { scheduleEnsure(16); return false; }
+    const controlsRef = controls(host);
+    if (controlsRef) controlsRef.root.classList.toggle("open", state.open);
+    return true;
+  }
+
+  function send() {
+    const controlsRef = controls();
+    if (!controlsRef || state.awaitingDispatch) return;
+    const value = controlsRef.input.value.trim();
+    if (!value) return;
+    state.awaitingDispatch = true;
+    update(controlsRef);
+    emit("assistant:send", value);
+    controlsRef.input.value = "";
+    controlsRef.input.style.height = "44px";
+  }
+
+  function bind(shadow) {
+    if (shadow.__glaucoplasticAssistantBound) return;
+    shadow.__glaucoplasticAssistantBound = true;
+    const input = shadow.querySelector(".input");
+    const sendButton = shadow.querySelector(".send");
+    const microphone = shadow.querySelector(".microphone");
+    sendButton.addEventListener("click", send);
+    input.addEventListener("keydown", event => {
+      if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); send(); }
+    });
+    input.addEventListener("input", event => {
+      const field = event.currentTarget;
+      field.style.height = "44px";
+      field.style.height = Math.min(field.scrollHeight, 104) + "px";
+    });
+    microphone.addEventListener("click", () => {
+      if (state.awaitingDispatch) return;
+      const voice = text(state.snapshot && state.snapshot.voiceState).toLowerCase();
+      emit(voice === "recording" || voice === "starting" ? "assistant:voice-stop" : "assistant:voice-start");
+    });
+  }
+
+  function installObserver() {
+    if (state.observer || !document.documentElement) return;
+    state.observer = new MutationObserver(() => {
+      if (!document.getElementById(HOST_ID)) scheduleEnsure(0);
+    });
+    state.observer.observe(document.documentElement, { childList: true, subtree: true });
+  }
+
+  function scheduleEnsure(delay = 0) {
+    if (state.ensureTimer) clearTimeout(state.ensureTimer);
+    state.ensureTimer = window.setTimeout(() => {
+      state.ensureTimer = 0;
+      if (!ensureHost()) scheduleEnsure(16);
+    }, Math.max(0, delay));
+    return true;
+  }
+
+  window.__glaucoplasticAssistantForeignApply = applySnapshot;
+  window.__glaucoplasticAssistantForeignSetOpen = setOpen;
+  window.__glaucoplasticAssistantForeignEnsure = scheduleEnsure;
+  window.__glaucoplasticAssistantForeignApiReady = () => true;
+
+  if (parentNode()) {
+    ensureHost();
+  } else {
+    document.addEventListener("DOMContentLoaded", () => scheduleEnsure(0), { once: true });
+    scheduleEnsure(16);
+  }
+
+  return true;
+})();
+""";
+
+proc plasticAssistantForeignOverlayScript*(): string =
+  PlasticAssistantForeignOverlayScript
 
 type
   PlasticPyGILState = cint
@@ -192,6 +633,255 @@ proc plasticNetworkWebBridgeScript(): string =
       ).find(element => element.dataset.glaucoIdentity === path) || null;
     }
 
+    function bindKnowledgeGraphCanvas() {
+      const ns = 'http://www.w3.org/2000/svg';
+      document.querySelectorAll('.ks-knowledge-canvas').forEach(canvas => {
+        if (canvas.dataset.graphBound === 'true') return;
+        canvas.dataset.graphBound = 'true';
+
+        const layer = canvas.querySelector('.ks-graph-layer');
+        if (!layer) return;
+
+        // Núcleo transcrito do diagram-canvas do MacroObras: modelo explícito,
+        // espaço de mundo, arestas Bézier e interação por ponteiros.
+        const nodeElements = [...canvas.querySelectorAll('[data-diagram-node]')];
+        const nodeLayer = document.createElement('div');
+        nodeLayer.dataset.nodeLayer = 'true';
+        nodeLayer.style.position = 'absolute';
+        nodeLayer.style.inset = '0';
+        nodeLayer.style.width = '1600px';
+        nodeLayer.style.height = '1000px';
+        nodeLayer.style.zIndex = '1';
+        nodeElements.forEach(element => nodeLayer.appendChild(element));
+        canvas.appendChild(nodeLayer);
+        const model = {
+          nodes: nodeElements.map(element => ({
+            id: element.dataset.nodeId || element.id,
+            element
+          })),
+          edges: [
+            {id: 'edge-embeddings-rag', from: 'Embeddings e busca semântica', to: 'RAG com contexto local', label: 'recupera contexto'},
+            {id: 'edge-rag-quantizacao', from: 'RAG com contexto local', to: 'Quantização e inferência', label: 'prepara execução'},
+            {id: 'edge-embeddings-quantizacao', from: 'Embeddings e busca semântica', to: 'Quantização e inferência', label: 'otimiza memória'}
+          ]
+        };
+
+        const svg = document.createElementNS(ns, 'svg');
+        svg.dataset.diagramSvg = 'true';
+        svg.setAttribute('viewBox', '0 0 1600 1000');
+        svg.setAttribute('preserveAspectRatio', 'none');
+        // O SVG precisa ocupar o mesmo mundo 1600x1000 do nodeLayer. Sem
+        // estas dimensões inline, o navegador usa o viewport intrínseco
+        // (980x560) e comprime os paths, criando o offset visível.
+        svg.style.width = '1600px';
+        svg.style.height = '1000px';
+        const defs = document.createElementNS(ns, 'defs');
+        defs.innerHTML = '<marker id="ks-graph-arrow" markerWidth="11" markerHeight="11" refX="9" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,8 L10,4 z"></path></marker>';
+        svg.appendChild(defs);
+        const preview = document.createElementNS(ns, 'path');
+        preview.classList.add('ks-diagram-edge-preview');
+        preview.hidden = true;
+        svg.appendChild(preview);
+        model.edges.forEach(edge => {
+          const path = document.createElementNS(ns, 'path');
+          path.classList.add('ks-diagram-edge');
+          path.dataset.edgePath = edge.id;
+          path.dataset.from = edge.from;
+          path.dataset.to = edge.to;
+          path.setAttribute('marker-end', 'url(#ks-graph-arrow)');
+          svg.appendChild(path);
+        });
+        layer.replaceChildren(svg);
+
+        const scaleOf = () => Math.max(.28, Math.min(1.85, Number(canvas.dataset.diagramZoom || 1)));
+        const setScale = value => {
+          const scale = Math.max(.28, Math.min(1.85, Number(value || 1)));
+          canvas.dataset.diagramZoom = String(scale);
+          svg.style.zoom = String(scale);
+          nodeLayer.style.zoom = String(scale);
+          const indicator = canvas.parentElement?.querySelector('[data-diagram-zoom-value]');
+          if (indicator) indicator.textContent = `${Math.round(scale * 100)}%`;
+        };
+        const clientToWorld = (clientX, clientY) => {
+          const rect = canvas.getBoundingClientRect();
+          const scale = scaleOf();
+          return {
+            x: (clientX - rect.left + canvas.scrollLeft) / scale,
+            y: (clientY - rect.top + canvas.scrollTop) / scale
+          };
+        };
+        const pathD = (source, target) => {
+          const delta = Math.max(70, Math.abs(target.x - source.x) * .45);
+          return `M ${source.x} ${source.y} C ${source.x + delta} ${source.y}, ${target.x - delta} ${target.y}, ${target.x} ${target.y}`;
+        };
+        const nodePoint = (node, side) => {
+          const element = node.element;
+          const scale = scaleOf();
+          // getBoundingClientRect reflete zoom; voltamos ao espaço de mundo
+          // antes de desenhar o path no SVG, exatamente como o canvas original.
+          const rect = element.getBoundingClientRect();
+          const width = rect.width / scale || 260;
+          const height = rect.height / scale || 180;
+          return {
+            x: parseFloat(element.style.left || '0') + (side === 'source' ? width : 0),
+            y: parseFloat(element.style.top || '0') + height / 2
+          };
+        };
+        const updateEdges = () => {
+          model.edges.forEach(edge => {
+            const sourceNode = model.nodes.find(node => node.id === edge.from);
+            const targetNode = model.nodes.find(node => node.id === edge.to);
+            const path = svg.querySelector(`[data-edge-path="${CSS.escape(edge.id)}"]`);
+            if (!sourceNode || !targetNode || !path) return;
+            path.setAttribute('d', pathD(nodePoint(sourceNode, 'source'), nodePoint(targetNode, 'target')));
+          });
+        };
+        const targetAtPoint = (x, y) => document.elementsFromPoint(x, y)
+          .map(element => element.closest?.('[data-diagram-node]'))
+          .find(element => element && canvas.contains(element)) || null;
+        const emitMove = node => {
+          const handler = document.getElementById('knowledge-move-handler');
+          if (!handler) return;
+          handler.value = JSON.stringify({id: node.id, x: Math.round(parseFloat(node.element.style.left || '0')), y: Math.round(parseFloat(node.element.style.top || '0'))});
+          // `change` não aciona o reload global reservado a cliques de
+          // navegação; a posição permanece no DOM enquanto é persistida.
+          handler.dispatchEvent(new Event('change', {bubbles: true}));
+        };
+        const emitRelation = (from, to, label) => {
+          const handler = document.getElementById('knowledge-relate-handler');
+          if (!handler) return;
+          handler.value = JSON.stringify({from, to, label});
+          handler.dispatchEvent(new Event('change', {bubbles: true}));
+        };
+        const addEdge = (from, to, label = 'relação') => {
+          if (!from || !to || from === to || model.edges.some(edge => edge.from === from && edge.to === to)) return;
+          const edge = {id: `edge-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, from, to, label};
+          model.edges.push(edge);
+          const path = document.createElementNS(ns, 'path');
+          path.classList.add('ks-diagram-edge');
+          path.dataset.edgePath = edge.id;
+          path.setAttribute('marker-end', 'url(#ks-graph-arrow)');
+          svg.appendChild(path);
+          updateEdges();
+          emitRelation(from, to, label);
+        };
+
+        canvas.querySelectorAll('[data-diagram-node]').forEach(element => {
+          const node = model.nodes.find(item => item.element === element);
+          if (!node) return;
+          element.addEventListener('pointerdown', event => {
+            if (event.button !== 0 || event.target.closest('input,textarea,button,[data-edge-handle]')) return;
+            event.preventDefault();
+            const start = clientToWorld(event.clientX, event.clientY);
+            const offsetX = start.x - parseFloat(element.style.left || '0');
+            const offsetY = start.y - parseFloat(element.style.top || '0');
+            let dragged = false;
+            element.classList.add('ks-dragging');
+            const move = moveEvent => {
+              const point = clientToWorld(moveEvent.clientX, moveEvent.clientY);
+              const nextX = Math.max(8, point.x - offsetX);
+              const nextY = Math.max(8, point.y - offsetY);
+              dragged = dragged || Math.hypot(nextX - parseFloat(element.style.left || '0'), nextY - parseFloat(element.style.top || '0')) > 2;
+              element.style.left = `${nextX}px`;
+              element.style.top = `${nextY}px`;
+              updateEdges();
+            };
+            const up = () => {
+              element.classList.remove('ks-dragging');
+              window.removeEventListener('pointermove', move);
+              window.removeEventListener('pointerup', up);
+              window.removeEventListener('pointercancel', up);
+              if (dragged) emitMove(node);
+            };
+            window.addEventListener('pointermove', move);
+            window.addEventListener('pointerup', up);
+            window.addEventListener('pointercancel', up);
+          });
+        });
+
+        canvas.querySelectorAll('[data-edge-handle]').forEach(handle => {
+          handle.addEventListener('pointerdown', event => {
+            if (event.button !== 0) return;
+            event.preventDefault();
+            event.stopPropagation();
+            const sourceElement = handle.closest('[data-diagram-node]');
+            const source = model.nodes.find(node => node.element === sourceElement);
+            if (!source) return;
+            let moved = false;
+            const startX = event.clientX;
+            const startY = event.clientY;
+            preview.hidden = false;
+            canvas.classList.add('ks-creating-edge');
+            const move = moveEvent => {
+              moved = moved || Math.hypot(moveEvent.clientX - startX, moveEvent.clientY - startY) > 5;
+              const targetElement = targetAtPoint(moveEvent.clientX, moveEvent.clientY);
+              const target = targetElement ? model.nodes.find(node => node.element === targetElement) : null;
+              const destination = target ? nodePoint(target, 'target') : clientToWorld(moveEvent.clientX, moveEvent.clientY);
+              preview.setAttribute('d', pathD(nodePoint(source, 'source'), destination));
+              canvas.querySelectorAll('[data-diagram-node]').forEach(node => node.classList.toggle('ks-edge-target', node === targetElement && node !== sourceElement));
+            };
+            const cleanup = () => {
+              preview.hidden = true;
+              preview.removeAttribute('d');
+              canvas.classList.remove('ks-creating-edge');
+              canvas.querySelectorAll('.ks-edge-target').forEach(node => node.classList.remove('ks-edge-target'));
+              window.removeEventListener('pointermove', move);
+              window.removeEventListener('pointerup', up);
+              window.removeEventListener('pointercancel', cancel);
+            };
+            const up = upEvent => {
+              const targetElement = targetAtPoint(upEvent.clientX, upEvent.clientY);
+              const target = targetElement ? model.nodes.find(node => node.element === targetElement) : null;
+              cleanup();
+              if (moved && target && target !== source) addEdge(source.id, target.id, 'relaciona');
+            };
+            const cancel = () => cleanup();
+            window.addEventListener('pointermove', move);
+            window.addEventListener('pointerup', up);
+            window.addEventListener('pointercancel', cancel);
+          });
+        });
+
+        let panStart = null;
+        const panMove = event => {
+          if (!panStart) return;
+          canvas.scrollLeft = panStart.scrollLeft - (event.clientX - panStart.x);
+          canvas.scrollTop = panStart.scrollTop - (event.clientY - panStart.y);
+        };
+        const stopPan = () => {
+          panStart = null;
+          canvas.classList.remove('ks-panning');
+          window.removeEventListener('pointermove', panMove);
+          window.removeEventListener('pointerup', stopPan);
+          window.removeEventListener('pointercancel', stopPan);
+        };
+        canvas.addEventListener('pointerdown', event => {
+          if (event.button !== 0 || event.target.closest('[data-diagram-node], .ks-relation-label, input, textarea, button')) return;
+          event.preventDefault();
+          panStart = {x: event.clientX, y: event.clientY, scrollLeft: canvas.scrollLeft, scrollTop: canvas.scrollTop};
+          canvas.classList.add('ks-panning');
+          window.addEventListener('pointermove', panMove);
+          window.addEventListener('pointerup', stopPan);
+          window.addEventListener('pointercancel', stopPan);
+        });
+        canvas.addEventListener('wheel', event => {
+          event.preventDefault();
+          const oldScale = scaleOf();
+          const point = clientToWorld(event.clientX, event.clientY);
+          const nextScale = Math.max(.28, Math.min(1.85, oldScale + (event.deltaY < 0 ? .1 : -.1)));
+          setScale(nextScale);
+          const rect = canvas.getBoundingClientRect();
+          canvas.scrollLeft = point.x * nextScale - (event.clientX - rect.left);
+          canvas.scrollTop = point.y * nextScale - (event.clientY - rect.top);
+          updateEdges();
+        }, {passive: false});
+        canvas.addEventListener('scroll', updateEdges, {passive: true});
+        window.addEventListener('resize', updateEdges);
+        setScale(scaleOf());
+        updateEdges();
+      });
+    }
+
     function applyProperty(update) {
       if (!update || !update.path || !update.property) return;
       const element = findIdentity(update.path);
@@ -208,6 +898,10 @@ proc plasticNetworkWebBridgeScript(): string =
 
     function applyPayload(payload) {
       if (!payload || typeof payload !== 'object') return;
+      if (payload.reload === true) {
+        window.setTimeout(() => window.location.reload(), 0);
+        return;
+      }
       if (Array.isArray(payload.properties)) {
         payload.properties.forEach(applyProperty);
       }
@@ -244,6 +938,17 @@ proc plasticNetworkWebBridgeScript(): string =
       if (polling) return;
       polling = true;
       try {
+        const healthResponse = await fetch('/__glaucoplastic/health', {cache: 'no-store'});
+        if (healthResponse.ok) {
+          const health = await healthResponse.json();
+          const token = health && health.reloadToken;
+          if (token && window.__glaucoplasticReloadToken && token !== window.__glaucoplasticReloadToken) {
+            window.__glaucoplasticReloadToken = token;
+            window.location.reload();
+            return;
+          }
+          if (token) window.__glaucoplasticReloadToken = token;
+        }
         const response = await fetch('/__glaucoplastic/poll', {cache: 'no-store'});
         if (response.ok) applyPayload(await response.json());
       } catch (error) {
@@ -253,6 +958,7 @@ proc plasticNetworkWebBridgeScript(): string =
       }
     }
 
+    bindKnowledgeGraphCanvas();
     window.setInterval(postEvents, 50);
     window.setInterval(poll, 200);
     postEvents();
@@ -280,6 +986,7 @@ proc runPlasticNetworkWebServer*(
     raise newException(ValueError, "O servidor --nw recebeu callbacks incompletos.")
 
   let server = newAsyncHttpServer()
+  let reloadToken = $epochTime().int64 & "-" & $getCurrentProcessId()
 
   proc callback(request: Request) {.async, gcsafe.} =
     var status = Http200
@@ -293,7 +1000,7 @@ proc runPlasticNetworkWebServer*(
         {.cast(gcsafe).}:
           body = plasticNetworkWebDocument(renderHtml())
       of "/__glaucoplastic/health":
-        body = "{\"ok\":true}"
+        body = $(%*{"ok": true, "reloadToken": reloadToken})
       of "/__glaucoplastic/poll":
         {.cast(gcsafe).}:
           body = $pollState()
@@ -304,11 +1011,17 @@ proc runPlasticNetworkWebServer*(
         else:
           let parsed = parseJson(request.body)
           let events = if parsed.kind == JArray: parsed else: %*[parsed]
+          var needsReload = false
           {.cast(gcsafe).}:
             for event in events.items:
               if event.kind == JObject:
+                if event.hasKey("event") and event["event"].kind == JString and event["event"].getStr == "click":
+                  needsReload = true
                 dispatchEvent(event)
-            body = $pollState()
+            let payload = pollState()
+            if needsReload and payload.kind == JObject:
+              payload["reload"] = %true
+            body = $payload
       else:
         status = Http404
         body = "{\"ok\":false,\"error\":\"not found\"}"
@@ -505,6 +1218,7 @@ type
     assets*: seq[JsonNode]
     desktopShortcut*: bool
     startMenuShortcut*: bool
+    installerDownloadPage*: JsonNode
 
   PlasticInstallationRuntime* = ref object
     config*: PlasticInstallationConfig
@@ -953,6 +1667,7 @@ type
     safeStorageValue*: PlasticSafeStorageRuntime
     foreignValue*: PlasticForeignRuntime
     llamaValue*: PlasticLlamaRuntime
+    rlmValue*: PlasticRlmRuntime
     agentsValue*: Table[string, PlasticAgent]
     componentsValue*: JsonNode
     renderTreeValue*: JsonNode
@@ -981,7 +1696,6 @@ type
     rlmConditions*: string
     toolPlans*: JsonNode
     application*: PlasticApplication
-    rlmValue*: PlasticRlmRuntime
     sessionVariables*: Table[string, JsonNode]
     hookDispatching*: bool
     asyncExecution*: bool
@@ -993,13 +1707,13 @@ type
     maxIterations*: int
     maxRecursionDepth*: int
 
-  PlasticRlmToolProc* = proc(
+  PlasticCapability* = proc(
     agent: PlasticAgent;
     arguments: JsonNode
   ): JsonNode {.closure.}
 
   PlasticRlmRuntime* = ref object
-    tools*: Table[string, PlasticRlmToolProc]
+    capabilities*: Table[string, PlasticCapability]
 
 
 const PlasticAssistantHandlerId* = "glaucoplastic-assistant"
@@ -1863,6 +2577,16 @@ proc runPlasticAssistantChatWorker(
         " error=" &
         error.msg
       )
+
+      try:
+        stderr.writeLine(
+          "[GlaucoPlastic] assistant inference failed: " &
+          error.msg
+        )
+        stderr.flushFile()
+      except CatchableError:
+        discard
+
       acquire(runtime.dataLock)
       runtime.status = "error"
       runtime.lastError = error.msg
@@ -2520,7 +3244,7 @@ proc plasticAssistantBodyHtml*(runtime: PlasticAssistantRuntime): string =
 
 proc plasticAssistantScript*(runtime: PlasticAssistantRuntime = nil): string =
   let initialVoiceBackend =
-    if runtime.isNil: ""
+    if runtime.isNil: "system-microphone"
     else: runtime.config.voiceRecognition
   result = "<script>window.__glaucoplasticAssistantVoiceBackend = " &
     $(%initialVoiceBackend) & ";</script>" & r"""
@@ -2566,6 +3290,28 @@ proc plasticAssistantScript*(runtime: PlasticAssistantRuntime = nil): string =
             } catch (error) {
               console.error(
                 '[GlaucoPlastic] assistant bridge failed',
+                error
+              );
+            }
+          }
+
+          // Fallback nativo do WebView2. O shim window.webkit é instalado
+          // por AddScriptToExecuteOnDocumentCreated, mas a UI principal não
+          // deve depender do timing dessa instalação.
+          if (
+            window.chrome &&
+            window.chrome.webview &&
+            typeof window.chrome.webview.postMessage === 'function'
+          ) {
+            try {
+              window.chrome.webview.postMessage({
+                type: 'glaucoplasticEvent',
+                payload: JSON.stringify(payload)
+              });
+              return true;
+            } catch (error) {
+              console.error(
+                '[GlaucoPlastic] assistant chrome bridge failed',
                 error
               );
             }
@@ -3014,74 +3760,6 @@ proc plasticAssistantScript*(runtime: PlasticAssistantRuntime = nil): string =
           }
         }
 
-        function queueInfo(snapshot) {
-        const queue = snapshot && snapshot.chatQueue || {};
-        const queued = Number(queue.queued || 0);
-        const active = !!queue.active;
-        const totalPending = Number(
-          queue.totalPending ||
-          queued + (active ? 1 : 0)
-        );
-        return {queued, active, totalPending};
-      }
-      function runtimeIsProcessing(snapshot) {
-        const status = valueText(
-          snapshot && snapshot.status
-        ).toLowerCase();
-        const queue = queueInfo(snapshot);
-        return (
-          status === "thinking" ||
-          status === "processing" ||
-          status === "running" ||
-          queue.totalPending > 0
-        );
-      }
-      function updateInteraction(snapshot) {
-        const composer = byId("composer");
-        const sendButton = byId("send");
-        const microphone = byId("microphone");
-        const queueState = byId("queue-state");
-        const queue = queueInfo(snapshot);
-        const processing =
-          runtimeIsProcessing(snapshot);
-
-        if (processing || (snapshot && snapshot.lastError)) {
-          state.awaitingDispatch = false;
-        }
-
-        document.body.classList.toggle(
-          "processing",
-          processing
-        );
-
-        composer.disabled = state.awaitingDispatch;
-        sendButton.disabled = state.awaitingDispatch;
-        microphone.disabled = state.awaitingDispatch;
-
-        sendButton.textContent =
-          processing ? "Enfileirar" : "Executar";
-
-        composer.placeholder =
-          state.awaitingDispatch
-            ? "Enviando mensagem..."
-            : processing
-              ? "Digite outra mensagem para acrescentar à fila..."
-              : "Descreva o que deseja realizar...";
-
-        if (state.awaitingDispatch) {
-          queueState.textContent =
-            "Enviando para o processamento...";
-        } else if (queue.totalPending === 1) {
-          queueState.textContent =
-            "1 mensagem em processamento";
-        } else if (queue.totalPending > 1) {
-          queueState.textContent =
-            queue.totalPending +
-            " mensagens em processamento ou na fila";
-        } else {
-          queueState.textContent = "";
-        }
-      }
         function mainAssistantQueueInfo(snapshot) {
           const queue = snapshot && snapshot.chatQueue || {};
           const queued = Number(queue.queued || 0);
@@ -3548,7 +4226,8 @@ function installVoiceInput() {
             state.snapshot &&
               state.snapshot.config &&
               state.snapshot.config.voiceRecognition ||
-            window.__glaucoplasticAssistantVoiceBackend
+            window.__glaucoplasticAssistantVoiceBackend ||
+            'system-microphone'
           ).toLowerCase();
 
           const nativeSystemBackend =
@@ -3603,6 +4282,49 @@ function installVoiceInput() {
           window.__glaucoplasticChatOpen = open;
           shell.dataset.chatOpen =
             open ? 'true' : 'false';
+          if (panel) {
+            panel.hidden = !open;
+            panel.setAttribute(
+              'aria-hidden',
+              open ? 'false' : 'true'
+            );
+            panel.style.setProperty(
+              'display',
+              open ? 'flex' : 'none',
+              'important'
+            );
+            panel.style.setProperty(
+              'visibility',
+              open ? 'visible' : 'hidden',
+              'important'
+            );
+            panel.style.setProperty(
+              'opacity',
+              open ? '1' : '0',
+              'important'
+            );
+            panel.style.setProperty(
+              'pointer-events',
+              open ? 'auto' : 'none',
+              'important'
+            );
+          }
+
+          if (panel && composerShell) {
+            const composerTarget = open ? panel : shell;
+            const composerAnchor =
+              shell.querySelector('.rpa-runtime-controls');
+
+            if (composerShell.parentElement !== composerTarget) {
+              composerTarget.appendChild(composerShell);
+            }
+
+            if (!open && composerAnchor &&
+                composerShell.parentElement === shell &&
+                composerShell.nextSibling !== composerAnchor) {
+              shell.insertBefore(composerShell, composerAnchor);
+            }
+          }
 
           const stateBridge =
             window.webkit &&
@@ -3663,6 +4385,110 @@ function installVoiceInput() {
           return open;
         }
 
+        function syncShellPageUi(source = 'sync') {
+          const shell =
+            document.querySelector('.rpa-shell');
+          const pages = [
+            ['rpa-page-workspace-toggle', 'rpa-page-workspace', 'block'],
+            ['rpa-page-tasks-toggle', 'rpa-page-tasks', 'flex'],
+            ['rpa-page-automations-toggle', 'rpa-page-automations', 'flex'],
+            ['rpa-page-history-toggle', 'rpa-page-history', 'flex'],
+            ['rpa-page-memory-toggle', 'rpa-page-memory', 'flex'],
+            ['rpa-page-settings-toggle', 'rpa-page-settings', 'flex']
+          ];
+          const toggles = pages
+            .map(([toggleId]) => byId(toggleId))
+            .filter(Boolean);
+
+          if (!shell || toggles.length === 0) {
+            uiDebug('page.missing', {
+              source,
+              shell: !!shell,
+              toggles: toggles.length
+            });
+            return false;
+          }
+
+          const checkedPage =
+            toggles.find(toggle => !!toggle.checked)?.id || '';
+          const knownActive = pages.some(
+            ([toggleId]) => toggleId === shell.dataset.activePage
+          )
+            ? shell.dataset.activePage
+            : '';
+          const current =
+            checkedPage ||
+            knownActive ||
+            'rpa-page-workspace-toggle';
+
+          for (const [toggleId, pageId, displayMode] of pages) {
+            const toggle = byId(toggleId);
+            const page = byId(pageId);
+            const active = toggleId === current;
+
+            if (toggle) {
+              toggle.checked = active;
+              toggle.setAttribute(
+                'aria-checked',
+                active ? 'true' : 'false'
+              );
+            }
+
+            if (page) {
+              page.hidden = !active;
+              page.setAttribute(
+                'aria-hidden',
+                active ? 'false' : 'true'
+              );
+              page.style.setProperty(
+                'display',
+                active ? displayMode : 'none',
+                'important'
+              );
+              page.style.setProperty(
+                'visibility',
+                active ? 'visible' : 'hidden',
+                'important'
+              );
+              page.style.setProperty(
+                'opacity',
+                active ? '1' : '0',
+                'important'
+              );
+              page.style.setProperty(
+                'pointer-events',
+                active ? 'auto' : 'none',
+                'important'
+              );
+            }
+          }
+
+          shell.dataset.activePage = current;
+
+          if (window.__glaucoplasticScheduleForeignLayouts) {
+            window.__glaucoplasticScheduleForeignLayouts();
+            window.setTimeout(
+              window.__glaucoplasticScheduleForeignLayouts,
+              0
+            );
+          }
+
+          requestAnimationFrame(() => {
+            uiDebug('page.state', {
+              source,
+              activePage: shell.dataset.activePage || '',
+              workspace: !!byId('rpa-page-workspace'),
+              tasks: !!byId('rpa-page-tasks'),
+              automations: !!byId('rpa-page-automations'),
+              history: !!byId('rpa-page-history'),
+              memory: !!byId('rpa-page-memory'),
+              settings: !!byId('rpa-page-settings')
+            });
+          });
+
+          return true;
+        }
+
         const chatToggle =
           byId('rpa-chat-toggle');
         const chatToggleLabel =
@@ -3671,7 +4497,15 @@ function installVoiceInput() {
           );
 
         if (chatToggle) {
-          if (window.__glaucoplasticChatOpen) {
+          const shell =
+            document.querySelector('.rpa-shell');
+          if (
+            window.__glaucoplasticChatOpen ||
+            (
+              shell &&
+              shell.dataset.chatOpen === 'true'
+            )
+          ) {
             chatToggle.checked = true;
           }
 
@@ -3681,13 +4515,63 @@ function installVoiceInput() {
           );
         }
 
-        if (
-          chatToggle &&
-          chatToggleLabel &&
-          typeof window.__glaucoplasticCoreChatSync !==
-            'function'
-        ) {
-          chatToggleLabel.addEventListener(
+        for (const pageToggle of [
+          byId('rpa-page-workspace-toggle'),
+          byId('rpa-page-tasks-toggle'),
+          byId('rpa-page-automations-toggle'),
+          byId('rpa-page-history-toggle'),
+          byId('rpa-page-memory-toggle'),
+          byId('rpa-page-settings-toggle')
+        ]) {
+          if (!pageToggle) continue;
+          pageToggle.addEventListener(
+            'change',
+            () => syncShellPageUi('change')
+          );
+        }
+
+        document.addEventListener(
+          'click',
+          event => {
+            const navItem =
+              event.target.closest('.rpa-nav-item');
+            if (!navItem) return;
+
+            const pageToggleId =
+              navItem.classList.contains('rpa-nav-workspace')
+                ? 'rpa-page-workspace-toggle'
+                : navItem.classList.contains('rpa-nav-tasks')
+                  ? 'rpa-page-tasks-toggle'
+                  : navItem.classList.contains('rpa-nav-automations')
+                    ? 'rpa-page-automations-toggle'
+                    : navItem.classList.contains('rpa-nav-history')
+                      ? 'rpa-page-history-toggle'
+                      : navItem.classList.contains('rpa-nav-memory')
+                        ? 'rpa-page-memory-toggle'
+                        : navItem.classList.contains('rpa-nav-settings')
+                          ? 'rpa-page-settings-toggle'
+                          : '';
+
+            if (pageToggleId.length === 0) return;
+
+            const pageToggle = byId(pageToggleId);
+            const shell =
+              document.querySelector('.rpa-shell');
+
+            if (!pageToggle || !shell) return;
+
+            pageToggle.checked = true;
+            shell.dataset.activePage = pageToggleId;
+            syncShellPageUi('nav-click');
+          },
+          true
+        );
+
+        const chatToggleButton =
+          document.querySelector('.rpa-chat-toggle-button');
+
+        if (chatToggle && chatToggleButton) {
+          chatToggleButton.addEventListener(
             'click',
             event => {
               event.preventDefault();
@@ -3695,6 +4579,8 @@ function installVoiceInput() {
 
               chatToggle.checked =
                 !chatToggle.checked;
+
+              syncChatPanelUi('chat-click');
 
               chatToggle.dispatchEvent(
                 new Event(
@@ -3705,6 +4591,9 @@ function installVoiceInput() {
 
               uiDebug('chat.click', {
                 checked: !!chatToggle.checked,
+                dataChatOpen:
+                  document.querySelector('.rpa-shell')
+                    ?.dataset.chatOpen || '',
                 shellGeneration:
                   Number(
                     window.__glaucoplasticShellGeneration || 0
@@ -3720,10 +4609,141 @@ function installVoiceInput() {
         requestAnimationFrame(
           () => syncChatPanelUi('install')
         );
+        requestAnimationFrame(
+          () => syncShellPageUi('install')
+        );
 
 window.__glaucoplasticAssistantApply = applySnapshot;
         byId('assistant-new-session')?.addEventListener('click', () => emit('assistant:new-session'));
-        byId('assistant-send')?.addEventListener('click', sendComposer);
+        // Delegação mantém o envio funcional mesmo quando o renderer
+        // materializa identidades como custom-element hosts.
+        document.addEventListener('click', event => {
+          const target =
+            event.target && event.target.closest
+              ? event.target.closest('#assistant-send')
+              : null;
+          if (target) {
+            event.preventDefault();
+            sendComposer();
+            return;
+          }
+
+          const metisTarget =
+            event.target && event.target.closest
+              ? event.target.closest('#metis-home, #metis-memory, #metis-model')
+              : null;
+          if (metisTarget) {
+            event.preventDefault();
+            const viewName = {
+              'metis-home': 'home',
+              'metis-memory': 'memory',
+              'metis-model': 'model'
+            }[metisTarget.id];
+            document.querySelectorAll('.metis-view').forEach(view => {
+              view.classList.toggle('metis-view-active', view.id === 'metis-view-' + viewName);
+            });
+            document.querySelectorAll('.metis-nav button').forEach(button => {
+              button.dataset.active = button.id === metisTarget.id ? 'true' : 'false';
+            });
+            return;
+          }
+
+          const relationMode = event.target && event.target.closest
+            ? event.target.closest('#metis-relation-mode')
+            : null;
+          if (relationMode) {
+            event.preventDefault();
+            window.__metisRelationMode = !window.__metisRelationMode;
+            relationMode.dataset.active = window.__metisRelationMode ? 'true' : 'false';
+            relationMode.textContent = window.__metisRelationMode
+              ? 'Selecione dois cards'
+              : 'Criar relação';
+            window.__metisSelectedCards = [];
+            document.querySelectorAll('.metis-memory-node').forEach(card => {
+              card.dataset.selected = 'false';
+            });
+            return;
+          }
+
+          const newCard = event.target && event.target.closest
+            ? event.target.closest('#metis-new-card')
+            : null;
+          if (newCard) {
+            event.preventDefault();
+            const title = window.prompt('Nome do novo card de memória:', 'Novo conhecimento');
+            if (!title || !title.trim()) return;
+            const canvas = document.getElementById('metis-memory-canvas');
+            if (!canvas) return;
+            const card = document.createElement('article');
+            card.className = 'metis-memory-node';
+            card.dataset.memoryCard = 'card-' + Date.now();
+            card.innerHTML = '<strong></strong><small>Card criado nesta sessão. Dê duplo clique para editar.</small>';
+            card.querySelector('strong').textContent = title.trim();
+            canvas.appendChild(card);
+            return;
+          }
+
+          const processAdd = event.target && event.target.closest
+            ? event.target.closest('#metis-process-add')
+            : null;
+          if (processAdd) {
+            event.preventDefault();
+            const label = window.prompt('Nome da etapa do processo:', 'Nova etapa');
+            if (!label || !label.trim()) return;
+            const list = document.querySelector('#metis-process-canvas .metis-flow-list');
+            if (!list) return;
+            const node = document.createElement('div');
+            const index = list.children.length % 3;
+            node.className = 'metis-flow-node ' + (index === 1 ? 'metis-flow-step' : index === 2 ? 'metis-flow-decision' : 'metis-flow-step');
+            const text = document.createElement('span');
+            text.textContent = label.trim();
+            node.appendChild(text);
+            list.appendChild(node);
+            return;
+          }
+
+          const memoryCard = event.target && event.target.closest
+            ? event.target.closest('.metis-memory-node')
+            : null;
+          if (memoryCard && window.__metisRelationMode) {
+            event.preventDefault();
+            const selected = window.__metisSelectedCards || (window.__metisSelectedCards = []);
+            const id = memoryCard.dataset.memoryCard || memoryCard.id || 'card';
+            if (!selected.includes(id)) {
+              selected.push(id);
+              memoryCard.dataset.selected = 'true';
+            }
+            if (selected.length === 2) {
+              const relations = document.getElementById('metis-relations');
+              if (relations) {
+                const relation = document.createElement('span');
+                relation.className = 'metis-relation';
+                relation.textContent = selected[0] + '  →  ' + selected[1];
+                relations.appendChild(relation);
+              }
+
+              selected.length = 0;
+              window.__metisRelationMode = false;
+              const button = document.getElementById('metis-relation-mode');
+              if (button) {
+                button.dataset.active = 'false';
+                button.textContent = 'Criar relação';
+              }
+            }
+          }
+        }, true);
+
+        document.addEventListener('dblclick', event => {
+          const card = event.target && event.target.closest
+            ? event.target.closest('.metis-memory-node')
+            : null;
+          if (!card) return;
+          const title = card.querySelector('strong');
+          if (!title) return;
+          const next = window.prompt('Editar card de memória:', title.textContent);
+          if (next && next.trim()) title.textContent = next.trim();
+        }, true);
+
         byId('assistant-composer')?.addEventListener('keydown', event => {
           if (event.key === 'Enter' && !event.shiftKey) {
             event.preventDefault();
@@ -3741,6 +4761,23 @@ window.__glaucoplasticAssistantApply = applySnapshot;
         });
         byId('assistant-repeat-voice')?.addEventListener('click', () => speak(state.lastAssistantText, true));
         byId('assistant-stop-voice')?.addEventListener('click', stopSpeaking);
+
+        // No backend Windows não há o timer GLib usado pelo WebKitGTK.
+        // O shell pede somente uma verificação de revision; o Nim publica
+        // snapshot apenas quando o runtime realmente mudou.
+        if (
+          window.chrome &&
+          window.chrome.webview &&
+          typeof window.chrome.webview.postMessage === 'function' &&
+          !window.__glaucoplasticAssistantWindowsPollTimer
+        ) {
+          window.__glaucoplasticAssistantWindowsPollTimer =
+            window.setInterval(
+              () => emit('assistant:poll'),
+              750
+            );
+        }
+
         installVoiceInput();
         if (window.speechSynthesis) speechSynthesis.getVoices();
       })();
@@ -3763,7 +4800,7 @@ proc plasticOfficeRuntimeBridge*(): string =
     return expandTilde(configured)
   getCurrentDir() / "tools" / "glaucoplastic_office.py"
 
-proc plasticOfficeInvoke*(operation: string; arguments: JsonNode): JsonNode =
+proc plasticOfficeInvoke*(capability: string; arguments: JsonNode): JsonNode =
   let python = plasticOfficeRuntimePython()
   let bridge = plasticOfficeRuntimeBridge()
   if not fileExists(bridge):
@@ -3780,7 +4817,7 @@ proc plasticOfficeInvoke*(operation: string; arguments: JsonNode): JsonNode =
   defer:
     if fileExists(inputPath):
       removeFile(inputPath)
-  let command = @[python, bridge, operation, inputPath]
+  let command = @[python, bridge, capability, inputPath]
     .mapIt(quoteShell(it))
     .join(" ")
   let execution = execCmdEx(
@@ -3791,14 +4828,14 @@ proc plasticOfficeInvoke*(operation: string; arguments: JsonNode): JsonNode =
   if payload.len == 0:
     raise newException(
       PlasticAgentError,
-      "Office tool returned empty output: " & operation
+      "Office tool returned empty output: " & capability
     )
   try:
     result = parseJson(payload)
   except CatchableError as error:
     raise newException(
       PlasticAgentError,
-      "Invalid Office tool JSON for " & operation & ": " &
+      "Invalid Office tool JSON for " & capability & ": " &
         error.msg & "\\n" & payload
     )
   if execution.exitCode != 0 or
@@ -3806,7 +4843,7 @@ proc plasticOfficeInvoke*(operation: string; arguments: JsonNode): JsonNode =
        result["ok"].kind == JBool and not result["ok"].getBool):
     raise newException(
       PlasticAgentError,
-      "Office tool failed: " & operation & "\\n" & payload
+      "Office tool failed: " & capability & "\\n" & payload
     )
 
 
@@ -3825,7 +4862,7 @@ proc plasticRpaRuntimeBridge*(): string =
     return expandTilde(configured)
   getCurrentDir() / "tools" / "glaucoplastic_rpa.py"
 
-proc plasticRpaInvoke*(operation: string; arguments: JsonNode): JsonNode =
+proc plasticRpaInvoke*(capability: string; arguments: JsonNode): JsonNode =
   let python = plasticRpaRuntimePython()
   let bridge = plasticRpaRuntimeBridge()
   if not fileExists(bridge):
@@ -3844,7 +4881,7 @@ proc plasticRpaInvoke*(operation: string; arguments: JsonNode): JsonNode =
     if fileExists(inputPath):
       removeFile(inputPath)
 
-  let command = @[python, bridge, operation, inputPath]
+  let command = @[python, bridge, capability, inputPath]
     .mapIt(quoteShell(it))
     .join(" ")
   let execution = execCmdEx(
@@ -3855,14 +4892,14 @@ proc plasticRpaInvoke*(operation: string; arguments: JsonNode): JsonNode =
   if payload.len == 0:
     raise newException(
       PlasticAgentError,
-      "RPA tool returned empty output: " & operation
+      "RPA tool returned empty output: " & capability
     )
   try:
     result = parseJson(payload)
   except CatchableError as error:
     raise newException(
       PlasticAgentError,
-      "Invalid RPA tool JSON for " & operation & ": " &
+      "Invalid RPA tool JSON for " & capability & ": " &
         error.msg & "\\n" & payload
     )
   if execution.exitCode != 0 or
@@ -3870,8 +4907,226 @@ proc plasticRpaInvoke*(operation: string; arguments: JsonNode): JsonNode =
        result["ok"].kind == JBool and not result["ok"].getBool):
     raise newException(
       PlasticAgentError,
-      "RPA tool failed: " & operation & "\\n" & payload
+      "RPA tool failed: " & capability & "\\n" & payload
     )
+
+proc plasticRpaScreenObserve*(arguments: JsonNode): JsonNode =
+  ## Captura a tela no mesmo processo do runtime usando NimPy.
+  if plasticPyGILEnsureProc.isNil:
+    raise newException(PlasticAgentError, "NimPy ainda não foi inicializado.")
+  let root = expandTilde(getEnv(
+    "GLAUCOPLASTIC_RPA_SCREENSHOT_ROOT",
+    getCurrentDir() / "rpa-memory" / "screenshots"
+  ))
+  createDir(root)
+  let path = root / ("screen-" & $(epochTime() * 1000.0).int64 & "-" &
+    $getCurrentProcessId() & ".png")
+  var region: seq[int] = @[]
+  if arguments.hasKey("region") and arguments["region"].kind == JArray:
+    for item in arguments["region"].items:
+      region.add item.getInt
+  elif arguments.hasKey("region") and arguments["region"].kind == JObject:
+    for key in ["x", "y", "width", "height"]:
+      region.add arguments["region"].getOrDefault(key).getInt
+  if region.len != 0 and region.len != 4:
+    raise newException(PlasticAgentError, "region deve conter x, y, width e height.")
+  if region.len == 4 and (region[2] <= 0 or region[3] <= 0):
+    raise newException(PlasticAgentError, "width e height da region devem ser positivos.")
+  let gil = plasticAcquirePythonGIL()
+  try:
+    let pyautogui = pyImport("pyautogui")
+    var image = nimpy.callMethod(pyautogui, "screenshot")
+    if region.len == 4:
+      image = nimpy.callMethod(
+        image,
+        "crop",
+        region[0], region[1], region[0] + region[2], region[1] + region[3]
+      )
+    discard nimpy.callMethod(image, "save", path)
+    let size = nimpy.getAttr(image, "size")
+    result = %*{
+      "ok": true,
+      "path": path,
+      "format": "png",
+      "width": size[0].to(int),
+      "height": size[1].to(int),
+      "capturedAt": $epochTime()
+    }
+  finally:
+    plasticReleasePythonGIL(gil)
+
+proc plasticRpaScreenPixel*(arguments: JsonNode): JsonNode =
+  if plasticPyGILEnsureProc.isNil:
+    raise newException(PlasticAgentError, "NimPy ainda não foi inicializado.")
+  let x = arguments["x"].getInt
+  let y = arguments["y"].getInt
+  let gil = plasticAcquirePythonGIL()
+  try:
+    let pyautogui = pyImport("pyautogui")
+    let color = nimpy.callMethod(pyautogui, "pixel", x, y)
+    result = %*{"ok": true, "x": x, "y": y,
+      "rgb": [color[0].to(int), color[1].to(int), color[2].to(int)]}
+  finally:
+    plasticReleasePythonGIL(gil)
+
+proc plasticRpaScreenLocate*(arguments: JsonNode): JsonNode =
+  if plasticPyGILEnsureProc.isNil:
+    raise newException(PlasticAgentError, "NimPy ainda não foi inicializado.")
+  let reference =
+    if arguments.hasKey("image"): arguments["image"].getStr
+    else: arguments["path"].getStr
+  if reference.len == 0:
+    raise newException(PlasticAgentError, "LocateImage exige image ou path.")
+  let gil = plasticAcquirePythonGIL()
+  try:
+    let pyautogui = pyImport("pyautogui")
+    let box = nimpy.callMethod(pyautogui, "locateOnScreen", reference)
+    if $box == "None":
+      return %*{"ok": true, "found": false, "image": reference}
+    let center = nimpy.callMethod(pyautogui, "center", box)
+    result = %*{"ok": true, "found": true, "image": reference,
+      "box": [box[0].to(int), box[1].to(int), box[2].to(int), box[3].to(int)],
+      "center": {"x": center[0].to(int), "y": center[1].to(int)}}
+  finally:
+    plasticReleasePythonGIL(gil)
+
+proc plasticRpaPointerMove*(arguments: JsonNode): JsonNode =
+  let x = arguments["x"].getInt
+  let y = arguments["y"].getInt
+  let gil = plasticAcquirePythonGIL()
+  try:
+    let pyautogui = pyImport("pyautogui")
+    discard nimpy.callMethod(pyautogui, "moveTo", x, y,
+      if arguments.hasKey("duration"): arguments["duration"].getFloat else: 0.0)
+    result = %*{"ok": true, "x": x, "y": y}
+  finally:
+    plasticReleasePythonGIL(gil)
+
+proc plasticRpaPointerClick*(arguments: JsonNode): JsonNode =
+  let x = arguments["x"].getInt
+  let y = arguments["y"].getInt
+  let clicks = if arguments.hasKey("clicks"): arguments["clicks"].getInt else: 1
+  let button = if arguments.hasKey("button"): arguments["button"].getStr else: "left"
+  let gil = plasticAcquirePythonGIL()
+  try:
+    let pyautogui = pyImport("pyautogui")
+    discard nimpy.callMethod(pyautogui, "click", x, y, clicks, 0.0, button)
+    result = %*{"ok": true, "x": x, "y": y, "clicks": clicks, "button": button}
+  finally:
+    plasticReleasePythonGIL(gil)
+
+proc plasticRpaPointerDrag*(arguments: JsonNode): JsonNode =
+  let fromX = arguments["fromX"].getInt
+  let fromY = arguments["fromY"].getInt
+  let toX = arguments["toX"].getInt
+  let toY = arguments["toY"].getInt
+  let duration = if arguments.hasKey("duration"): arguments["duration"].getFloat else: 0.2
+  let button = if arguments.hasKey("button"): arguments["button"].getStr else: "left"
+  let gil = plasticAcquirePythonGIL()
+  try:
+    let pyautogui = pyImport("pyautogui")
+    discard nimpy.callMethod(pyautogui, "moveTo", fromX, fromY)
+    discard nimpy.callMethod(pyautogui, "dragTo", toX, toY, duration, button)
+    result = %*{"ok": true, "from": [fromX, fromY], "to": [toX, toY]}
+  finally:
+    plasticReleasePythonGIL(gil)
+
+proc plasticRpaKeyboardWrite*(arguments: JsonNode): JsonNode =
+  let value = arguments["text"].getStr
+  let interval = if arguments.hasKey("interval"): arguments["interval"].getFloat else: 0.01
+  let gil = plasticAcquirePythonGIL()
+  try:
+    let pyautogui = pyImport("pyautogui")
+    discard nimpy.callMethod(pyautogui, "write", value, interval)
+    result = %*{"ok": true, "length": value.len}
+  finally:
+    plasticReleasePythonGIL(gil)
+
+proc plasticRpaKeyboardPress*(arguments: JsonNode): JsonNode =
+  let key = arguments["key"].getStr
+  let presses = if arguments.hasKey("presses"): arguments["presses"].getInt else: 1
+  let gil = plasticAcquirePythonGIL()
+  try:
+    let pyautogui = pyImport("pyautogui")
+    discard nimpy.callMethod(pyautogui, "press", key, presses)
+    result = %*{"ok": true, "key": key, "presses": presses}
+  finally:
+    plasticReleasePythonGIL(gil)
+
+proc plasticRpaKeyboardHotkey*(arguments: JsonNode): JsonNode =
+  if not arguments.hasKey("keys") or arguments["keys"].kind != JArray or
+      arguments["keys"].len == 0:
+    raise newException(PlasticAgentError, "Hotkey exige um array keys não vazio.")
+  let gil = plasticAcquirePythonGIL()
+  try:
+    let pyautogui = pyImport("pyautogui")
+    for key in arguments["keys"].items:
+      discard nimpy.callMethod(pyautogui, "keyDown", key.getStr)
+    for index in countdown(arguments["keys"].len - 1, 0):
+      discard nimpy.callMethod(pyautogui, "keyUp", arguments["keys"][index].getStr)
+    result = %*{"ok": true, "keys": arguments["keys"]}
+  finally:
+    plasticReleasePythonGIL(gil)
+
+proc plasticRpaScroll*(arguments: JsonNode): JsonNode =
+  let clicks = if arguments.hasKey("clicks"): arguments["clicks"].getInt else: 0
+  let gil = plasticAcquirePythonGIL()
+  try:
+    let pyautogui = pyImport("pyautogui")
+    if arguments.hasKey("x") and arguments.hasKey("y"):
+      discard nimpy.callMethod(pyautogui, "scroll", clicks,
+        arguments["x"].getInt, arguments["y"].getInt)
+    else:
+      discard nimpy.callMethod(pyautogui, "scroll", clicks)
+    result = %*{"ok": true, "clicks": clicks}
+  finally:
+    plasticReleasePythonGIL(gil)
+
+proc plasticRpaTrajectoryExecute*(arguments: JsonNode): JsonNode =
+  if not arguments.hasKey("actions") or arguments["actions"].kind != JArray:
+    raise newException(PlasticAgentError, "ExecuteVisualTrajectory exige actions.")
+  let gil = plasticAcquirePythonGIL()
+  var executed = 0
+  try:
+    let pyautogui = pyImport("pyautogui")
+    for action in arguments["actions"].items:
+      let kind =
+        if action.hasKey("kind"): action["kind"].getStr.toLowerAscii
+        elif action.hasKey("type"): action["type"].getStr.toLowerAscii
+        else: ""
+      case kind
+      of "move", "moveto":
+        discard nimpy.callMethod(pyautogui, "moveTo", action["x"].getInt, action["y"].getInt)
+      of "click":
+        discard nimpy.callMethod(pyautogui, "click", action["x"].getInt, action["y"].getInt)
+      of "drag", "dragto":
+        discard nimpy.callMethod(pyautogui, "moveTo", action["fromX"].getInt, action["fromY"].getInt)
+        discard nimpy.callMethod(pyautogui, "dragTo", action["toX"].getInt, action["toY"].getInt,
+          if action.hasKey("duration"): action["duration"].getFloat else: 0.2)
+      of "write":
+        discard nimpy.callMethod(pyautogui, "write", action["text"].getStr)
+      of "press":
+        discard nimpy.callMethod(pyautogui, "press", action["key"].getStr)
+      of "hotkey":
+        for key in action["keys"].items:
+          discard nimpy.callMethod(pyautogui, "keyDown", key.getStr)
+        for index in countdown(action["keys"].len - 1, 0):
+          discard nimpy.callMethod(pyautogui, "keyUp", action["keys"][index].getStr)
+      of "scroll":
+        discard nimpy.callMethod(pyautogui, "scroll", action["clicks"].getInt)
+      of "wait":
+        sleep(max(0, min(120_000, int(action["seconds"].getFloat * 1000.0))))
+      else:
+        raise newException(PlasticAgentError, "Ação visual não suportada: " & kind)
+      inc executed
+    result = %*{"ok": true, "executed": executed}
+  finally:
+    plasticReleasePythonGIL(gil)
+
+proc plasticRpaWait*(arguments: JsonNode): JsonNode =
+  let seconds = if arguments.hasKey("seconds"): arguments["seconds"].getFloat else: 0.5
+  sleep(max(0, min(120_000, int(seconds * 1000.0))))
+  %*{"ok": true, "seconds": seconds}
 
 proc plasticAssistantVoiceExtension(mimeType: string): string =
   let normalized = mimeType.toLowerAscii
@@ -4124,6 +5379,8 @@ when defined(windows) and not defined(glaucoplasticHeadless):
         foreignPath*: string
         width*: int
         height*: int
+        shellReloading*: bool
+        lastForeignLayoutKey*: string
 
   proc gpwv2_create(
     titleUtf8, userDataFolderUtf8: cstring;
@@ -4155,6 +5412,12 @@ when defined(windows) and not defined(glaucoplasticHeadless):
     host: pointer;
     htmlUtf8: cstring
   ): cint {.cdecl, importc.}
+
+  proc gpwv2_shell_execute_sync(
+    host: pointer;
+    scriptUtf8: cstring;
+    timeoutMs: cint
+  ): cstring {.cdecl, importc.}
 
   proc gpwv2_foreign_navigate(
     host: pointer;
@@ -4425,6 +5688,11 @@ macro glaucoplasticFragment*(fragmentName: untyped; body: untyped): untyped =
   proc astDslName(node: NimNode): string =
     case node.kind
     of nnkIdent, nnkSym:
+      result = node.strVal
+    of nnkStrLit, nnkRStrLit, nnkTripleStrLit:
+      # Permite nomes de atributos escritos como string na DSL, por exemplo:
+      # `"data-node-id" = "42"`. O nome continua sendo validado na etapa de
+      # renderização antes de chegar ao HTML.
       result = node.strVal
     of nnkAccQuoted:
       for child in node:
@@ -4771,6 +6039,10 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
     ## `` `div` ``, são normalizados para "div".
     case node.kind
     of nnkIdent, nnkSym:
+      result = node.strVal
+    of nnkStrLit, nnkRStrLit, nnkTripleStrLit:
+      # Atributos podem usar nomes HTML entre aspas, inclusive com hífen:
+      # `"data-node-id" = "42"`.
       result = node.strVal
     of nnkAccQuoted:
       for child in node:
@@ -6202,22 +7474,46 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
         )
 
     proc `jsonStringFieldSym`(node: JsonNode; key: string; fallback = ""): string =
-      if node.kind == JObject and node.hasKey(key) and node[key].kind == JString:
-        node[key].getStr
-      else:
-        fallback
+      if node.isNil or
+          node.kind != JObject or
+          not node.hasKey(key):
+        return fallback
+
+      let value = node[key]
+
+      if value.isNil or
+          value.kind != JString:
+        return fallback
+
+      value.getStr
 
     proc `jsonBoolFieldSym`(node: JsonNode; key: string; fallback = false): bool =
-      if node.kind == JObject and node.hasKey(key) and node[key].kind == JBool:
-        node[key].getBool
-      else:
-        fallback
+      if node.isNil or
+          node.kind != JObject or
+          not node.hasKey(key):
+        return fallback
+
+      let value = node[key]
+
+      if value.isNil or
+          value.kind != JBool:
+        return fallback
+
+      value.getBool
 
     proc `jsonIntFieldSym`(node: JsonNode; key: string; fallback = 0): int =
-      if node.kind == JObject and node.hasKey(key) and node[key].kind == JInt:
-        node[key].getInt
-      else:
-        fallback
+      if node.isNil or
+          node.kind != JObject or
+          not node.hasKey(key):
+        return fallback
+
+      let value = node[key]
+
+      if value.isNil or
+          value.kind != JInt:
+        return fallback
+
+      value.getInt
 
     proc quoteShellArgument(value: string): string =
       when defined(windows):
@@ -6596,7 +7892,8 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
             ],
             assets: @[],
             desktopShortcut: true,
-            startMenuShortcut: true
+            startMenuShortcut: true,
+            installerDownloadPage: newJObject()
           ),
           installRoot: getAppDir(),
           dataRoot: dataRoot,
@@ -6757,6 +8054,9 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
           managedRuntime: false,
           endpoint: "http://" & llamaConfig.host & ":" & $llamaConfig.port & "/v1"
         ),
+        rlmValue: PlasticRlmRuntime(
+          capabilities: initTable[string, PlasticCapability]()
+        ),
         agentsValue: initTable[string, PlasticAgent](),
         componentsValue: newJArray(),
         renderTreeValue: newJArray(),
@@ -6879,7 +8179,7 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
     proc okf*(application: PlasticApplication): PlasticOkfRuntime = application.okfValue
     proc foreign*(application: PlasticApplication): PlasticForeignRuntime = application.foreignValue
     proc llama*(application: PlasticApplication): PlasticLlamaRuntime = application.llamaValue
-    proc rlm*(agent: PlasticAgent): PlasticRlmRuntime = agent.rlmValue
+    proc rlm*(application: PlasticApplication): PlasticRlmRuntime = application.rlmValue
     proc metisMemory*(application: PlasticApplication): PlasticMetisMemory = application.metisMemoryValue
     proc safeStorage*(application: PlasticApplication): PlasticSafeStorageRuntime = application.safeStorageValue
     proc desktop*(application: PlasticApplication): PlasticDesktopRuntime = application.desktopValue
@@ -7565,7 +8865,8 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
               "webview/Default/cache"
             ],
             desktopShortcut: true,
-            startMenuShortcut: true
+            startMenuShortcut: true,
+            installerDownloadPage: newJObject()
           )
 
         proc parseInstallationConfig(plan: PlasticPlan; applicationName: string): PlasticInstallationConfig =
@@ -7617,13 +8918,33 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
                 else: discard
             of "package":
               for item in planChildren(child):
-                if planName(item) in ["file", "glob", "include", "includeGlob"]:
+                if planName(item) in ["file", "glob", "include", "includeGlob", "tree", "directory"]:
                   result.assets.add item
             of "shortcut":
               for item in planChildren(child):
                 case planName(item)
                 of "desktop": result.desktopShortcut = firstLiteralBool(item, result.desktopShortcut)
                 of "startMenu": result.startMenuShortcut = firstLiteralBool(item, result.startMenuShortcut)
+                else: discard
+            of "downloadPage", "installerDownloadPage":
+              result.installerDownloadPage = %*{
+                "enabled": true,
+                "title": "Preparar recursos locais",
+                "description": "Baixe o runtime gráfico e o modelo necessário durante a instalação.",
+                "runtime": true,
+                "model": true,
+                "backend": "auto",
+                "autoStart": true
+              }
+              for item in planChildren(child):
+                case planName(item)
+                of "enabled": result.installerDownloadPage["enabled"] = %firstLiteralBool(item, true)
+                of "title": result.installerDownloadPage["title"] = %firstLiteralString(item, "Preparar recursos locais")
+                of "description": result.installerDownloadPage["description"] = %firstLiteralString(item, "Baixe os recursos durante a instalação.")
+                of "runtime", "downloadRuntime": result.installerDownloadPage["runtime"] = %firstLiteralBool(item, true)
+                of "model", "downloadModel": result.installerDownloadPage["model"] = %firstLiteralBool(item, true)
+                of "backend": result.installerDownloadPage["backend"] = %firstLiteralString(item, "auto")
+                of "autoStart": result.installerDownloadPage["autoStart"] = %firstLiteralBool(item, true)
                 else: discard
             else:
               discard
@@ -8404,7 +9725,7 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
           element.url = normalized
 
           if element.currentUrl == normalized and
-              element.status in {pfsLoading, pfsReady, pfsNavigating}:
+              element.status == pfsReady:
             return
 
           element.status = pfsNavigating
@@ -8593,26 +9914,6 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
             return style.display !== 'none' && style.visibility !== 'hidden' &&
               style.opacity !== '0' && rect.width > 0 && rect.height > 0;
           };
-          const semanticRole = element => {
-            const explicit = String(element.getAttribute('role') || '').trim().toLowerCase();
-            if (explicit) return explicit;
-            const tag = element.tagName.toLowerCase();
-            const type = String(element.getAttribute('type') || '').toLowerCase();
-            if (tag === 'button') return 'button';
-            if (tag === 'a' && element.hasAttribute('href')) return 'link';
-            if (tag === 'textarea') return 'textbox';
-            if (tag === 'select') return element.multiple ? 'listbox' : 'combobox';
-            if (tag === 'option') return 'option';
-            if (tag === 'input') {
-              if (type === 'checkbox') return 'checkbox';
-              if (type === 'radio') return 'radio';
-              if (type === 'button' || type === 'submit' || type === 'reset') return 'button';
-              if (type === 'range') return 'slider';
-              if (type === 'number') return 'spinbutton';
-              if (type !== 'hidden') return 'textbox';
-            }
-            return '';
-          };
           const cssPath = element => {
             if (element.id) return '#' + escapeCss(element.id);
             const parts = [];
@@ -8645,7 +9946,7 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
               id: element.id || undefined,
               name: element.getAttribute('name') || undefined,
               type: element.getAttribute('type') || undefined,
-              role: semanticRole(element) || undefined,
+              role: element.getAttribute('role') || undefined,
               ariaLabel: element.getAttribute('aria-label') || undefined,
               placeholder: element.getAttribute('placeholder') || undefined,
               text: normalize(element.innerText || element.textContent).slice(0, 320),
@@ -8711,26 +10012,6 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
             return style.display !== 'none' && style.visibility !== 'hidden' &&
               style.opacity !== '0' && rect.width > 0 && rect.height > 0;
           };
-          const semanticRole = element => {
-            const explicit = String(element.getAttribute('role') || '').trim().toLowerCase();
-            if (explicit) return explicit;
-            const tag = element.tagName.toLowerCase();
-            const type = String(element.getAttribute('type') || '').toLowerCase();
-            if (tag === 'button') return 'button';
-            if (tag === 'a' && element.hasAttribute('href')) return 'link';
-            if (tag === 'textarea') return 'textbox';
-            if (tag === 'select') return element.multiple ? 'listbox' : 'combobox';
-            if (tag === 'option') return 'option';
-            if (tag === 'input') {
-              if (type === 'checkbox') return 'checkbox';
-              if (type === 'radio') return 'radio';
-              if (type === 'button' || type === 'submit' || type === 'reset') return 'button';
-              if (type === 'range') return 'slider';
-              if (type === 'number') return 'spinbutton';
-              if (type !== 'hidden') return 'textbox';
-            }
-            return '';
-          };
           const cssPath = element => {
             if (element.id) return '#' + escapeCss(element.id);
             const parts = [];
@@ -8766,7 +10047,7 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
               id: element.id || undefined,
               name: element.getAttribute('name') || undefined,
               type: element.getAttribute('type') || undefined,
-              role: semanticRole(element) || undefined,
+              role: element.getAttribute('role') || undefined,
               ariaLabel: element.getAttribute('aria-label') || undefined,
               placeholder: element.getAttribute('placeholder') || undefined,
               text: normalize(element.innerText || element.textContent).slice(0, 320),
@@ -8787,7 +10068,7 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
             if (visibleOnly) elements = elements.filter(visible);
             if (requestedRole) {
               const roleNeedle = requestedRole.toLowerCase();
-              elements = elements.filter(element => semanticRole(element) === roleNeedle);
+              elements = elements.filter(element => String(element.getAttribute('role') || '').toLowerCase() === roleNeedle);
             }
             if (requestedText) {
               const textNeedle = normalize(requestedText).toLowerCase();
@@ -8828,13 +10109,11 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
         ): JsonNode =
           let selector = plasticRpaJsonString(arguments, "selector")
           let text = plasticRpaJsonString(arguments, "text")
-          let role = plasticRpaJsonString(arguments, "role")
           let index = max(0, plasticRpaJsonInt(arguments, "index", 0))
           var script = """
         (() => {
           const selector = __SELECTOR__;
           const requestedText = __TEXT__;
-          const requestedRole = __ROLE__;
           const index = __INDEX__;
           const normalize = value => String(value ?? '').replace(/\s+/g, ' ').trim();
           const visible = element => {
@@ -8844,33 +10123,9 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
             return style.display !== 'none' && style.visibility !== 'hidden' &&
               style.opacity !== '0' && rect.width > 0 && rect.height > 0;
           };
-          const semanticRole = element => {
-            const explicit = String(element.getAttribute('role') || '').trim().toLowerCase();
-            if (explicit) return explicit;
-            const tag = element.tagName.toLowerCase();
-            const type = String(element.getAttribute('type') || '').toLowerCase();
-            if (tag === 'button') return 'button';
-            if (tag === 'a' && element.hasAttribute('href')) return 'link';
-            if (tag === 'textarea') return 'textbox';
-            if (tag === 'select') return element.multiple ? 'listbox' : 'combobox';
-            if (tag === 'option') return 'option';
-            if (tag === 'input') {
-              if (type === 'checkbox') return 'checkbox';
-              if (type === 'radio') return 'radio';
-              if (type === 'button' || type === 'submit' || type === 'reset') return 'button';
-              if (type === 'range') return 'slider';
-              if (type === 'number') return 'spinbutton';
-              if (type !== 'hidden') return 'textbox';
-            }
-            return '';
-          };
           try {
             const baseSelector = selector || 'a,button,input,textarea,select,[role="button"],[role="link"],[tabindex]';
             let elements = Array.from(document.querySelectorAll(baseSelector)).filter(visible);
-            if (requestedRole) {
-              const roleNeedle = requestedRole.toLowerCase();
-              elements = elements.filter(element => semanticRole(element) === roleNeedle);
-            }
             if (requestedText) {
               const needle = normalize(requestedText).toLowerCase();
               elements = elements.filter(element => normalize([
@@ -8890,7 +10145,6 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
               before,
               clicked: {
                 tag: element.tagName.toLowerCase(),
-                role: semanticRole(element) || undefined,
                 text: normalize(element.innerText || element.textContent).slice(0, 320),
                 ariaLabel: element.getAttribute('aria-label') || undefined,
                 rect: {x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height)}
@@ -8904,7 +10158,6 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
         """
           script = script.replace("__SELECTOR__", plasticRpaJsLiteral(selector))
           script = script.replace("__TEXT__", plasticRpaJsLiteral(text))
-          script = script.replace("__ROLE__", plasticRpaJsLiteral(role))
           script = script.replace("__INDEX__", $index)
           runtime.plasticRpaDomEval(arguments, script)
 
@@ -10011,6 +11264,17 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
             elif planKind(child) == "when":
               element.eventPlans.add child.copy
 
+          let overlayRemovedByComposition =
+            getEnv("GLAUCOPLASTIC_NATIVE_ASSISTANT_OVERLAY_REMOVED_BY_COMPOSITION").strip.toLowerAscii in
+              ["1", "true", "yes", "on"]
+          if not application.assistantValue.isNil and
+              application.assistantValue.config.enabled and
+              not overlayRemovedByComposition:
+            let overlayScript = plasticAssistantForeignOverlayScript()
+            if overlayScript.len > 0 and
+                overlayScript notin element.documentStartScripts:
+              element.documentStartScripts.add overlayScript
+
         proc deriveForeignElements(application: PlasticApplication) =
           proc visitInlineForeign(node: JsonNode; componentName: string) =
             if planKind(node) == "call" and planName(node) == "foreign":
@@ -10079,8 +11343,27 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
               visitInlineForeign(declaration, componentName)
 
 
-        proc htmlEscape(value: string): string =
+        proc repairMojibake(value: string): string =
+          ## Corrige texto UTF-8 que atravessou uma etapa Latin-1/CP1252.
+          ## O renderer recebe strings de planos, estado e ORM pelo mesmo caminho.
           result = value
+          result = result.replace("\u00C3\u00A3", "\u00E3")
+          result = result.replace("\u00C3\u00AD", "\u00ED")
+          result = result.replace("\u00C3\u00A9", "\u00E9")
+          result = result.replace("\u00C3\u00B5", "\u00F5")
+          result = result.replace("\u00C3\u00A7", "\u00E7")
+          result = result.replace("\u00C3\u00B3", "\u00F3")
+          result = result.replace("\u00C3\u00A1", "\u00E1")
+          result = result.replace("\u00C3\u00BA", "\u00FA")
+          result = result.replace("\u00C3\u00AA", "\u00EA")
+          result = result.replace("\u00C3\u0161", "\u00DA")
+          result = result.replace("\u00C2\u00B7", "\u00B7")
+          result = result.replace("\u00E2\u2020\u2019", "\u2192")
+          result = result.replace("\u00E2\u2020\u0090", "\u2190")
+          result = result.replace("\u00E2\u20AC\u201D", "\u2014")
+          result = result.replace("\u00E2\u20AC\u00A6", "\u2026")
+        proc htmlEscape(value: string): string =
+          result = repairMojibake(value)
             .replace("&", "&amp;")
             .replace("<", "&lt;")
             .replace(">", "&gt;")
@@ -10092,7 +11375,7 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
         proc jsonText(value: JsonNode): string =
           case value.kind
           of JString:
-            result = value.getStr
+            result = repairMojibake(value.getStr)
           of JNull:
             result = ""
           of JBool:
@@ -10437,11 +11720,43 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
           result = none(JsonNode)
 
         proc sanitizeTagName(value: string): string =
+          case value
+          of "CdsButton": return "cds-button"
+          of "CdsTabs": return "cds-tabs"
+          of "CdsTab": return "cds-tab"
+          of "CdsAccordion": return "cds-accordion"
+          of "CdsAccordionItem": return "cds-accordion-item"
+          of "CdsTile": return "cds-tile"
+          of "CdsTag": return "cds-tag"
+          of "CdsTextInput": return "cds-text-input"
+          of "CdsTextarea": return "cds-textarea"
+          of "CdsInlineNotification": return "cds-inline-notification"
+          of "CdsIconButton": return "cds-icon-button"
+          else: discard
+          var previousWasAlphaNumeric = false
           for character in value:
+            if character.isUpperAscii and previousWasAlphaNumeric:
+              result.add '-'
             if character.isAlphaNumeric or character in {'-', '_'}:
-              result.add character
+              result.add character.toLowerAscii
+              previousWasAlphaNumeric = character.isAlphaNumeric
+            else:
+              previousWasAlphaNumeric = false
           if result.len == 0:
             result = "div"
+
+        proc validHtmlAttributeName(value: string): bool =
+          ## Aceita atributos HTML/custom-element, inclusive nomes quoted com
+          ## hífen (`"data-node-id"`). O bloqueio de `on*` evita transformar
+          ## valores da DSL em handlers inline.
+          if value.len == 0 or value.toLowerAscii.startsWith("on"):
+            return false
+          for index, character in value:
+            if index == 0 and not (character.isAlphaNumeric or character == ':'):
+              return false
+            if not (character.isAlphaNumeric or character in {'-', '_', ':', '.'}):
+              return false
+          true
 
         proc sanitizeCustomElementName(value: string): string =
           var lastWasDash = false
@@ -10626,7 +11941,16 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
           if titleValue.len > 0:
             result.add " title=\"" & htmlAttribute(titleValue) & "\""
 
-          result.add " data-status=\"loading\"></div>"
+          let placeholderStatus =
+            if application.foreignValue.elements.hasKey(path) and
+                application.foreignValue.elements[path].status == pfsReady:
+              "ready"
+            else:
+              "loading"
+
+          result.add " data-status=\"" &
+            placeholderStatus &
+            "\"></div>"
 
         proc renderPlanNodeHtml(
           application: PlasticApplication;
@@ -10712,6 +12036,7 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
           let baseTagName = sanitizeTagName(name)
           var attributes = ""
           var content = ""
+          var textareaValue = ""
           let arguments = planArguments(node)
           let identityName = positionalIdentityName(node)
           let positionalIdentityIndex = if identityName.len > 0: 0 else: -1
@@ -10750,18 +12075,30 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
                 attributes.add " data-glauco-bind-attribute=\"" &
                   htmlAttribute(attributeName) & "\""
 
-              case attributeName
-              of "class", "id", "style", "title", "role", "name", "value", "type",
-                 "placeholder", "autocomplete", "spellcheck", "aria-label",
-                 "href", "src", "rel", "media", "target", "download", "defer",
-                 "async", "crossorigin", "integrity", "referrerpolicy":
-                if baseTagName == "style" and attributeName == "src":
-                  discard
-                else:
-                  attributes.add " " & attributeName & "=\"" & htmlAttribute(text) & "\""
+              if baseTagName == "textarea" and attributeName == "value":
+                # HTML textarea lê o valor inicial do conteúdo textual, não
+                # do atributo value. Mantemos a ligação de estado acima e
+                # materializamos a expressão no corpo do elemento.
+                textareaValue = text
               else:
-                if attributeName.startsWith("data"):
-                  attributes.add " " & attributeName & "=\"" & htmlAttribute(text) & "\""
+                case attributeName
+                of "class", "id", "style", "title", "role", "name", "value", "type",
+                   "placeholder", "autocomplete", "spellcheck", "aria-label",
+                   "href", "src", "rel", "media", "target", "download", "defer",
+                   "async", "crossorigin", "integrity", "referrerpolicy",
+                   "viewBox", "x", "y", "width", "height", "x1", "y1", "x2", "y2",
+                   "d", "fill", "stroke", "stroke-width", "stroke-linecap",
+                   "marker-end", "preserveAspectRatio":
+                  if baseTagName == "style" and attributeName == "src":
+                    discard
+                  else:
+                    attributes.add " " & attributeName & "=\"" & htmlAttribute(text) & "\""
+                else:
+                  # Nomes quoted e atributos de custom elements (Carbon, por
+                  # exemplo `kind`, `size`, `slot`, `data-node-id`) passam por
+                  # uma validação restrita antes de serem emitidos.
+                  if validHtmlAttributeName(attributeName):
+                    attributes.add " " & attributeName & "=\"" & htmlAttribute(text) & "\""
             elif argumentIndex != positionalIdentityIndex:
               content.add htmlEscape(jsonText(
                 application.resolveRenderValue(argument, environment)
@@ -10820,6 +12157,9 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
               environment,
               componentName
             )
+
+          if baseTagName == "textarea" and content.len == 0 and textareaValue.len > 0:
+            content = htmlEscape(textareaValue)
 
           if baseTagName == "style":
             let srcNode = callNamedArgument(node, "src")
@@ -10901,13 +12241,22 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
               plasticAssistantScript(application.assistantValue)
             else:
               ""
-
           result = """<!doctype html>
         <html>
         <head>
           <meta charset="utf-8">
           <meta name="viewport" content="width=device-width, initial-scale=1">
           <title>""" & title & """</title>
+          <!-- Carbon Web Components oficiais: artefatos CDN autocontidos, sem
+               import map/bundler e sem dependência de módulos bare como `lit`. -->
+          <script type="module" src="https://1.www.s81c.com/common/carbon/web-components/tag/v2/latest/button.min.js"></script>
+          <script type="module" src="https://1.www.s81c.com/common/carbon/web-components/tag/v2/latest/tabs.min.js"></script>
+          <script type="module" src="https://1.www.s81c.com/common/carbon/web-components/tag/v2/latest/accordion.min.js"></script>
+          <script type="module" src="https://1.www.s81c.com/common/carbon/web-components/tag/v2/latest/tag.min.js"></script>
+          <script type="module" src="https://1.www.s81c.com/common/carbon/web-components/tag/v2/latest/tile.min.js"></script>
+          <script type="module" src="https://1.www.s81c.com/common/carbon/web-components/tag/v2/latest/text-input.min.js"></script>
+          <script type="module" src="https://1.www.s81c.com/common/carbon/web-components/tag/v2/latest/textarea.min.js"></script>
+          <script type="module" src="https://1.www.s81c.com/common/carbon/web-components/tag/v2/latest/notification.min.js"></script>
           <style>
             :root { color-scheme: light dark; }
             * { box-sizing: border-box; }
@@ -11015,6 +12364,21 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
                   }
                 }
                 return null;
+              }
+
+              function diagramClickBlocked(event) {
+                const node = event && event.target && event.target.closest
+                  ? event.target.closest('[data-diagram-node]')
+                  : null;
+                if (node && node.dataset.diagramDragSuppressed === 'true') {
+                  return true;
+                }
+                const canvas = node && node.closest
+                  ? node.closest('.ks-knowledge-canvas')
+                  : null;
+                return !!canvas && Date.now() < Number(
+                  canvas.dataset.diagramClickBlockUntil || 0
+                );
               }
 
               function emit(eventName, element, event) {
@@ -11251,6 +12615,19 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
 
                 const blockers =
                   visibleBlockingRectangles();
+                const shell =
+                  document.querySelector(".rpa-shell");
+                const checkedPage =
+                  document.querySelector(".rpa-page-input:checked");
+                const activePage =
+                  checkedPage && checkedPage.id
+                    ? checkedPage.id
+                    : shell && shell.dataset
+                      ? shell.dataset.activePage || ""
+                      : "";
+                const foreignPageActive =
+                  activePage === "" ||
+                  activePage === "rpa-page-workspace-toggle";
 
                 return Array.from(
                   document.querySelectorAll(
@@ -11278,6 +12655,7 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
                     WebView foreign deva desaparecer.
                   */
                   const visible =
+                    foreignPageActive &&
                     style.display !== "none" &&
                     !element.hidden &&
                     width > 1 &&
@@ -11310,6 +12688,11 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
                     y: Math.round(top),
                     width: Math.round(width),
                     height: Math.round(height),
+                    viewportWidth: Math.round(window.innerWidth),
+                    viewportHeight: Math.round(window.innerHeight),
+                    dprMilli: Math.round(
+                      (window.devicePixelRatio || 1) * 1000
+                    ),
                     visible,
                     inputHoles
                   };
@@ -11319,38 +12702,106 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
               window.__glaucoplasticCollectForeignLayouts =
                 collectGlaucoplasticForeignLayouts;
 
+              function applyGlaucoplasticForeignStatuses(snapshot) {
+                const root =
+                  window.__glaucoplasticShellRoot ||
+                  document;
+                if (!root || !snapshot || !snapshot.length) return;
+
+                for (const item of snapshot) {
+                  if (!item || !item.path) continue;
+                  const element = root.querySelector(
+                    '[data-glauco-foreign="' +
+                      String(item.path).replace(/"/g, '\\"') +
+                      '"]'
+                  );
+                  if (!element) continue;
+                  element.dataset.status =
+                    item.visible ? "ready" : "loading";
+                }
+              }
+
               function publishGlaucoplasticForeignLayouts() {
                 const snapshot = (
                   collectGlaucoplasticForeignLayouts()
                 );
+                const serialized =
+                  JSON.stringify(snapshot);
+
                 window.__glaucoplasticForeignLayoutSnapshot = snapshot;
+                applyGlaucoplasticForeignStatuses(snapshot);
+
+                if (
+                  serialized ===
+                    window.__glaucoplasticLastPublishedForeignLayout
+                ) {
+                  return false;
+                }
+
+                let posted = false;
+
                 if (window.webkit &&
                     window.webkit.messageHandlers &&
                     window.webkit.messageHandlers.glaucoplasticLayout) {
                   window.webkit.messageHandlers.glaucoplasticLayout.postMessage(
-                    JSON.stringify(snapshot)
+                    serialized
                   );
-                }
-                if (window.chrome &&
+                  posted = true;
+                } else if (window.chrome &&
                     window.chrome.webview &&
                     window.chrome.webview.postMessage) {
                   window.chrome.webview.postMessage({
                     type: "glaucoplasticLayout",
-                    payload: JSON.stringify(snapshot)
+                    payload: serialized
                   });
+                  posted = true;
                 }
+
+                if (posted) {
+                  window.__glaucoplasticLastPublishedForeignLayout =
+                    serialized;
+                }
+
+                return posted;
               }
 
-              function scheduleGlaucoplasticForeignLayouts() {
+              function scheduleGlaucoplasticForeignLayouts(
+                delayMs = 0
+              ) {
+                if (delayMs > 0) {
+                  if (window.__glaucoplasticForeignResizeTimer) {
+                    window.clearTimeout(
+                      window.__glaucoplasticForeignResizeTimer
+                    );
+                  }
+
+                  window.__glaucoplasticForeignResizeTimer =
+                    window.setTimeout(
+                      () => {
+                        window.__glaucoplasticForeignResizeTimer = 0;
+                        scheduleGlaucoplasticForeignLayouts(0);
+                      },
+                      delayMs
+                    );
+                  return;
+                }
+
                 if (window.__glaucoplasticForeignLayoutScheduled) return;
+
                 window.__glaucoplasticForeignLayoutScheduled = true;
-                const schedule = window.requestAnimationFrame ||
+
+                const schedule =
+                  window.requestAnimationFrame ||
                   (callback => window.setTimeout(callback, 16));
+
                 schedule(() => {
                   window.__glaucoplasticForeignLayoutScheduled = false;
                   publishGlaucoplasticForeignLayouts();
                 });
               }
+
+              window.__glaucoplasticScheduleForeignLayouts =
+                scheduleGlaucoplasticForeignLayouts;
 
               function ensureGlaucoplasticForeignLayoutObservers() {
                 if (window.__glaucoplasticForeignLayoutObserverInstalled) return;
@@ -11367,13 +12818,13 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
                       'class',
                       'style',
                       'hidden',
-                      'data-status'
+                      'data-active-page'
                     ]
                   });
                 }
                 if (window.ResizeObserver) {
                   const resizeObserver = new ResizeObserver(() => {
-                    scheduleGlaucoplasticForeignLayouts();
+                    scheduleGlaucoplasticForeignLayouts(60);
                   });
                   for (const element of document.querySelectorAll(
                     '[data-glauco-foreign]'
@@ -11389,7 +12840,7 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
                   scheduleGlaucoplasticForeignLayouts();
                 }, true);
                 window.addEventListener('resize', () => {
-                  scheduleGlaucoplasticForeignLayouts();
+                  scheduleGlaucoplasticForeignLayouts(60);
                 }, true);
                 scheduleGlaucoplasticForeignLayouts();
               }
@@ -11398,6 +12849,7 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
               ensureGlaucoplasticForeignLayoutObservers();
 
               document.addEventListener("click", event => {
+                if (diagramClickBlocked(event)) return;
                 const element = resolveEventElement(
                   event,
                   "[data-glauco-handler-click]"
@@ -11406,7 +12858,32 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
                 emit("click", element, event);
               }, true);
 
+              /*
+                 Canvas nodes can expose a semantic action button while the
+                 whole card remains the interaction surface.  Route a click
+                 on card content to that action through the same Glaucoplastic
+                 event bridge; edge handles and drag releases stay isolated.
+              */
+              document.addEventListener("click", event => {
+                if (diagramClickBlocked(event)) return;
+                const target = event && event.target && event.target.closest
+                  ? event.target
+                  : null;
+                const node = target && target.closest
+                  ? target.closest('[data-diagram-node]')
+                  : null;
+                if (!node || (target && target.closest('[data-edge-handle]'))) {
+                  return;
+                }
+                if (target && target.closest('[data-glauco-handler-click]')) {
+                  return;
+                }
+                const action = node.querySelector('[data-glauco-handler-click]');
+                if (action) emit("click", action, event);
+              }, true);
+
               document.addEventListener("pointerup", event => {
+                if (diagramClickBlocked(event)) return;
                 const element = resolveEventElement(
                   event,
                   "[data-glauco-handler-click]"
@@ -11416,6 +12893,7 @@ macro glaucoplastic*(arguments: varargs[untyped]): untyped =
               }, true);
 
               document.addEventListener("mouseup", event => {
+                if (diagramClickBlocked(event)) return;
                 const element = resolveEventElement(
                   event,
                   "[data-glauco-handler-click]"
@@ -12922,6 +14400,109 @@ finally:
         proc plasticPyNone(): PyObject =
           nimpy.callMethod(pyBuiltinsModule(), "eval", "None")
 
+        # GLAUCOPLASTIC_METIS_TORCH_CPU_DEVICE_COMPAT_V1
+
+        proc plasticMetisInstallTorchCpuDeviceCompat(
+          torchModule: PyObject
+        ) =
+          ## Compatibilidade para código Python device-agnostic que espera
+          ## `torch.<backend>.device(...)` também para o backend CPU.
+          ##
+          ## Para CPU não existe seleção real de device; um context manager
+          ## nulo fornece a semântica necessária para `with torch.cpu.device(...)`.
+          let py =
+            pyBuiltinsModule()
+
+          let scope =
+            nimpy.callMethod(
+              py,
+              "dict"
+            )
+
+          scope["torch"] =
+            torchModule
+
+          discard nimpy.callMethod(
+            py,
+            "exec",
+            "import contextlib\n" &
+              "if hasattr(torch, 'cpu') and " &
+              "not hasattr(torch.cpu, 'device'):\n" &
+              "    torch.cpu.device = " &
+              "lambda *args, **kwargs: contextlib.nullcontext()\n",
+            scope,
+            scope
+          )
+
+          let cpuModule =
+            nimpy.getAttr(
+              torchModule,
+              "cpu"
+            )
+
+          let installed =
+            nimpy.callMethod(
+              py,
+              "hasattr",
+              cpuModule,
+              "device"
+            ).to(bool)
+
+          if not installed:
+            raise newException(
+              PlasticRuntimeError,
+              "Não foi possível instalar compatibilidade torch.cpu.device."
+            )
+
+          plasticDebugTrace(
+            "metis.compat torch.cpu.device ready"
+          )
+
+        proc plasticMetisInstallQwenLinearAttentionCompat() =
+          ## No Windows, flash-linear-attention imports successfully but its
+          ## Triton kernels are not reliable. Force the Qwen3.5 module to use
+          ## the pure torch fallbacks before the Metis remote code imports it.
+          when defined(windows):
+            if getEnv(
+                "GLAUCOPLASTIC_METIS_FORCE_TORCH_LINEAR_ATTENTION",
+                "1"
+              ).strip.toLowerAscii in
+                ["1", "true", "yes", "on", "enabled"]:
+              let py =
+                pyBuiltinsModule()
+              let scope =
+                nimpy.callMethod(
+                  py,
+                  "dict"
+                )
+              discard nimpy.callMethod(
+                py,
+                "exec",
+                "import os\n" &
+                  "os.environ.setdefault('TRITON_INTERPRET', '1')\n" &
+                  "os.environ.setdefault('TRITON_DISABLE_LINE_INFO', '1')\n" &
+                  "os.environ.setdefault('TORCHDYNAMO_DISABLE', '1')\n" &
+                  "os.environ.setdefault('TORCH_COMPILE_DISABLE', '1')\n",
+                scope,
+                scope
+              )
+              discard nimpy.callMethod(
+                py,
+                "exec",
+                "import transformers.models.qwen3_5.modeling_qwen3_5 as qwen35\n" &
+                  "qwen35.FusedRMSNormGated = None\n" &
+                  "qwen35.chunk_gated_delta_rule = None\n" &
+                  "qwen35.fused_recurrent_gated_delta_rule = None\n" &
+                  "qwen35.is_fast_path_available = False\n",
+                scope,
+                scope
+              )
+              plasticDebugTrace(
+                "metis.compat qwen3_5 linear_attention=torch"
+              )
+          else:
+            discard
+
         proc plasticMetisMessages(
           pairs: openArray[tuple[role, content: string]]
         ): PyObject =
@@ -14152,12 +15733,6 @@ finally:
         proc plasticMetisLogNvidiaProcesses(): JsonNode =
           result = newJArray()
           when defined(linux):
-            let deviceProbe = execCmdEx("ls -l /dev/nvidia* 2>&1")
-            plasticDebugTrace(
-              "metis.memory.diagnostic.nvidia-devices output=" &
-              deviceProbe.output.strip() &
-              " code=" & $deviceProbe.exitCode
-            )
             let executable = findExe("nvidia-smi")
             if executable.len == 0:
               return
@@ -14169,8 +15744,7 @@ finally:
             if execution.exitCode != 0:
               plasticDebugTrace(
                 "metis.memory.diagnostic.nvidia-smi.failed code=" &
-                $execution.exitCode &
-                " output=" & execution.output.strip()
+                $execution.exitCode
               )
               return
             for rawLine in execution.output.splitLines:
@@ -14309,114 +15883,6 @@ finally:
               $memory.config.minGpuFreeMiB & " MiB."
             )
 
-        proc plasticMetisCudaAvailabilityDiagnostic(
-          memory: PlasticMetisMemory;
-          torchModule: PyObject;
-          cudaModule: PyObject;
-          phase: string
-        ): JsonNode =
-          proc diagnosticText(node: JsonNode; key: string): string =
-            if node.hasKey(key) and node[key].kind == JString:
-              node[key].getStr
-            else:
-              ""
-
-          proc diagnosticBool(node: JsonNode; key: string): string =
-            if node.hasKey(key) and node[key].kind == JBool:
-              $node[key].getBool
-            else:
-              ""
-
-          proc diagnosticInt(node: JsonNode; key: string): string =
-            if node.hasKey(key) and node[key].kind == JInt:
-              $node[key].getInt
-            else:
-              ""
-
-          result = newJObject()
-          result["phase"] = %phase
-
-          try:
-            result["torchVersion"] =
-              %nimpy.getAttr(torchModule, "__version__").to(string)
-          except CatchableError as error:
-            result["torchVersionError"] = %error.msg
-
-          try:
-            let torchVersionModule = nimpy.getAttr(torchModule, "version")
-            result["torchCudaVersion"] =
-              %nimpy.getAttr(torchVersionModule, "cuda").to(string)
-          except CatchableError as error:
-            result["torchCudaVersionError"] = %error.msg
-
-          try:
-            let backends = nimpy.getAttr(torchModule, "backends")
-            let cudaBackends = nimpy.getAttr(backends, "cuda")
-            result["cudaBackendBuilt"] =
-              %nimpy.callMethod(cudaBackends, "is_built").to(bool)
-          except CatchableError as error:
-            result["cudaBackendBuiltError"] = %error.msg
-
-          try:
-            result["cudaIsAvailable"] =
-              %nimpy.callMethod(cudaModule, "is_available").to(bool)
-          except CatchableError as error:
-            result["cudaIsAvailableError"] = %error.msg
-
-          try:
-            result["cudaDeviceCount"] =
-              %nimpy.callMethod(cudaModule, "device_count").to(int)
-          except CatchableError as error:
-            result["cudaDeviceCountError"] = %error.msg
-
-          try:
-            result["cudaIsInitialized"] =
-              %nimpy.callMethod(cudaModule, "is_initialized").to(bool)
-          except CatchableError as error:
-            result["cudaIsInitializedError"] = %error.msg
-
-          let environment = newJObject()
-          for key in [
-            "CUDA_VISIBLE_DEVICES",
-            "NVIDIA_VISIBLE_DEVICES",
-            "CUDA_HOME",
-            "CUDA_PATH",
-            "LD_LIBRARY_PATH"
-          ]:
-            environment[key] = %getEnv(key, "")
-          result["environment"] = environment
-
-          if memory.lastDiagnostic.isNil or
-              memory.lastDiagnostic.kind != JObject:
-            memory.lastDiagnostic = newJObject()
-          memory.lastDiagnostic["cuda-availability-" & phase] = result
-
-          plasticDebugTrace(
-            "metis.memory.diagnostic.cuda-availability phase=" & phase &
-            " torchVersion=" &
-            diagnosticText(result, "torchVersion") &
-            " torchCudaVersion=" &
-            diagnosticText(result, "torchCudaVersion") &
-            " cudaBackendBuilt=" &
-            diagnosticBool(result, "cudaBackendBuilt") &
-            " cudaIsAvailable=" &
-            diagnosticBool(result, "cudaIsAvailable") &
-            " cudaDeviceCount=" &
-            diagnosticInt(result, "cudaDeviceCount") &
-            " cudaIsInitialized=" &
-            diagnosticBool(result, "cudaIsInitialized") &
-            " CUDA_VISIBLE_DEVICES=" &
-            diagnosticText(environment, "CUDA_VISIBLE_DEVICES") &
-            " NVIDIA_VISIBLE_DEVICES=" &
-            diagnosticText(environment, "NVIDIA_VISIBLE_DEVICES") &
-            " CUDA_HOME=" &
-            diagnosticText(environment, "CUDA_HOME") &
-            " CUDA_PATH=" &
-            diagnosticText(environment, "CUDA_PATH") &
-            " LD_LIBRARY_PATH=" &
-            diagnosticText(environment, "LD_LIBRARY_PATH")
-          )
-
         proc plasticMetisModelDiagnosticInvoker(): PyObject =
           if plasticMetisModelDiagnosticFunction.isNil:
             let py = pyBuiltinsModule()
@@ -14532,13 +15998,14 @@ finally:
             let gil = plasticAcquirePythonGIL()
             try:
               memory.torchModule = pyImport("torch")
-              memory.transformersModule = pyImport("transformers")
-              let cudaModule = nimpy.getAttr(memory.torchModule, "cuda")
-              discard memory.plasticMetisCudaAvailabilityDiagnostic(
-                memory.torchModule,
-                cudaModule,
-                "before-load"
+
+              plasticMetisInstallTorchCpuDeviceCompat(
+                memory.torchModule
               )
+
+              memory.transformersModule = pyImport("transformers")
+              plasticMetisInstallQwenLinearAttentionCompat()
+              let cudaModule = nimpy.getAttr(memory.torchModule, "cuda")
               if not nimpy.callMethod(
                 cudaModule,
                 "is_available"
@@ -15921,7 +17388,22 @@ finally:
             return "cpu"
 
           when defined(windows):
-            if findExe("nvidia-smi").len > 0:
+            let nvidiaSmi = findExe("nvidia-smi")
+            if nvidiaSmi.len > 0:
+              let probe = execCmdEx(
+                quoteShell(nvidiaSmi),
+                options = {poUsePath, poStdErrToStdOut}
+              )
+              let marker = "CUDA Version:"
+              let markerAt = probe.output.find(marker)
+              if probe.exitCode == 0 and markerAt >= 0:
+                let versionText = probe.output[(markerAt + marker.len) .. ^1].strip.splitWhitespace
+                if versionText.len > 0:
+                  let major =
+                    try: parseInt(versionText[0].split('.')[0])
+                    except ValueError: 0
+                  if major >= 13: return "cuda13"
+                  if major >= 12: return "cuda12"
               return "cuda12"
             if findExe("vulkaninfo").len > 0:
               return "vulkan"
@@ -17194,42 +18676,15 @@ Mantenha a resposta objetiva e útil para inferência.
               result["context"] = context.copy
 
         proc newRlmRuntime*(): PlasticRlmRuntime =
-          PlasticRlmRuntime(
-            tools: initTable[string, PlasticRlmToolProc]()
-          )
+          PlasticRlmRuntime(capabilities: initTable[string, PlasticCapability]())
 
-        proc register*(
-          runtime: PlasticRlmRuntime;
-          name: string;
-          tool: PlasticRlmToolProc
-        ) =
-          let toolName = name.strip
-          if toolName.len == 0:
-            raise newException(
-              PlasticAgentError,
-              "Nome de Tool RLM vazio."
-            )
-          runtime.tools[toolName] = tool
+        proc register*(runtime: PlasticRlmRuntime; name: string; capability: PlasticCapability) =
+          runtime.capabilities[name] = capability
 
-        proc get*(
-          runtime: PlasticRlmRuntime;
-          name: string
-        ): PlasticRlmToolProc =
-          let toolName = name.strip
-          if not runtime.tools.hasKey(toolName):
-            raise newException(
-              PlasticAgentError,
-              "Tool RLM inexistente: " & toolName
-            )
-          runtime.tools[toolName]
-
-        proc invoke(
-          runtime: PlasticRlmRuntime;
-          agent: PlasticAgent;
-          name: string;
-          arguments: JsonNode
-        ): JsonNode =
-          runtime.get(name)(agent, arguments)
+        proc invoke(runtime: PlasticRlmRuntime; agent: PlasticAgent; name: string; arguments: JsonNode): JsonNode =
+          if not runtime.capabilities.hasKey(name):
+            raise newException(PlasticAgentError, "Capability RLM inexistente: " & name)
+          runtime.capabilities[name](agent, arguments)
 
         const PlasticRlmBasePrompt* = """
         Você é o planejador RLM do GlaucoPlastic. Você não responde diretamente
@@ -17244,7 +18699,7 @@ Mantenha a resposta objetiva e útil para inferência.
           {
             "instructions": [
               {
-                "tool": "tool.exata",
+                "capability": "capability.exata",
                 "arguments": {},
                 "assign": "variavel-opcional"
               }
@@ -17260,10 +18715,10 @@ Mantenha a resposta objetiva e útil para inferência.
            autoritativo para decidir se uma execução nova é obrigatória.
         2. rlm.variables.runtime.
         3. rlm.variables.environment.
-           Este é o ambiente atual: tools, states, WebContents,
+           Este é o ambiente atual: capabilities, states, WebContents,
            propósito, domínio, propriedades e conhecimento disponível.
         4. rlm.variables.observations.
-           Results de tools desta execução são a evidência primária.
+           Results de capabilities desta execução são a evidência primária.
         5. rlm.variables.workingVariables.
         6. rlm.variables.memory.
         7. rlm.variables.history por último.
@@ -17272,21 +18727,22 @@ Mantenha a resposta objetiva e útil para inferência.
 
         DECISÃO OPERACIONAL:
         - Se request.value.requiresAction=true e observations ainda não prova a
-          execução do pedido atual, instructions deve conter ao menos uma tool.
+          execução do pedido atual, instructions deve conter ao menos uma
+          capability.
         - Nunca diga que algo foi aberto, clicado, preenchido, enviado,
           executado ou observado apenas porque o histórico afirma isso.
-        - Para ação operacional, selecione a tool mais direta do catálogo
-          environment.value.tools.
-        - tool deve copiar literalmente o campo id desse catálogo.
-        - Não invente tools.
+        - Para ação operacional, selecione a capability mais direta do catálogo
+          environment.value.capabilities.
+        - capability deve copiar literalmente o campo id desse catálogo.
+        - Não invente capabilities.
         - Pedidos declarativos, conversacionais, explicativos, de redação,
           código, opinião ou conhecimento geral normalmente usam instructions=[].
 
         FEEDBACK APÓS EXECUÇÃO:
-        - observations.value contém resultados reais de tools.
+        - observations.value contém resultados reais de capabilities.
         - runtime.value.mustReturnAnswer=true significa que já há observation e
           a prioridade é concluir em answer sem repetir ação confirmada.
-        - Use nova tool somente se faltar uma observação diferente e
+        - Use nova capability somente se faltar uma observação diferente e
           indispensável para concluir ou verificar a tarefa.
         - answer produzido na mesma etapa que solicita instructions não é
           confirmação e deve ser null.
@@ -17375,37 +18831,36 @@ Mantenha a resposta objetiva e útil para inferência.
             result = result[0 ..< maxChars].strip & "..."
 
         proc compactAgentToolManifest(agent: PlasticAgent): JsonNode =
-          ## O catálogo é o escopo RLM efetivo desta instância.
-          ## Declarações Tool apenas enriquecem metadados das funções
-          ## realmente instaladas no runtime do agente.
-          var declaredByTool =
+          ## Catálogo único: uma capability aparece uma vez.
+          var declaredByCapability =
             initTable[string, JsonNode]()
 
           if agent.toolPlans.kind == JArray:
             for functionPlan in agent.toolPlans.items:
               if functionPlan.kind != JObject:
                 continue
-              let toolName =
-                `jsonStringFieldSym`(functionPlan, "name")
-              if toolName.len > 0:
-                declaredByTool[toolName] =
+              let capabilityName =
+                `jsonStringFieldSym`(functionPlan, "capability")
+              if capabilityName.len > 0:
+                declaredByCapability[capabilityName] =
                   functionPlan.copy
 
-          var toolNames = newSeq[string]()
-          if not agent.rlmValue.isNil:
-            for toolName in agent.rlmValue.tools.keys:
-              toolNames.add toolName
-          toolNames.sort()
+          var capabilityNames = newSeq[string]()
+          if not agent.application.rlmValue.isNil:
+            for capabilityName, _ in
+                agent.application.rlmValue.capabilities:
+              capabilityNames.add capabilityName
+          capabilityNames.sort()
 
           result = newJArray()
-          for toolName in toolNames:
+          for capabilityName in capabilityNames:
             var item = newJObject()
-            item["id"] = %toolName
+            item["id"] = %capabilityName
 
-            if declaredByTool.hasKey(toolName):
-              let plan = declaredByTool[toolName]
+            if declaredByCapability.hasKey(capabilityName):
+              let plan = declaredByCapability[capabilityName]
               let label = `jsonStringFieldSym`(plan, "name")
-              if label.len > 0:
+              if label.len > 0 and label != capabilityName:
                 item["label"] = %label
 
               let description =
@@ -17483,7 +18938,7 @@ Mantenha a resposta objetiva e útil para inferência.
             text.contains("https://") or
             text.contains("www.")
 
-        proc validateRlmProgramTools(
+        proc validateRlmProgramCapabilities(
           agent: PlasticAgent;
           program: JsonNode;
           input: JsonNode
@@ -17506,7 +18961,7 @@ Mantenha a resposta objetiva e útil para inferência.
               plasticRlmInputRequiresAction(input) and
               not hasCurrentObservation:
             return(
-              "O pedido atual é operacional e ainda exige uma tool. " &
+              "O pedido atual é operacional e ainda exige uma capability. " &
               "Mensagens anteriores, resumo da sessão e memória não provam " &
               "que a ação atual foi executada."
             )
@@ -17523,12 +18978,10 @@ Mantenha a resposta objetiva e útil para inferência.
             return "O campo answer deve ser uma string ou null."
 
           var allowedNames = newSeq[string]()
-          let manifest = compactAgentToolManifest(agent)
-          if manifest.kind == JArray:
-            for entry in manifest.items:
-              if entry.kind == JObject and entry.hasKey("id") and
-                  entry["id"].kind == JString:
-                allowedNames.add entry["id"].getStr
+          if not agent.application.rlmValue.isNil:
+            for registeredName, _ in
+                agent.application.rlmValue.capabilities:
+              allowedNames.add registeredName
           allowedNames.sort()
 
           var instructionIndex = 0
@@ -17541,25 +18994,28 @@ Mantenha a resposta objetiva e útil para inferência.
                 "] deve ser um objeto JSON."
               )
 
-            if not instruction.hasKey("tool") or
-                instruction["tool"].kind != JString:
+            if not instruction.hasKey("capability") or
+                instruction["capability"].kind != JString:
               return(
                 "instructions[" & $index &
-                "].tool deve ser uma string."
+                "].capability deve ser uma string."
               )
 
-            let toolName =
-              instruction["tool"].getStr.strip
+            let capabilityName =
+              instruction["capability"].getStr.strip
 
-            if toolName.len == 0:
+            if capabilityName.len == 0:
               return(
                 "instructions[" & $index &
-                "].tool não pode ser vazia."
+                "].capability não pode ser vazia."
               )
 
-            if toolName notin allowedNames:
+            if agent.application.rlmValue.isNil or
+                not agent.application.rlmValue.capabilities.hasKey(
+                  capabilityName
+                ):
               return(
-                "Tool não registrada: " & toolName &
+                "Capability não registrada: " & capabilityName &
                 ". Use exatamente uma destas: " &
                 allowedNames.join(", ")
               )
@@ -17567,14 +19023,14 @@ Mantenha a resposta objetiva e útil para inferência.
             if instruction.hasKey("arguments") and
                 instruction["arguments"].kind != JObject:
               return(
-                "arguments de " & toolName &
+                "arguments de " & capabilityName &
                 " deve ser um objeto JSON."
               )
 
             if instruction.hasKey("assign") and
                 instruction["assign"].kind notin {JNull, JString}:
               return(
-                "assign de " & toolName &
+                "assign de " & capabilityName &
                 " deve ser string ou null."
               )
 
@@ -17587,7 +19043,7 @@ Mantenha a resposta objetiva e útil para inferência.
                 )
               ):
             return(
-              "Sem tool a executar, answer deve conter uma mensagem " &
+              "Sem capability a executar, answer deve conter uma mensagem " &
               "textual não vazia ao usuário."
             )
 
@@ -17617,14 +19073,14 @@ Mantenha a resposta objetiva e útil para inferência.
             returnNode = arguments[1].copy
             result["return"] = returnNode.copy
             result["returnType"] = %planTextValue(arguments[1])
-          else:
-            result["returnType"] = %"JsonNode"
 
           result["children"] = newJArray()
 
           for child in planChildren(node):
             if planKind(child) == "call" and planName(child) == "systemPrompt":
               result["systemPrompt"] = %firstLiteralString(child)
+            elif planKind(child) == "call" and planName(child) == "capability":
+              result["capability"] = %firstLiteralString(child)
             elif planKind(child) == "call" and planName(child) == "render":
               var renderNodes = newJArray()
               for renderNode in planChildren(child):
@@ -17802,7 +19258,6 @@ Mantenha a resposta objetiva e útil para inferência.
             rlmConditions: "",
             toolPlans: newJArray(),
             application: application,
-            rlmValue: newRlmRuntime(),
             properties: properties,
             sessionVariables: initTable[string, JsonNode](),
             hookDispatching: false,
@@ -17944,7 +19399,7 @@ Mantenha a resposta objetiva e útil para inferência.
           # {"Search.selectedTitle": "...", "Search.selectedHref": "..."}
           # {"Search": {"selectedTitle": "..."}}
           #
-          # Dentro da tool state.set, cada chave não reservada é tratada
+          # Dentro da capability state.set, cada chave não reservada é tratada
           # como caminho de estado. Isso evita depender de uma única convenção
           # de serialização do modelo.
           for key, value in arguments.pairs:
@@ -18058,15 +19513,15 @@ Mantenha a resposta objetiva e útil para inferência.
           else:
             plasticAgentStateSet(agent, path, answer)
 
-        proc installDefaultTools(agent: PlasticAgent) =
-          agent.rlmValue.register("state.get", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+        proc installDefaultCapabilities(application: PlasticApplication) =
+          application.rlmValue.register("state.get", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             plasticAgentStateGet(
               agent,
               `jsonStringFieldSym`(arguments, "name")
             )
           )
 
-          agent.rlmValue.register("state.set", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          application.rlmValue.register("state.set", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             let writes =
               plasticAgentApplyStateSetArguments(agent, arguments)
 
@@ -18088,7 +19543,7 @@ Mantenha a resposta objetiva e útil para inferência.
             }
           )
 
-          agent.rlmValue.register("orm.find", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          application.rlmValue.register("orm.find", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             findAgentOrmById(
               agent.application.ormValue,
               `jsonStringFieldSym`(arguments, "entity"),
@@ -18096,7 +19551,7 @@ Mantenha a resposta objetiva e útil para inferência.
             )
           )
 
-          agent.rlmValue.register("orm.insert", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          application.rlmValue.register("orm.insert", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             insertAgentOrmRow(
               agent.application.ormValue,
               `jsonStringFieldSym`(arguments, "entity"),
@@ -18104,7 +19559,7 @@ Mantenha a resposta objetiva e útil para inferência.
             )
           )
 
-          agent.rlmValue.register("okf.list", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          application.rlmValue.register("okf.list", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             let space = `jsonStringFieldSym`(arguments, "space")
             interpretOkfAccess(
               agent,
@@ -18114,7 +19569,7 @@ Mantenha a resposta objetiva e útil para inferência.
             )
           )
 
-          agent.rlmValue.register("okf.search", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          application.rlmValue.register("okf.search", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             let query = `jsonStringFieldSym`(arguments, "query")
             let space = `jsonStringFieldSym`(arguments, "space")
             interpretOkfAccess(
@@ -18125,7 +19580,7 @@ Mantenha a resposta objetiva e útil para inferência.
             )
           )
 
-          agent.rlmValue.register("okf.get", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          application.rlmValue.register("okf.get", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             let id = `jsonStringFieldSym`(arguments, "id")
             interpretOkfAccess(
               agent,
@@ -18135,11 +19590,11 @@ Mantenha a resposta objetiva e útil para inferência.
             )
           )
 
-          agent.rlmValue.register("okf.persist", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          application.rlmValue.register("okf.persist", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             activeOkfRuntime(agent).persist(arguments{"document"})
           )
 
-          agent.rlmValue.register("memory.query", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          application.rlmValue.register("memory.query", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             %agent.application.metisMemoryValue.query(
               agent.application.llamaValue,
               agent.metisSession,
@@ -18147,37 +19602,37 @@ Mantenha a resposta objetiva e útil para inferência.
             )
           )
 
-          agent.rlmValue.register("memory.status", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          application.rlmValue.register("memory.status", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             result = agent.application.metisMemoryValue.statusJson()
             result["session"] = %agent.metisSession
           )
 
-          agent.rlmValue.register("memory.save", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          application.rlmValue.register("memory.save", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             agent.application.metisMemoryValue.flush()
             %*{"saved": true, "session": agent.metisSession}
           )
 
-          agent.rlmValue.register("memory.newSession", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          application.rlmValue.register("memory.newSession", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             let session = `jsonStringFieldSym`(arguments, "session", agent.metisSession)
             agent.application.metisMemoryValue.clearSession(session)
             %*{"cleared": true, "session": session}
           )
 
-          agent.rlmValue.register("memory.rebuild", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          application.rlmValue.register("memory.rebuild", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             let count = agent.application.metisMemoryValue.rebuild(
               agent.application.llamaValue
             )
             %*{"rebuilt": count}
           )
 
-          agent.rlmValue.register("memory.reset", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          application.rlmValue.register("memory.reset", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             agent.application.metisMemoryValue.reset(
               agent.application.llamaValue
             )
             %*{"reset": true}
           )
 
-          agent.rlmValue.register("okf.tree", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          application.rlmValue.register("okf.tree", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             interpretOkfAccess(
               agent,
               "okf.tree",
@@ -18186,15 +19641,15 @@ Mantenha a resposta objetiva e útil para inferência.
             )
           )
 
-          agent.rlmValue.register("webcontents.list", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          application.rlmValue.register("webcontents.list", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             agent.application.foreignValue.list()
           )
 
-          agent.rlmValue.register("webcontents.describe", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          application.rlmValue.register("webcontents.describe", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             agent.application.foreignValue.describe(`jsonStringFieldSym`(arguments, "path"))
           )
 
-          agent.rlmValue.register("webcontents.eval_js", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          application.rlmValue.register("webcontents.eval_js", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             agent.application.foreignValue.evalJs(
               `jsonStringFieldSym`(arguments, "path"),
               `jsonStringFieldSym`(arguments, "script"),
@@ -18202,7 +19657,7 @@ Mantenha a resposta objetiva e útil para inferência.
             )
           )
 
-          agent.rlmValue.register("webcontents.navigate", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          application.rlmValue.register("webcontents.navigate", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             agent.application.foreignValue.navigate(
               `jsonStringFieldSym`(arguments, "path"),
               `jsonStringFieldSym`(arguments, "url")
@@ -18210,164 +19665,110 @@ Mantenha a resposta objetiva e útil para inferência.
             %*{"ok": true}
           )
 
-          agent.rlmValue.register("office.document.create", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          application.rlmValue.register("rpa.dom.snapshot", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            agent.application.foreignValue.plasticRpaDomSnapshot(arguments)
+          )
+          application.rlmValue.register("rpa.dom.query", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            agent.application.foreignValue.plasticRpaDomQuery(arguments)
+          )
+          application.rlmValue.register("rpa.dom.click", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            agent.application.foreignValue.plasticRpaDomClick(arguments)
+          )
+          application.rlmValue.register("rpa.dom.fill", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            agent.application.foreignValue.plasticRpaDomFill(arguments)
+          )
+          application.rlmValue.register("rpa.dom.select", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            agent.application.foreignValue.plasticRpaDomSelect(arguments)
+          )
+          application.rlmValue.register("rpa.dom.read", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            agent.application.foreignValue.plasticRpaDomRead(arguments)
+          )
+          application.rlmValue.register("rpa.dom.submit", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            agent.application.foreignValue.plasticRpaDomSubmit(arguments)
+          )
+          application.rlmValue.register("rpa.dom.scroll", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            agent.application.foreignValue.plasticRpaDomScroll(arguments)
+          )
+          application.rlmValue.register("rpa.dom.wait", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            agent.application.foreignValue.plasticRpaDomWait(arguments)
+          )
+          application.rlmValue.register("rpa.dom.navigate", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            agent.application.foreignValue.plasticRpaDomNavigate(arguments)
+          )
+
+          application.rlmValue.register("rpa.screen.observe", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaScreenObserve(arguments)
+          )
+          application.rlmValue.register("rpa.screen.pixel", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaScreenPixel(arguments)
+          )
+          application.rlmValue.register("rpa.screen.locate", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaScreenLocate(arguments)
+          )
+          application.rlmValue.register("rpa.pointer.move", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaPointerMove(arguments)
+          )
+          application.rlmValue.register("rpa.pointer.click", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaPointerClick(arguments)
+          )
+          application.rlmValue.register("rpa.pointer.drag", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaPointerDrag(arguments)
+          )
+          application.rlmValue.register("rpa.keyboard.write", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaKeyboardWrite(arguments)
+          )
+          application.rlmValue.register("rpa.keyboard.press", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaKeyboardPress(arguments)
+          )
+          application.rlmValue.register("rpa.keyboard.hotkey", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaKeyboardHotkey(arguments)
+          )
+          application.rlmValue.register("rpa.scroll", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaScroll(arguments)
+          )
+          application.rlmValue.register("rpa.wait", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaWait(arguments)
+          )
+          application.rlmValue.register("rpa.trajectory.execute", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaTrajectoryExecute(arguments)
+          )
+          application.rlmValue.register("rpa.memory.remember", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaInvoke("rpa.memory.remember", arguments)
+          )
+          application.rlmValue.register("rpa.memory.search", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaInvoke("rpa.memory.search", arguments)
+          )
+          application.rlmValue.register("rpa.memory.get", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaInvoke("rpa.memory.get", arguments)
+          )
+          application.rlmValue.register("rpa.memory.list", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaInvoke("rpa.memory.list", arguments)
+          )
+          application.rlmValue.register("rpa.memory.correct", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+            plasticRpaInvoke("rpa.memory.correct", arguments)
+          )
+
+          application.rlmValue.register("office.document.create", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             plasticOfficeInvoke("office.document.create", arguments)
           )
-          agent.rlmValue.register("office.spreadsheet.create", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          application.rlmValue.register("office.spreadsheet.create", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             plasticOfficeInvoke("office.spreadsheet.create", arguments)
           )
-          agent.rlmValue.register("office.presentation.create", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          application.rlmValue.register("office.presentation.create", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             plasticOfficeInvoke("office.presentation.create", arguments)
           )
-          agent.rlmValue.register("office.pdf.create", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          application.rlmValue.register("office.pdf.create", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             plasticOfficeInvoke("office.pdf.create", arguments)
           )
-          agent.rlmValue.register("office.text.extract", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          application.rlmValue.register("office.text.extract", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             plasticOfficeInvoke("office.text.extract", arguments)
           )
-          agent.rlmValue.register("office.files.list", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          application.rlmValue.register("office.files.list", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             plasticOfficeInvoke("office.files.list", arguments)
           )
-          agent.rlmValue.register("office.workspace.summary", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
+          application.rlmValue.register("office.workspace.summary", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
             plasticOfficeInvoke("office.workspace.summary", arguments)
           )
-
-        proc installDeclaredTools(agent: PlasticAgent) =
-          if agent.isNil or agent.rlmValue.isNil:
-            return
-          if agent.toolPlans.kind != JArray:
-            return
-
-          for functionPlan in agent.toolPlans.items:
-            if functionPlan.kind != JObject:
-              continue
-
-            let toolName =
-              `jsonStringFieldSym`(functionPlan, "name").strip
-            if toolName.len == 0:
-              continue
-
-            # Uma função padrão pode ser redeclarada no RLM apenas para
-            # fornecer assinatura/descrição; a implementação já pertence
-            # ao escopo privado desta instância.
-            if agent.rlmValue.tools.hasKey(toolName):
-              continue
-
-            case toolName
-            of "ObservePage":
-              agent.rlmValue.register("ObservePage", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-                agent.application.foreignValue.plasticRpaDomSnapshot(arguments)
-              )
-            of "FindElement":
-              agent.rlmValue.register("FindElement", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-                agent.application.foreignValue.plasticRpaDomQuery(arguments)
-              )
-            of "ClickElement":
-              agent.rlmValue.register("ClickElement", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-                agent.application.foreignValue.plasticRpaDomClick(arguments)
-              )
-            of "FillElement":
-              agent.rlmValue.register("FillElement", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-                agent.application.foreignValue.plasticRpaDomFill(arguments)
-              )
-            of "SelectOption":
-              agent.rlmValue.register("SelectOption", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-                agent.application.foreignValue.plasticRpaDomSelect(arguments)
-              )
-            of "ReadElement":
-              agent.rlmValue.register("ReadElement", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-                agent.application.foreignValue.plasticRpaDomRead(arguments)
-              )
-            of "SubmitForm":
-              agent.rlmValue.register("SubmitForm", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-                agent.application.foreignValue.plasticRpaDomSubmit(arguments)
-              )
-            of "ScrollPage":
-              agent.rlmValue.register("ScrollPage", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-                agent.application.foreignValue.plasticRpaDomScroll(arguments)
-              )
-            of "WaitPage":
-              agent.rlmValue.register("WaitPage", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-                agent.application.foreignValue.plasticRpaDomWait(arguments)
-              )
-            of "NavigatePage":
-              agent.rlmValue.register("NavigatePage", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-                agent.application.foreignValue.plasticRpaDomNavigate(arguments)
-              )
-            of "ObserveScreen":
-              agent.rlmValue.register("ObserveScreen", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-                plasticRpaInvoke("rpa.screen.observe", arguments)
-              )
-            of "ReadPixel":
-              agent.rlmValue.register("ReadPixel", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-                plasticRpaInvoke("rpa.screen.pixel", arguments)
-              )
-            of "LocateImage":
-              agent.rlmValue.register("LocateImage", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-                plasticRpaInvoke("rpa.screen.locate", arguments)
-              )
-            of "MovePointer":
-              agent.rlmValue.register("MovePointer", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-                plasticRpaInvoke("rpa.pointer.move", arguments)
-              )
-            of "Click":
-              agent.rlmValue.register("Click", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-                plasticRpaInvoke("rpa.pointer.click", arguments)
-              )
-            of "DragPointer":
-              agent.rlmValue.register("DragPointer", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-                plasticRpaInvoke("rpa.pointer.drag", arguments)
-              )
-            of "WriteText":
-              agent.rlmValue.register("WriteText", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-                plasticRpaInvoke("rpa.keyboard.write", arguments)
-              )
-            of "PressKey":
-              agent.rlmValue.register("PressKey", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-                plasticRpaInvoke("rpa.keyboard.press", arguments)
-              )
-            of "Hotkey":
-              agent.rlmValue.register("Hotkey", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-                plasticRpaInvoke("rpa.keyboard.hotkey", arguments)
-              )
-            of "ScrollScreen":
-              agent.rlmValue.register("ScrollScreen", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-                plasticRpaInvoke("rpa.scroll", arguments)
-              )
-            of "Wait":
-              agent.rlmValue.register("Wait", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-                plasticRpaInvoke("rpa.wait", arguments)
-              )
-            of "ExecuteVisualTrajectory":
-              agent.rlmValue.register("ExecuteVisualTrajectory", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-                plasticRpaInvoke("rpa.trajectory.execute", arguments)
-              )
-            of "RememberTrajectory":
-              agent.rlmValue.register("RememberTrajectory", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-                plasticRpaInvoke("rpa.memory.remember", arguments)
-              )
-            of "RecallTrajectories":
-              agent.rlmValue.register("RecallTrajectories", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-                plasticRpaInvoke("rpa.memory.search", arguments)
-              )
-            of "GetTrajectory":
-              agent.rlmValue.register("GetTrajectory", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-                plasticRpaInvoke("rpa.memory.get", arguments)
-              )
-            of "rpa.memory.list":
-              agent.rlmValue.register("rpa.memory.list", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-                plasticRpaInvoke("rpa.memory.list", arguments)
-              )
-            of "CorrectTrajectory":
-              agent.rlmValue.register("CorrectTrajectory", proc(agent: PlasticAgent; arguments: JsonNode): JsonNode =
-                plasticRpaInvoke("rpa.memory.correct", arguments)
-              )
-            else:
-              raise newException(
-                PlasticAgentError,
-                "Tool declarada sem implementação no escopo RLM do agente " &
-                agent.instanceName & ": " & toolName
-              )
 
         proc normalizeAgentHookName(name: string): string =
           case name.strip.toLowerAscii
@@ -18940,8 +20341,6 @@ Mantenha a resposta objetiva e útil para inferência.
             agent.domainPlan = domainPlan
             agent.rlmConditions = rlmConditions
             agent.toolPlans = toolPlans
-            installDefaultTools(agent)
-            installDeclaredTools(agent)
             application.agentsValue[instanceName] = agent
             if getEnv("GLAUCOPLASTIC_UI_DEBUG").strip.len > 0:
               plasticDebugTrace(
@@ -19041,8 +20440,8 @@ Mantenha a resposta objetiva e útil para inferência.
 
           var rlmInferenceCalls = 0
           var rlmInferenceMs = 0.0
-          var rlmToolCalls = 0
-          var rlmToolMs = 0.0
+          var rlmCapabilityCalls = 0
+          var rlmCapabilityMs = 0.0
           var rlmInvocationCounts =
             initTable[string, int]()
 
@@ -19411,9 +20810,9 @@ Mantenha a resposta objetiva e útil para inferência.
                 "Identidade, propósito, domínio, condições e propriedades do agente.",
                 agentValue
               )
-            environmentValue["tools"] =
+            environmentValue["capabilities"] =
               plasticRlmDeclaredVariable(
-                "Catálogo único e fechado. Use id literalmente em instructions[].tool.",
+                "Catálogo único e fechado. Use id literalmente em instructions[].capability.",
                 compactAgentToolManifest(agent)
               )
             environmentValue["states"] =
@@ -19452,7 +20851,7 @@ Mantenha a resposta objetiva e útil para inferência.
               )
             rlmVariables["observations"] =
               plasticRlmDeclaredVariable(
-                "Resultados reais de tools nesta execução; são a evidência primária.",
+                "Resultados reais de capabilities nesta execução; são a evidência primária.",
                 toolResults
               )
             rlmVariables["workingVariables"] =
@@ -19552,8 +20951,8 @@ Mantenha a resposta objetiva e útil para inferência.
                     "rlm.variables.request, runtime e environment. Só depois " &
                     "consulte memory e history. Se request.value.requiresAction " &
                     "for true e ainda não houver observation suficiente, use " &
-                    "ao menos uma tool literal do catálogo " &
-                    "environment.value.tools.value e answer=null. " &
+                    "ao menos uma capability literal do catálogo " &
+                    "environment.value.capabilities.value e answer=null. " &
                     "Histórico nunca comprova execução atual."
                 }
 
@@ -19730,7 +21129,7 @@ Mantenha a resposta objetiva e útil para inferência.
 
                 let candidateProgram = parseJson(jsonPayload)
                 let validationError =
-                  validateRlmProgramTools(
+                  validateRlmProgramCapabilities(
                     agent,
                     candidateProgram,
                     promptInput
@@ -19829,8 +21228,8 @@ Mantenha a resposta objetiva e útil para inferência.
               for instruction in program["instructions"].items:
                 inc executedInstructions
 
-                let toolName =
-                  `jsonStringFieldSym`(instruction, "tool")
+                let capabilityName =
+                  `jsonStringFieldSym`(instruction, "capability")
                 let arguments =
                   if instruction.hasKey("arguments"):
                     instruction["arguments"]
@@ -19840,12 +21239,12 @@ Mantenha a resposta objetiva e útil para inferência.
                 if llmDebug:
                   plasticDebugTrace(
                     "rlm.invoke agent=" & agent.instanceName &
-                    " tool=" & toolName &
+                    " capability=" & capabilityName &
                     " arguments=" & $arguments
                   )
 
                 let invocationKey =
-                  toolName & "|" & $arguments
+                  capabilityName & "|" & $arguments
                 let invocationCount =
                   rlmInvocationCounts.getOrDefault(
                     invocationKey,
@@ -19861,27 +21260,27 @@ Mantenha a resposta objetiva e útil para inferência.
                     "rlm.guard.repeat-tool run=" &
                     rlmRunId &
                     " iteration=" & $iteration &
-                    " tool=" & toolName &
+                    " capability=" & capabilityName &
                     " count=" & $invocationCount &
                     " arguments=" & $arguments
                   )
                   raise newException(
                     PlasticAgentError,
-                    "RLM repetiu a mesma tool com os " &
+                    "RLM repetiu a mesma capability com os " &
                     "mesmos argumentos mais de " &
                     $rlmRepeatToolLimit & " vez(es): " &
-                    toolName
+                    capabilityName
                   )
 
-                let toolStartedAt =
+                let capabilityStartedAt =
                   epochTime()
 
                 rlmProfile(
-                  "tool.begin",
+                  "capability.begin",
                   %*{
                     "iteration": iteration,
-                    "tool":
-                      toolName,
+                    "capability":
+                      capabilityName,
                     "arguments":
                       if rlmProfilingBodies:
                         arguments.copy
@@ -19896,18 +21295,18 @@ Mantenha a resposta objetiva e útil para inferência.
 
                 try:
                   value =
-                    agent.rlmValue.invoke(
+                    application.rlmValue.invoke(
                       agent,
-                      toolName,
+                      capabilityName,
                       arguments
                     )
-                except CatchableError as toolError:
+                except CatchableError as capabilityError:
                   rlmProfile(
-                    "tool.error",
+                    "capability.error",
                     %*{
                       "iteration": iteration,
-                      "tool":
-                        toolName,
+                      "capability":
+                        capabilityName,
                       "arguments":
                         if rlmProfilingBodies:
                           arguments.copy
@@ -19918,39 +21317,39 @@ Mantenha a resposta objetiva e útil para inferência.
                       "elapsedMs":
                         (
                           epochTime() -
-                          toolStartedAt
+                          capabilityStartedAt
                         ) * 1000.0,
                       "error":
-                        toolError.msg
+                        capabilityError.msg
                     }
                   )
                   raise
 
-                let toolElapsedMs =
-                  (epochTime() - toolStartedAt) * 1000.0
-                inc rlmToolCalls
-                rlmToolMs +=
-                  toolElapsedMs
+                let capabilityElapsedMs =
+                  (epochTime() - capabilityStartedAt) * 1000.0
+                inc rlmCapabilityCalls
+                rlmCapabilityMs +=
+                  capabilityElapsedMs
 
                 if rlmTimingDebug:
                   plasticDebugTrace(
-                    "rlm.tool.done run=" &
+                    "rlm.capability.done run=" &
                     rlmRunId &
                     " iteration=" & $iteration &
-                    " tool=" & toolName &
+                    " capability=" & capabilityName &
                     " repeat=" & $invocationCount &
                     " elapsedMs=" &
-                    $toolElapsedMs &
-                    " totalToolMs=" &
-                    $rlmToolMs
+                    $capabilityElapsedMs &
+                    " totalCapabilityMs=" &
+                    $rlmCapabilityMs
                   )
 
                 rlmProfile(
-                  "tool.done",
+                  "capability.done",
                   %*{
                     "iteration": iteration,
-                    "tool":
-                      toolName,
+                    "capability":
+                      capabilityName,
                     "arguments":
                       if rlmProfilingBodies:
                         arguments.copy
@@ -19964,23 +21363,23 @@ Mantenha a resposta objetiva e útil para inferência.
                     "repeat":
                       invocationCount,
                     "elapsedMs":
-                      toolElapsedMs,
-                    "toolCall":
-                      rlmToolCalls,
-                    "toolTotalMs":
-                      rlmToolMs
+                      capabilityElapsedMs,
+                    "capabilityCall":
+                      rlmCapabilityCalls,
+                    "capabilityTotalMs":
+                      rlmCapabilityMs
                   }
                 )
 
                 if llmDebug:
                   plasticDebugTrace(
                     "rlm.invoke.result agent=" & agent.instanceName &
-                    " tool=" & toolName &
+                    " capability=" & capabilityName &
                     " value=" & $value
                   )
 
                 var observation = newJObject()
-                observation["tool"] = %toolName
+                observation["capability"] = %capabilityName
                 observation["arguments"] = arguments.copy
                 observation["result"] = value.copy
 
@@ -19997,7 +21396,7 @@ Mantenha a resposta objetiva e útil para inferência.
 
             if appliedWrites > 0:
               var writeSummary = newJObject()
-              writeSummary["tool"] = %"state.write.summary"
+              writeSummary["capability"] = %"state.write.summary"
               writeSummary["arguments"] = newJObject()
               writeSummary["result"] = %*{
                 "ok": true,
@@ -20021,8 +21420,8 @@ Mantenha a resposta objetiva e útil para inferência.
               if lastObservation.kind == JObject and
                   `jsonStringFieldSym`(
                     lastObservation,
-                    "tool"
-                  ) == "NavigatePage" and
+                    "capability"
+                  ) == "rpa.dom.navigate" and
                   lastObservation.hasKey("result") and
                   lastObservation["result"].kind == JObject:
                 let navigationResult =
@@ -20062,7 +21461,7 @@ Mantenha a resposta objetiva e útil para inferência.
                       "Página aberta."
 
                   plasticDebugTrace(
-                    "rlm.fast-complete tool=NavigatePage " &
+                    "rlm.fast-complete capability=rpa.dom.navigate " &
                     "run=" & rlmRunId &
                     " iteration=" & $iteration &
                     " totalMs=" & $rlmElapsedMs() &
@@ -20081,10 +21480,10 @@ Mantenha a resposta objetiva e útil para inferência.
                         rlmInferenceCalls,
                       "inferenceMs":
                         rlmInferenceMs,
-                      "toolCalls":
-                        rlmToolCalls,
-                      "toolMs":
-                        rlmToolMs,
+                      "capabilityCalls":
+                        rlmCapabilityCalls,
+                      "capabilityMs":
+                        rlmCapabilityMs,
                       "answer":
                         if rlmProfilingBodies:
                           answerText
@@ -20103,7 +21502,7 @@ Mantenha a resposta objetiva e útil para inferência.
                   )
                   return %answerText
 
-            # Para outras tools, a resposta final continua exigindo
+            # Para outras capabilities, a resposta final continua exigindo
             # feedback do resultado ao modelo.
             if executedInstructions > 0:
               if llmDebug:
@@ -20163,10 +21562,10 @@ Mantenha a resposta objetiva e útil para inferência.
                   $rlmInferenceCalls &
                   " inferenceMs=" &
                   $rlmInferenceMs &
-                  " toolCalls=" &
-                  $rlmToolCalls &
-                  " toolMs=" &
-                  $rlmToolMs &
+                  " capabilityCalls=" &
+                  $rlmCapabilityCalls &
+                  " capabilityMs=" &
+                  $rlmCapabilityMs &
                   " answerChars=" &
                   $answerText.len
                 )
@@ -20181,10 +21580,10 @@ Mantenha a resposta objetiva e útil para inferência.
                     rlmInferenceCalls,
                   "inferenceMs":
                     rlmInferenceMs,
-                  "toolCalls":
-                    rlmToolCalls,
-                  "toolMs":
-                    rlmToolMs,
+                  "capabilityCalls":
+                    rlmCapabilityCalls,
+                  "capabilityMs":
+                    rlmCapabilityMs,
                   "answer":
                     if rlmProfilingBodies:
                       answerText
@@ -20212,8 +21611,8 @@ Mantenha a resposta objetiva e útil para inferência.
               " totalMs=" & $rlmElapsedMs() &
               " inferenceCalls=" &
               $rlmInferenceCalls &
-              " toolCalls=" &
-              $rlmToolCalls &
+              " capabilityCalls=" &
+              $rlmCapabilityCalls &
               " toolResults=" & $toolResults.len
             )
 
@@ -20226,10 +21625,10 @@ Mantenha a resposta objetiva e útil para inferência.
                   rlmInferenceCalls,
                 "inferenceMs":
                   rlmInferenceMs,
-                "toolCalls":
-                  rlmToolCalls,
-                "toolMs":
-                  rlmToolMs,
+                "capabilityCalls":
+                  rlmCapabilityCalls,
+                "capabilityMs":
+                  rlmCapabilityMs,
                 "toolResultCount":
                   toolResults.len,
                 "toolResults":
@@ -20260,8 +21659,8 @@ Mantenha a resposta objetiva e útil para inferência.
             $rlmEffectiveMaxIterations &
             " inferenceCalls=" &
             $rlmInferenceCalls &
-            " toolCalls=" &
-            $rlmToolCalls
+            " capabilityCalls=" &
+            $rlmCapabilityCalls
           )
           rlmProfile(
             "run.limit",
@@ -20274,10 +21673,10 @@ Mantenha a resposta objetiva e útil para inferência.
                 rlmInferenceCalls,
               "inferenceMs":
                 rlmInferenceMs,
-              "toolCalls":
-                rlmToolCalls,
-              "toolMs":
-                rlmToolMs,
+              "capabilityCalls":
+                rlmCapabilityCalls,
+              "capabilityMs":
+                rlmCapabilityMs,
               "toolResultCount":
                 toolResults.len
             }
@@ -20292,6 +21691,9 @@ Mantenha a resposta objetiva e útil para inferência.
       result.add quote do:
         if `applicationVariable`.llamaValue.isNil:
           `applicationVariable`.llamaValue = newLlamaRuntime()
+        if `applicationVariable`.rlmValue.isNil:
+          `applicationVariable`.rlmValue = newRlmRuntime()
+        installDefaultCapabilities(`applicationVariable`)
         deriveAgents(`applicationVariable`)
       continue
 
@@ -20539,6 +21941,7 @@ Mantenha a resposta objetiva e útil para inferência.
 
             node.copy
 
+          # GLAUCOPLASTIC_WINDOWS_RESIZE_PERF_AND_ASSISTANT_ERROR_V1
           proc applyPlasticWindowsForeignLayoutSnapshot(
             desktop: PlasticWindowsDesktopRuntime;
             payload: string
@@ -20547,6 +21950,16 @@ Mantenha a resposta objetiva e útil para inferência.
                 desktop.host.isNil or
                 payload.len == 0:
               return
+
+            type
+              DecodedForeignLayout = object
+                path: string
+                x: int
+                y: int
+                width: int
+                height: int
+                visible: bool
+                holes: seq[PlasticWebView2Rect]
 
             var rectangles: JsonNode
 
@@ -20562,13 +21975,17 @@ Mantenha a resposta objetiva e útil para inferência.
               )
               return
 
-            if rectangles.kind != JArray:
+            if rectangles.isNil or
+                rectangles.kind != JArray:
               return
 
-            var applied = false
+            var decoded:
+              seq[DecodedForeignLayout] =
+                @[]
 
             for rectangle in rectangles.items:
-              if rectangle.kind != JObject:
+              if rectangle.isNil or
+                  rectangle.kind != JObject:
                 continue
 
               let path =
@@ -20589,11 +22006,13 @@ Mantenha a resposta objetiva e útil para inferência.
                   rectangle,
                   "x"
                 )
+
               let y =
                 `jsonIntFieldSym`(
                   rectangle,
                   "y"
                 )
+
               let width =
                 max(
                   0,
@@ -20602,6 +22021,7 @@ Mantenha a resposta objetiva e útil para inferência.
                     "width"
                   )
                 )
+
               let height =
                 max(
                   0,
@@ -20611,52 +22031,28 @@ Mantenha a resposta objetiva e útil para inferência.
                   )
                 )
 
-              let visible =
-                width > 1 and
-                height > 1
-
-              gpwv2_set_foreign_visible(
-                desktop.host,
-                (
-                  if visible:
-                    1
-                  else:
-                    0
-                ).cint
-              )
-
-              if not visible:
-                gpwv2_set_foreign_input_regions(
-                  desktop.host,
-                  nil,
-                  0
-                )
-                applied = true
-                continue
-
-              gpwv2_set_foreign_bounds(
-                desktop.host,
-                x.cint,
-                y.cint,
-                width.cint,
-                height.cint
-              )
-
               var holes:
                 seq[PlasticWebView2Rect] =
                   @[]
 
+              var inputHolesNode:
+                JsonNode =
+                  nil
+
               if rectangle.hasKey(
                   "inputHoles"
-                ) and
+                ):
+                inputHolesNode =
                   rectangle[
                     "inputHoles"
-                  ].kind == JArray:
+                  ]
+
+              if not inputHolesNode.isNil and
+                  inputHolesNode.kind == JArray:
                 for hole in
-                    rectangle[
-                      "inputHoles"
-                    ].items:
-                  if hole.kind != JObject:
+                    inputHolesNode.items:
+                  if hole.isNil or
+                      hole.kind != JObject:
                     continue
 
                   let holeWidth =
@@ -20667,6 +22063,7 @@ Mantenha a resposta objetiva e útil para inferência.
                         "width"
                       )
                     )
+
                   let holeHeight =
                     max(
                       0,
@@ -20699,7 +22096,19 @@ Mantenha a resposta objetiva e útil para inferência.
                     )
                   )
 
-              if holes.len == 0:
+              let visible =
+                (
+                  if rectangle.hasKey("visible") and
+                      rectangle["visible"].kind == JBool:
+                    rectangle["visible"].getBool
+                  else:
+                    true
+                ) and
+                width > 1 and
+                height > 1
+
+              if visible and
+                  holes.len == 0:
                 holes.add(
                   PlasticWebView2Rect(
                     x: x.cint,
@@ -20709,37 +22118,280 @@ Mantenha a resposta objetiva e útil para inferência.
                   )
                 )
 
-              gpwv2_set_foreign_input_regions(
+              decoded.add(
+                DecodedForeignLayout(
+                  path: path,
+                  x: x,
+                  y: y,
+                  width: width,
+                  height: height,
+                  visible: visible,
+                  holes: holes
+                )
+              )
+
+            rectangles = nil
+
+            var applied = false
+            var firstPath = ""
+            var firstX = 0
+            var firstY = 0
+            var firstWidth = 0
+            var firstHeight = 0
+
+            for index in 0 ..< decoded.len:
+              let layout =
+                decoded[index]
+
+              if firstPath.len == 0:
+                firstPath =
+                  layout.path
+                firstX =
+                  layout.x
+                firstY =
+                  layout.y
+                firstWidth =
+                  layout.width
+                firstHeight =
+                  layout.height
+
+              let visible =
+                layout.visible and
+                layout.width > 1 and
+                layout.height > 1
+
+              var geometryKey =
+                layout.path &
+                "|" & $visible &
+                "|" & $layout.x &
+                "|" & $layout.y &
+                "|" & $layout.width &
+                "|" & $layout.height
+
+              for hole in layout.holes:
+                geometryKey.add(
+                  "|" & $hole.x &
+                  "," & $hole.y &
+                  "," & $hole.width &
+                  "," & $hole.height
+                )
+
+              if geometryKey ==
+                  desktop.lastForeignLayoutKey:
+                applied = true
+                continue
+
+              desktop.lastForeignLayoutKey =
+                geometryKey
+
+              gpwv2_set_foreign_visible(
                 desktop.host,
-                unsafeAddr holes[0],
-                holes.len.cint
+                (
+                  if visible:
+                    1
+                  else:
+                    0
+                ).cint
+              )
+
+              if not visible:
+                gpwv2_set_foreign_input_regions(
+                  desktop.host,
+                  nil,
+                  0
+                )
+                applied =
+                  true
+                continue
+
+              if layout.holes.len > 0:
+                gpwv2_set_foreign_input_regions(
+                  desktop.host,
+                  unsafeAddr layout.holes[0],
+                  layout.holes.len.cint
+                )
+              else:
+                gpwv2_set_foreign_input_regions(
+                  desktop.host,
+                  nil,
+                  0
+                )
+
+              if plasticEnvEnabled(
+                  "GLAUCOPLASTIC_UI_DEBUG"
+                ):
+                stderr.writeLine(
+                  "[GlaucoPlastic] layout.native before-bounds path=" &
+                  layout.path &
+                  " rect=" &
+                  $layout.x &
+                  "," &
+                  $layout.y &
+                  " " &
+                  $layout.width &
+                  "x" &
+                  $layout.height &
+                  " holes=" &
+                  $layout.holes.len
+                )
+                stderr.flushFile()
+
+              gpwv2_set_foreign_bounds(
+                desktop.host,
+                layout.x.cint,
+                layout.y.cint,
+                layout.width.cint,
+                layout.height.cint
               )
 
               if plasticEnvEnabled(
                   "GLAUCOPLASTIC_UI_DEBUG"
                 ):
-                plasticUiTrace(
-                  "webview2.layout foreign path=" &
-                  path &
-                  " rect=" &
-                  $x &
-                  "," &
-                  $y &
-                  " " &
-                  $width &
-                  "x" &
-                  $height &
-                  " holes=" &
-                  $holes.len
+                stderr.writeLine(
+                  "[GlaucoPlastic] layout.native after-bounds path=" &
+                  layout.path
                 )
+                stderr.flushFile()
 
-              applied = true
+              applied =
+                true
+
+            if plasticEnvEnabled(
+                "GLAUCOPLASTIC_UI_DEBUG"
+              ) and firstPath.len > 0:
+              plasticUiTrace(
+                "webview2.layout first-foreign path=" &
+                firstPath &
+                " rect=" &
+                $firstX &
+                "," &
+                $firstY &
+                " " &
+                $firstWidth &
+                "x" &
+                $firstHeight &
+                " window=" &
+                $desktop.width &
+                "x" &
+                $desktop.height
+              )
 
             if not applied and
                 desktop.foreignPath.len > 0:
               gpwv2_set_foreign_visible(
                 desktop.host,
                 0
+              )
+
+          # GLAUCOPLASTIC_WINDOWS_SHELL_INTERACTION_FIX_V1
+          proc publishWindowsAssistantSnapshot(
+            desktop: PlasticWindowsDesktopRuntime;
+            force = false
+          ) =
+            if desktop.isNil or
+                desktop.host.isNil or
+                desktop.application.isNil or
+                desktop.application.assistantValue.isNil or
+                not desktop.application.assistantValue.config.enabled:
+              return
+
+            let runtime =
+              desktop.application.assistantValue
+
+            var targetRevision: int64
+            var shouldPublish = force
+
+            acquire(runtime.dataLock)
+            try:
+              targetRevision =
+                runtime.revision
+              if not shouldPublish:
+                shouldPublish =
+                  runtime.revision !=
+                  runtime.publishedRevision
+            finally:
+              release(runtime.dataLock)
+
+            if not shouldPublish:
+              return
+
+            let snapshot =
+              plasticAssistantSnapshot(
+                runtime
+              )
+
+            let script =
+              """
+                (() => {
+                  if (typeof window.__glaucoplasticAssistantApply !==
+                      'function') {
+                    return false;
+                  }
+
+                  window.__glaucoplasticAssistantApply(
+              """ & $snapshot & """
+                  );
+                  return true;
+                })()
+              """
+
+            let result =
+              gpwv2_shell_execute_sync(
+                desktop.host,
+                script.cstring,
+                1_500
+              )
+
+            if result.isNil:
+              return
+
+            let applied =
+              ($result).strip == "true"
+
+            gpwv2_free_string(
+              result
+            )
+
+            if applied:
+              acquire(runtime.dataLock)
+              try:
+                if runtime.publishedRevision <
+                    targetRevision:
+                  runtime.publishedRevision =
+                    targetRevision
+              finally:
+                release(runtime.dataLock)
+
+          proc acknowledgeWindowsAssistantDispatch(
+            desktop: PlasticWindowsDesktopRuntime
+          ) =
+            if desktop.isNil or
+                desktop.host.isNil:
+              return
+
+            let script =
+              """
+                (() => {
+                  if (typeof window
+                      .__glaucoplasticAssistantDispatchAccepted ===
+                      'function') {
+                    window
+                      .__glaucoplasticAssistantDispatchAccepted();
+                  }
+                  return true;
+                })()
+              """
+
+            let result =
+              gpwv2_shell_execute_sync(
+                desktop.host,
+                script.cstring,
+                1_000
+              )
+
+            if not result.isNil:
+              gpwv2_free_string(
+                result
               )
 
           proc onPlasticWindowsWebMessage(
@@ -20771,14 +22423,27 @@ Mantenha a resposta objetiva e útil para inferência.
             except CatchableError:
               return
 
+            if envelope.kind == JString:
+              try:
+                envelope =
+                  parseJson(
+                    envelope.getStr
+                  )
+              except CatchableError:
+                return
+
             if envelope.kind != JObject:
               return
 
             let channel =
-              `jsonStringFieldSym`(
-                envelope,
-                "channel"
-              )
+              if envelope.hasKey("channel") and
+                  envelope["channel"].kind == JString:
+                envelope["channel"].getStr
+              elif envelope.hasKey("type") and
+                  envelope["type"].kind == JString:
+                envelope["type"].getStr
+              else:
+                ""
 
             let payload =
               if envelope.hasKey(
@@ -20792,31 +22457,66 @@ Mantenha a resposta objetiva e útil para inferência.
               else:
                 newJNull()
 
+            if desktop.shellReloading and
+                (
+                  channel == "glaucoplasticLayout" or
+                  channel == "glaucoplasticLayoutSync"
+                ):
+              if plasticEnvEnabled(
+                  "GLAUCOPLASTIC_UI_DEBUG"
+                ):
+                plasticUiTrace(
+                  "webview2.message layout ignored-during-shell-reload"
+                )
+              return
+
             case channel
             of "glaucoplasticEvent":
               if payload.kind == JObject:
+                let identity =
+                  `jsonStringFieldSym`(
+                    payload,
+                    "identity"
+                  )
+
                 desktop.application
                   .dispatchUiEvent(
                     payload
                   )
 
-                desktop.reloadWindowsDesktop()
+                if identity == "assistant:send":
+                  desktop
+                    .acknowledgeWindowsAssistantDispatch()
+
+                if identity.startsWith("assistant:"):
+                  desktop
+                    .publishWindowsAssistantSnapshot()
 
             of "glaucoplasticLayout":
               let layoutText =
-                if envelope[
-                    "payload"
-                  ].kind == JString:
-                  envelope[
-                    "payload"
-                  ].getStr
+                if payload.kind == JString:
+                  payload.getStr
                 else:
                   $payload
+              if plasticEnvEnabled(
+                  "GLAUCOPLASTIC_UI_DEBUG"
+                ):
+                plasticUiTrace(
+                  "webview2.message layout payloadLen=" &
+                  $layoutText.len
+                )
 
               desktop
                 .applyPlasticWindowsForeignLayoutSnapshot(
                   layoutText
                 )
+
+            of "glaucoplasticLayoutSync":
+              if payload.kind == JString:
+                desktop
+                  .applyPlasticWindowsForeignLayoutSnapshot(
+                    payload.getStr
+                  )
 
             else:
               if plasticEnvEnabled(
@@ -20873,6 +22573,17 @@ Mantenha a resposta objetiva e útil para inferência.
                   url
                 )
 
+          proc updateWindowsForeignHostStatus(
+            desktop: PlasticWindowsDesktopRuntime;
+            path, status: string
+          ) =
+            # Não executar JavaScript síncrono aqui.
+            # data-status disparava MutationObserver -> layout ->
+            # callback Nim reentrante durante gpwv2_shell_execute_sync.
+            discard desktop
+            discard path
+            discard status
+
           proc onPlasticWindowsWebView2Log(
             messageUtf8: cstring;
             userData: pointer
@@ -20898,6 +22609,10 @@ Mantenha a resposta objetiva e útil para inferência.
               plasticWindowsShellHtml(
                 desktop.application
               )
+
+            desktop.shellReloading = true
+            defer:
+              desktop.shellReloading = false
 
             if gpwv2_shell_set_html(
                 desktop.host,
@@ -20959,6 +22674,18 @@ Mantenha a resposta objetiva e útil para inferência.
                 element.status =
                   pfsIdle
 
+                gpwv2_set_foreign_visible(
+                  desktop.host,
+                  1
+                )
+                gpwv2_set_foreign_bounds(
+                  desktop.host,
+                  0,
+                  0,
+                  desktop.width.cint,
+                  desktop.height.cint
+                )
+
             result.navigate =
               proc(
                 element:
@@ -20985,6 +22712,24 @@ Mantenha a resposta objetiva e útil para inferência.
                   raise newException(
                     PlasticForeignBackendError,
                     "WebView2 falhou ao navegar para " &
+                    normalized
+                  )
+
+                # A shell só precisa que a navegação tenha sido aceita pelo
+                # host nativo para sair do placeholder de loading.
+                element.currentUrl =
+                  normalized
+                element.status =
+                  pfsReady
+                updateWindowsForeignHostStatus(
+                  desktop,
+                  element.path,
+                  "ready"
+                )
+                desktop.application
+                  .foreignValue
+                  .notifyUrlChanged(
+                    element.path,
                     normalized
                   )
 
@@ -21093,6 +22838,8 @@ Mantenha a resposta objetiva e útil para inferência.
                   nil,
                 foreignPath:
                   "",
+                shellReloading:
+                  false,
                 width:
                   max(
                     960,
@@ -21120,16 +22867,28 @@ Mantenha a resposta objetiva e útil para inferência.
             application.desktopValue =
               desktop
 
+            stderr.writeLine(
+              "[GlaucoPlastic] windows.desktop before gpwv2_create"
+            )
+
+            let windowTitle =
+              application.productValue.title
+            stderr.writeLine(
+              "[GlaucoPlastic] windows.desktop title len=" &
+              $windowTitle.len
+            )
+
+            let userFolder =
+              application.webViewValue.userFolder
+            stderr.writeLine(
+              "[GlaucoPlastic] windows.desktop userFolder len=" &
+              $userFolder.len
+            )
+
             desktop.host =
               gpwv2_create(
-                application
-                  .productValue
-                  .title
-                  .cstring,
-                application
-                  .webViewValue
-                  .userFolder
-                  .cstring,
+                windowTitle.cstring,
+                userFolder.cstring,
                 desktop.width.cint,
                 desktop.height.cint,
                 onPlasticWindowsWebMessage,
@@ -21140,6 +22899,12 @@ Mantenha a resposta objetiva e útil para inferência.
                 )
               )
 
+            stderr.writeLine(
+              "[GlaucoPlastic] windows.desktop after gpwv2_create host=" &
+              $cast[int](desktop.host)
+            )
+            stderr.flushFile()
+
             if desktop.host.isNil:
               raise newException(
                 PlasticRuntimeError,
@@ -21148,23 +22913,24 @@ Mantenha a resposta objetiva e útil para inferência.
 
             if gpwv2_wait_ready(
                 desktop.host,
-                60_000
+                10_000
               ) == 0:
-              gpwv2_destroy(
-                desktop.host
-              )
-              desktop.host =
-                nil
-
               raise newException(
                 PlasticRuntimeError,
-                "WebView2 Composition não ficou pronto em 60 segundos."
+                "WebView2 não ficou pronto a tempo."
               )
 
+            plasticUiTrace(
+              "windows.desktop wait_ready ok"
+            )
             application
               .webViewValue
               .initialized =
                 true
+            stderr.writeLine(
+              "[GlaucoPlastic] windows.desktop webView initialized"
+            )
+            stderr.flushFile()
 
             application
               .foreignValue
@@ -21173,33 +22939,143 @@ Mantenha a resposta objetiva e útil para inferência.
                   desktop
                 )
               )
+            stderr.writeLine(
+              "[GlaucoPlastic] windows.desktop foreign backend registered"
+            )
+            stderr.flushFile()
 
             if not plasticEnvEnabled(
                 "GLAUCOPLASTIC_DISABLE_STARTUP_PROGRAM"
               ):
-              application.executeProgram()
-
-            for path in
-                application
-                  .foreignValue
-                  .elements
-                  .keys
-                  .toSeq:
-              application
-                .foreignValue
-                .create(
+              for path in
+                  application
+                    .foreignValue
+                    .elements
+                    .keys
+                    .toSeq:
+                stderr.writeLine(
+                  "[GlaucoPlastic] windows.desktop before foreign create path=" &
                   path
                 )
+                stderr.flushFile()
+                application
+                  .foreignValue
+                  .create(
+                    path
+                  )
+                stderr.writeLine(
+                  "[GlaucoPlastic] windows.desktop after foreign create path=" &
+                  path
+                )
+                stderr.flushFile()
 
+              stderr.writeLine(
+                "[GlaucoPlastic] windows.desktop before executeProgram"
+              )
+              stderr.flushFile()
+              application.executeProgram()
+              stderr.writeLine(
+                "[GlaucoPlastic] windows.desktop after executeProgram"
+              )
+              stderr.flushFile()
+
+            stderr.writeLine(
+              "[GlaucoPlastic] windows.desktop before reloadWindowsDesktop"
+            )
+            stderr.flushFile()
             desktop.reloadWindowsDesktop()
+            stderr.writeLine(
+              "[GlaucoPlastic] windows.desktop after reloadWindowsDesktop"
+            )
+            stderr.flushFile()
 
+            stderr.writeLine(
+              "[GlaucoPlastic] windows.desktop before present"
+            )
+            stderr.flushFile()
             gpwv2_present(
               desktop.host
             )
+            stderr.writeLine(
+              "[GlaucoPlastic] windows.desktop after present"
+            )
+            stderr.flushFile()
+
+            if desktop.foreignPath.len > 0:
+              desktop.updateWindowsForeignHostStatus(
+                desktop.foreignPath,
+                "ready"
+              )
+
+            let layoutSyncScript =
+              """
+                (() => {
+                  const collectSnapshot = () => {
+                    const collect =
+                      window.__glaucoplasticCollectForeignLayouts;
+                    if (typeof collect !== 'function') {
+                      return null;
+                    }
+                    const snapshot = collect();
+                    window.__glaucoplasticForeignLayoutSnapshot = snapshot;
+                    return snapshot;
+                  };
+
+                  const snapshot = collectSnapshot();
+                  return {
+                    ok: !!snapshot,
+                    snapshot
+                  };
+                })()
+              """
+
+            stderr.writeLine(
+              "[GlaucoPlastic] windows.desktop before layoutSync"
+            )
+            stderr.flushFile()
+            let layoutSyncResult =
+              gpwv2_shell_execute_sync(
+              desktop.host,
+              layoutSyncScript.cstring,
+              3_000
+            )
+            if not layoutSyncResult.isNil:
+              let layoutSyncText = $layoutSyncResult
+              gpwv2_free_string(layoutSyncResult)
+              stderr.writeLine(
+                "[GlaucoPlastic] windows.desktop layoutSync result len=" &
+                $layoutSyncText.len
+              )
+              stderr.flushFile()
+              if layoutSyncText.len > 0:
+                try:
+                  let layoutSyncJson =
+                    parseJson(layoutSyncText)
+                  if layoutSyncJson.kind == JObject and
+                      layoutSyncJson.hasKey("snapshot"):
+                    desktop.applyPlasticWindowsForeignLayoutSnapshot(
+                      $layoutSyncJson["snapshot"]
+                    )
+                    stderr.writeLine(
+                      "[GlaucoPlastic] windows.desktop layoutSync snapshot applied"
+                    )
+                    stderr.flushFile()
+                except CatchableError:
+                  discard
+            stderr.writeLine(
+              "[GlaucoPlastic] windows.desktop after layoutSync"
+            )
+            stderr.flushFile()
+
+            desktop
+              .publishWindowsAssistantSnapshot(
+                true
+              )
 
             plasticUiTrace(
               "webview2.composition entering-message-loop"
             )
+            stderr.flushFile()
 
             discard gpwv2_run(
               desktop.host
@@ -22825,6 +24701,13 @@ Mantenha a resposta objetiva e útil para inferência.
                   "toggle.dispatchEvent(new Event('change', " &
                   "{bubbles:true})); } return true; })()"
               )
+              if not desktop.mainWebView.isNil:
+                executeNativeJsAsync(
+                  desktop.mainWebView,
+                  "(() => { if (window.__glaucoplasticAssistantForeignSetOpen) " &
+                    "{ window.__glaucoplasticAssistantForeignSetOpen(true); " &
+                    "return true; } return false; })()"
+                )
               return
 
             if plasticEnvEnabled(
@@ -24554,6 +26437,7 @@ Mantenha a resposta objetiva e útil para inferência.
               )
 
             var mainApplied = false
+            var foreignApplied = false
             var overlayApplied = desktop.assistantOverlayWebView.isNil
 
             let mainScript = """
@@ -24574,6 +26458,26 @@ Mantenha a resposta objetiva e útil para inferência.
               mainApplied = applied.kind == JBool and applied.getBool
             except CatchableError:
               discard
+
+            if not desktop.mainWebView.isNil:
+              let foreignScript = """
+                (() => {
+                  if (window.__glaucoplasticAssistantForeignApply) {
+                    window.__glaucoplasticAssistantForeignApply(""" & $snapshot & """);
+                    return true;
+                  }
+                  return false;
+                })()
+              """
+              try:
+                let applied = evaluateNativeJs(
+                  desktop.mainWebView,
+                  foreignScript,
+                  500
+                )
+                foreignApplied = applied.kind == JBool and applied.getBool
+              except CatchableError:
+                discard
 
             if not desktop.assistantOverlayWebView.isNil:
               let overlayScript = """
@@ -24603,6 +26507,8 @@ Mantenha a resposta objetiva e útil para inferência.
               plasticUiTrace(
                 "ui.snapshot.publish.end mainApplied=" &
                 $mainApplied &
+                " foreignApplied=" &
+                $foreignApplied &
                 " overlayApplied=" &
                 $overlayApplied &
                 " elapsedMs=" &
@@ -24612,7 +26518,7 @@ Mantenha a resposta objetiva e útil para inferência.
                 )
               )
 
-            if overlayApplied or
+            if foreignApplied or overlayApplied or
                 (desktop.assistantOverlayWebView.isNil and mainApplied):
               acquire(runtime.dataLock)
               runtime.publishedRevision = runtime.revision
@@ -26254,15 +28160,13 @@ Mantenha a resposta objetiva e útil para inferência.
             "running": application.llamaValue.running()
           }
 
-          result["rlmTools"] = newJObject()
+          result["rlmCapabilities"] = newJArray()
+          for capabilityName in application.rlmValue.capabilities.keys.toSeq.sorted:
+            result["rlmCapabilities"].add %capabilityName
+
           result["agents"] = newJArray()
           for agentName in application.agentsValue.keys.toSeq.sorted:
             let agent = application.agentsValue[agentName]
-            var agentTools = newJArray()
-            if not agent.rlmValue.isNil:
-              for toolName in agent.rlmValue.tools.keys.toSeq.sorted:
-                agentTools.add %toolName
-            result["rlmTools"][agentName] = agentTools
             result["agents"].add %*{
               "name": agentName,
               "constructor": agent.constructorName,
@@ -26849,7 +28753,8 @@ Mantenha a resposta objetiva e útil para inferência.
             "shortcuts": {
               "desktop": config.desktopShortcut,
               "start_menu": config.startMenuShortcut
-            }
+            },
+            "installer_download": config.installerDownloadPage
           }
 
           let okfSection = findPlanSection(application.planValue, "okfs")
@@ -26890,7 +28795,7 @@ Mantenha a resposta objetiva e útil para inferência.
                 ""
 
             result["assets"].add %*{
-              "kind": if planName(assetNode) in ["glob", "includeGlob"]: "glob" else: "file",
+              "kind": if planName(assetNode) in ["glob", "includeGlob"]: "glob" elif planName(assetNode) in ["tree", "directory"]: "tree" else: "file",
               "source": sourceValue.getStr,
               "destination": destination
             }
