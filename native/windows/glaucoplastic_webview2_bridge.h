@@ -72,6 +72,12 @@ GPWV2_API int32_t __cdecl gpwv2_shell_set_html(
   const char* htmlUtf8
 );
 
+GPWV2_API char* __cdecl gpwv2_shell_execute_sync(
+  GPWV2Host* host,
+  const char* scriptUtf8,
+  int32_t timeoutMs
+);
+
 GPWV2_API int32_t __cdecl gpwv2_foreign_navigate(
   GPWV2Host* host,
   const char* urlUtf8
